@@ -358,6 +358,89 @@ func maybeRewriteAssistantText(text string, silent bool) string {
 	}
 	return out
 }
+// sanitizeGrokErrorForClient strips xAI/Grok fingerprints from errors returned to customers.
+// When silent (Claude/OpenAI disguise), never leak grok-cli, xai, auth_kind, account emails, etc.
+func sanitizeGrokErrorForClient(msg string, silent bool) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		if silent {
+			return "The model is temporarily unavailable. Please try again."
+		}
+		return "upstream request failed"
+	}
+	low := strings.ToLower(msg)
+
+	// Classify first (before stripping) so we can map to stable public messages.
+	isAuth := strings.Contains(low, "401") || strings.Contains(low, "403") ||
+		strings.Contains(low, "invalid or expired credentials") ||
+		strings.Contains(low, "permissiondenied") ||
+		strings.Contains(low, "no auth context") ||
+		strings.Contains(low, "x_xai_token_auth") ||
+		strings.Contains(low, "auth http")
+	isQuota := strings.Contains(low, "402") ||
+		strings.Contains(low, "insufficient_quota") ||
+		strings.Contains(low, "spending limit") ||
+		strings.Contains(low, "credits exhausted") ||
+		strings.Contains(low, "build credits") ||
+		strings.Contains(low, "quota")
+
+	if silent {
+		if isQuota {
+			return "Rate limit or usage limit reached for this model. Please retry later."
+		}
+		if isAuth {
+			// Grok often returns 401 when Build credits/session are dead — do not say "Grok".
+			return "The model is temporarily unavailable. Please try again shortly."
+		}
+		if strings.Contains(low, "429") || strings.Contains(low, "rate") {
+			return "Rate limit reached. Please retry later."
+		}
+		if strings.Contains(low, "no grok accounts") || strings.Contains(low, "all grok") {
+			return "No capacity available for this model right now."
+		}
+		// Generic: strip brand tokens then collapse to short message if still dirty.
+		clean := msg
+		repls := []struct{ old, new string }{
+			{"grok-cli/", ""},
+			{"grok-cli", "upstream"},
+			{"Grok Build", "upstream"},
+			{"Grok", "upstream"},
+			{"grok", "upstream"},
+			{"xAI", "upstream"},
+			{"xai", "upstream"},
+			{"x_xai_token_auth", "auth"},
+			{"auth_kind=bearer", ""},
+			{"PermissionDenied", "denied"},
+			{"no auth context", "unauthorized"},
+			{"cli-chat-proxy.grok.com", "upstream"},
+			{"auth.x.ai", "upstream"},
+		}
+		for _, r := range repls {
+			clean = strings.ReplaceAll(clean, r.old, r.new)
+		}
+		// Drop raw JSON blobs that still look like provider dumps.
+		if (strings.Contains(clean, "{") && strings.Contains(clean, "error")) ||
+			strings.Contains(low, "upstream=") || len(clean) > 220 {
+			return "Upstream model error. Please try again."
+		}
+		clean = strings.TrimSpace(clean)
+		if clean == "" || clean == "HTTP 401:" || clean == "HTTP 403:" {
+			return "The model is temporarily unavailable. Please try again shortly."
+		}
+		return clean
+	}
+
+	// Explicit Grok API path: still avoid dumping full provider JSON when possible.
+	if isQuota {
+		return "Build credits or spending limit exhausted for this account."
+	}
+	if isAuth {
+		return "Upstream authentication failed. Account may need re-import or has no remaining access."
+	}
+	return truncateStr(msg, 240)
+}
+
+
 func truncateStr(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -2072,8 +2155,17 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	}
 
 	sendErr := func(status int, errType, msg string) {
+		msg = sanitizeGrokErrorForClient(msg, silent)
+		// Silent Claude path: map provider statuses to less fingerprintable codes.
 		if silent {
-			msg = strings.ReplaceAll(strings.ReplaceAll(msg, "Grok", "upstream"), "grok", "upstream")
+			if status == 401 || status == 403 {
+				status = 503
+				errType = "api_error"
+			}
+			if status == 402 {
+				status = 429
+				errType = "rate_limit_error"
+			}
 		}
 		if stream && w.Header().Get("Content-Type") != "" {
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
@@ -2095,7 +2187,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		gp.Reload()
 	}
 	if gp.Count() == 0 {
-		sendErr(503, "service_unavailable", "No Grok accounts configured")
+		sendErr(503, "service_unavailable", "No capacity available for this model")
 		return
 	}
 
@@ -2169,14 +2261,20 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("auth HTTP %d: %s", resp.StatusCode, truncateStr(string(b), 400))
+			bodyPreview := truncateStr(string(b), 400)
+			// Log full provider detail server-side only.
+			logger.Warnf("[Grok] auth HTTP %d account=%s body=%s", resp.StatusCode, acc.Email, bodyPreview)
+			// Client-facing lastErr uses short labels (sanitized later).
+			lastErr = fmt.Errorf("auth HTTP %d: invalid or expired credentials", resp.StatusCode)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			if resp.StatusCode == 401 {
 				if h.refreshGrokToken(acc) == nil {
 					delete(excluded, acc.ID)
+					logger.Infof("[Grok] token refreshed after 401, will retry account=%s", acc.Email)
 				} else {
-					gp.Disable(acc.ID, lastErr.Error())
+					gp.Disable(acc.ID, "auth failed")
+					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access", -1, 0)
 				}
 			}
 			continue
@@ -2189,9 +2287,13 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				msg += " " + truncateStr(s, 200)
 			}
 			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
-			gp.Reload()
-			sendErr(402, "insufficient_quota", msg)
-			return
+			gp.Disable(acc.ID, "quota exhausted")
+			excluded[acc.ID] = true
+			gp.RecordError(acc.ID)
+			lastErr = fmt.Errorf("%s", msg)
+			logger.Warnf("[Grok] quota exhausted account=%s — try next", acc.Email)
+			// Do not return raw 402 body to client yet; try other accounts first.
+			continue
 		}
 		if resp.StatusCode >= 400 {
 			b, _ := io.ReadAll(resp.Body)
@@ -2291,11 +2393,19 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	msg := "All Grok accounts failed"
+	msg := "All upstream accounts failed"
 	if lastErr != nil {
 		msg = lastErr.Error()
 	}
-	sendErr(502, "api_error", msg)
+	// Always sanitize; silent maps to generic Claude-like errors.
+	status := 502
+	errType := "api_error"
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "402") || strings.Contains(low, "credits exhausted") || strings.Contains(low, "spending limit") || strings.Contains(low, "quota") {
+		status = 402
+		errType = "insufficient_quota"
+	}
+	sendErr(status, errType, msg)
 }
 
 func (h *Handler) trySilentGrokClaudeFallback(w http.ResponseWriter, r *http.Request, req *ClaudeRequest, requestedModel string) bool {
