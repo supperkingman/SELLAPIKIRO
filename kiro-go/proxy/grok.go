@@ -27,7 +27,7 @@ import (
 //   - stream=true, store=false
 //   - delete max_tokens / max_completion_tokens (never pass client caps)
 //   - reasoning: {effort, summary:"concise"}
-//   - include: ["reasoning.encrypted_content"] when effort != none
+//   - include: only reasoning.encrypted_content (never reasoning.summary — 400)
 //
 // Reliability strategy (best completion quality):
 //   1) Always force-stream from Grok and FULLY collect the answer first.
@@ -515,15 +515,17 @@ func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[
 		"max_output_tokens": grokMaxOutputTokens,
 		"reasoning": map[string]interface{}{
 			"effort":  effort,
-			"summary": "detailed", // visible thinking for *-thinking client models
+			// "auto" | "concise" | "detailed" — Grok CLI accepts summary on reasoning object.
+			// Do NOT put "reasoning.summary" in include[] (upstream 400: Argument not supported).
+			"summary": "detailed",
 		},
 	}
 	if instr := extractOpenAISystem(req.Messages); instr != "" {
 		body["instructions"] = instr
 	}
 	if effort != "" && effort != "none" {
-		// encrypted_content for continuity; summary text is what clients display as thinking
-		body["include"] = []string{"reasoning.encrypted_content", "reasoning.summary"}
+		// Only encrypted_content is valid in include for Grok Build Responses API.
+		body["include"] = []string{"reasoning.encrypted_content"}
 	}
 	// Agent tools (Claude Code / Cursor / OpenCode / 9router) â€” required for tool loops.
 	if tools := convertOpenAIToolsToGrokResponses(req.Tools); len(tools) > 0 {
