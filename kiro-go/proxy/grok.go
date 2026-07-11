@@ -20,7 +20,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Grok CLI proxy — clean rewrite from 9router 0.5.x grok-cli provider.
+// Grok CLI proxy â€” clean rewrite from 9router 0.5.x grok-cli provider.
 //
 // 9router transformRequest (authoritative):
 //   - input[] items: {type:"message", role, content: STRING}  (not content parts)
@@ -56,39 +56,51 @@ var grokHTTPClient = &http.Client{
 	},
 }
 
-// TokensToCredits converts total tokens → customer API-key credits (token-based).
+// getGrokHTTPClient returns the default client or a per-proxy client (20m stream timeout).
+func getGrokHTTPClient(acc *config.GrokAccount) *http.Client {
+	if acc == nil || strings.TrimSpace(acc.ProxyURL) == "" {
+		return grokHTTPClient
+	}
+	proxyURL := strings.TrimSpace(acc.ProxyURL)
+	cacheKey := "grok:" + proxyURL
+	if cached, ok := proxyClientCache.Load(cacheKey); ok {
+		return cached.(*http.Client)
+	}
+	client := &http.Client{
+		Timeout:   20 * time.Minute,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	proxyClientCache.Store(cacheKey, client)
+	return client
+}
+
+// TokensToCredits converts total tokens to customer API-key credits (token-based).
 // Same curve as GrokCreditsForRequest with medium effort.
 func TokensToCredits(totalTokens int) float64 {
 	return GrokCreditsForRequest("medium", totalTokens)
 }
 
 // GrokCreditsForRequest maps one successful Grok completion to API-key credits
-// from (prompt+completion) tokens, calibrated on real Kiro API-key history × 1.4.
+// from (prompt+completion) tokens.
 //
-// Empirical Kiro fit (62 keys, ~4.44B tokens, ~38k credits):
+// Base: historical Kiro ~116,372 tokens/credit.
+// Previous Grok markup: 1.4x Kiro.
+// Current: previous Grok x 1.6 => 2.24x Kiro.
 //
-//	tokens/credit ≈ 116,372
-//	credits/request ≈ 1.02
+//	tokensPerCredit = 116372 / 2.24 ≈ 51,952
+//	100k tok medium ≈ 1.93 cr | high ≈ 2.02 cr
+//	1000 cr medium ≈ 52M tokens
 //
-// Target: charge ~1.4× Kiro (slightly more expensive):
-//
-//	tokensPerCredit = 116372 / 1.4 ≈ 83,123
-//	credits = totalTokens / 83123 × effort
-//
-//	  100k tok → ~1.20 cr (medium) / ~1.26 cr (high)
-//	  160k tok → ~1.92 cr (medium) / ~2.02 cr (high)
-//	  1000 cr  → ~83M tokens (medium) / ~79M (high)
-//
-// Effort nudge: low 0.95, medium 1.0, high 1.05, xhigh 1.10.
+// Effort: low 0.95, medium 1.0, high 1.05, xhigh 1.10.
 // Floor 0.05, ceiling 20.
 const grokKiroTokensPerCredit = 116372.0
-const grokCreditMarkup = 1.4 // charge 1.4× historical Kiro
+const grokCreditMarkup = 2.24 // previous Grok 1.4 x 1.6
 
 func GrokCreditsForRequest(effort string, totalTokens int) float64 {
 	if totalTokens <= 0 {
 		return 0.05
 	}
-	tokensPerCredit := grokKiroTokensPerCredit / grokCreditMarkup // ≈ 83123
+	tokensPerCredit := grokKiroTokensPerCredit / grokCreditMarkup // ≈ 51952
 	credits := float64(totalTokens) / tokensPerCredit
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "xhigh", "max":
@@ -382,7 +394,7 @@ func openaiMessagesToGrokInput(msgs []OpenAIMessage) []map[string]interface{} {
 		if strings.EqualFold(role, "system") {
 			continue
 		}
-		// tool result → function_call_output (Responses API)
+		// tool result â†’ function_call_output (Responses API)
 		if strings.EqualFold(role, "tool") {
 			out = append(out, map[string]interface{}{
 				"type":    "function_call_output",
@@ -391,7 +403,7 @@ func openaiMessagesToGrokInput(msgs []OpenAIMessage) []map[string]interface{} {
 			})
 			continue
 		}
-		// assistant with tool_calls → function_call items (+ optional text message)
+		// assistant with tool_calls â†’ function_call items (+ optional text message)
 		if strings.EqualFold(role, "assistant") && len(m.ToolCalls) > 0 {
 			if text := flattenOpenAIContent(m.Content); text != "" {
 				out = append(out, map[string]interface{}{
@@ -436,7 +448,7 @@ func openaiMessagesToGrokInput(msgs []OpenAIMessage) []map[string]interface{} {
 	return out
 }
 
-// convertOpenAIToolsToGrokResponses maps Chat Completions tools → Responses function tools
+// convertOpenAIToolsToGrokResponses maps Chat Completions tools â†’ Responses function tools
 // (9router grok-cli: {type:"function", name, description, parameters}).
 func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interface{} {
 	if len(tools) == 0 {
@@ -491,7 +503,7 @@ func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[
 	if effort != "" && effort != "none" {
 		body["include"] = []string{"reasoning.encrypted_content"}
 	}
-	// Agent tools (Claude Code / Cursor / OpenCode / 9router) — required for tool loops.
+	// Agent tools (Claude Code / Cursor / OpenCode / 9router) â€” required for tool loops.
 	if tools := convertOpenAIToolsToGrokResponses(req.Tools); len(tools) > 0 {
 		body["tools"] = tools
 		body["tool_choice"] = mapOpenAIToolChoiceToGrok(req.ToolChoice)
@@ -573,6 +585,10 @@ func buildGrokHeaders(acc *config.GrokAccount, sessionID, reqID string, turn int
 	}
 	if acc.UserID != "" {
 		h.Set("x-userid", acc.UserID)
+	}
+	if mid := strings.TrimSpace(acc.MachineId); mid != "" {
+		h.Set("x-machine-id", mid)
+		h.Set("x-grok-machine-id", mid)
 	}
 	return h
 }
@@ -1081,7 +1097,7 @@ func claudeRequestToOpenAI(req *ClaudeRequest) *OpenAIRequest {
 		// Expand Claude content blocks into OpenAI chat messages (incl. tool_use / tool_result).
 		out.Messages = append(out.Messages, claudeMessageToOpenAIMessages(role, m.Content)...)
 	}
-	// Map Claude tools → OpenAI tools for Grok Responses.
+	// Map Claude tools â†’ OpenAI tools for Grok Responses.
 	for _, t := range req.Tools {
 		name := strings.TrimSpace(t.Name)
 		if name == "" {
@@ -1251,7 +1267,7 @@ func flattenClaudeContent(content interface{}) string {
 
 
 // streamGrokLiveToOpenAI pipes text + tool_calls live (OpenAI chat.completion.chunk).
-// Matches 9router Responses→OpenAI converter: function_call → delta.tool_calls.
+// Matches 9router Responsesâ†’OpenAI converter: function_call â†’ delta.tool_calls.
 func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, model string) (res grokCollectResult, err error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1834,7 +1850,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				break
 			}
 			httpReq.Header = buildGrokHeaders(acc, sessionID, reqID, 1, upstreamModel)
-			resp, err = grokHTTPClient.Do(httpReq)
+			resp, err = getGrokHTTPClient(acc).Do(httpReq)
 			if err != nil {
 				lastErr = fmt.Errorf("network: %w", err)
 				continue
@@ -1890,7 +1906,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		}
 
 		// STREAM: live pipe like 9router (token-by-token). Collect-first caused many
-		// clients to abort while waiting (only pings / silence) → looked like "cut".
+		// clients to abort while waiting (only pings / silence) â†’ looked like "cut".
 		// NON-STREAM: fully collect then JSON.
 		var result grokCollectResult
 		var cErr error
@@ -1903,7 +1919,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			resp.Body.Close()
 			if cErr != nil {
 				logger.Warnf("[Grok] live stream error after start: %v", cErr)
-				// headers already sent — cannot retry accounts
+				// headers already sent â€” cannot retry accounts
 				return
 			}
 		} else {
@@ -2050,6 +2066,10 @@ func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
 		BanStatus    string  `json:"banStatus,omitempty"`
 		BanReason    string  `json:"banReason,omitempty"`
 		HasRefresh   bool    `json:"hasRefreshToken"`
+		MachineId    string  `json:"machineId,omitempty"`
+		ProxyURL     string  `json:"proxyURL,omitempty"`
+		LastUsed     int64   `json:"lastUsed,omitempty"`
+		UserID       string  `json:"userId,omitempty"`
 	}
 	out := make([]view, 0, len(accs))
 	for _, a := range accs {
@@ -2060,6 +2080,7 @@ func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
 			TotalTokens: a.TotalTokens, TotalCredits: a.TotalCredits,
 			BanStatus: a.BanStatus, BanReason: a.BanReason,
 			HasRefresh: a.RefreshToken != "",
+			MachineId: a.MachineId, ProxyURL: a.ProxyURL, LastUsed: a.LastUsed, UserID: a.UserID,
 		})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"accounts": out, "count": len(out)})
@@ -2087,7 +2108,7 @@ func (h *Handler) apiAddGrokAccount(w http.ResponseWriter, r *http.Request) {
 		acc.ID = uuid.New().String()
 	}
 	if !acc.Enabled {
-		// default enable on import unless explicitly false was set ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Enabled false is zero value;
+		// default enable on import unless explicitly false was set ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Enabled false is zero value;
 		// treat missing as true if tokens present.
 		acc.Enabled = true
 	}
@@ -2140,6 +2161,82 @@ func (h *Handler) apiSetGrokAccountEnabled(w http.ResponseWriter, r *http.Reques
 	}
 	pool.GetGrokPool().Reload()
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "enabled": body.Enabled})
+}
+
+
+func (h *Handler) apiGetGrokAccount(w http.ResponseWriter, r *http.Request, id string) {
+	id = strings.Trim(strings.TrimSpace(id), "/")
+	acc := config.GetGrokAccountByID(id)
+	if acc == nil {
+		w.WriteHeader(404)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"id": acc.ID, "email": acc.Email, "nickname": acc.Nickname, "displayName": acc.DisplayName,
+		"enabled": acc.Enabled, "expiresAt": acc.ExpiresAt, "authMethod": acc.AuthMethod,
+		"requestCount": acc.RequestCount, "errorCount": acc.ErrorCount,
+		"totalTokens": acc.TotalTokens, "totalCredits": acc.TotalCredits,
+		"banStatus": acc.BanStatus, "banReason": acc.BanReason,
+		"hasRefreshToken": acc.RefreshToken != "",
+		"machineId": acc.MachineId, "proxyURL": acc.ProxyURL,
+		"lastUsed": acc.LastUsed, "userId": acc.UserID, "clientId": acc.ClientID,
+	})
+}
+
+func (h *Handler) apiPatchGrokAccount(w http.ResponseWriter, r *http.Request, id string) {
+	id = strings.Trim(strings.TrimSpace(id), "/")
+	if id == "" {
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing id"})
+		return
+	}
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json"})
+		return
+	}
+	var machineId, proxyURL, nickname, displayName *string
+	if v, ok := body["machineId"].(string); ok {
+		machineId = &v
+	}
+	if v, ok := body["proxyURL"].(string); ok {
+		v = strings.TrimSpace(v)
+		if v != "" && !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") &&
+			!strings.HasPrefix(v, "socks5://") && !strings.HasPrefix(v, "socks5h://") {
+			w.WriteHeader(400)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			return
+		}
+		proxyURL = &v
+	}
+	if v, ok := body["nickname"].(string); ok {
+		nickname = &v
+	}
+	if v, ok := body["displayName"].(string); ok {
+		displayName = &v
+	}
+	if machineId == nil && proxyURL == nil && nickname == nil && displayName == nil {
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no fields to update (machineId, proxyURL, nickname, displayName)"})
+		return
+	}
+	if err := config.PatchGrokAccountFields(id, machineId, proxyURL, nickname, displayName); err != nil {
+		w.WriteHeader(404)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	pool.GetGrokPool().Reload()
+	acc := config.GetGrokAccountByID(id)
+	out := map[string]interface{}{"success": true, "id": id}
+	if acc != nil {
+		out["machineId"] = acc.MachineId
+		out["proxyURL"] = acc.ProxyURL
+		out["nickname"] = acc.Nickname
+		out["displayName"] = acc.DisplayName
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // parseGrokAccountJSON accepts:

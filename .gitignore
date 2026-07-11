@@ -46,3 +46,7 @@ kiro-go/kiro-go
 scripts/*grok*dump*
 scripts/grok-export*.txt
 scripts/9router_*.txt
+
+scripts/export-grok*.json
+scripts/export-*-accounts.json
+

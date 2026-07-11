@@ -2,7 +2,8 @@
 # setup-ols-proxy.sh - Tu dong cau hinh OpenLiteSpeed reverse proxy cho site.
 #
 # Tu tim file vhosts.conf theo ten mien, backup, chen extprocessor + context
-# tro toi kiro-go (KIRO_PORT) va keycheck (KEYCHECK_PORT). Doc cong tu .env.
+# tro toi kiro-go (KIRO_PORT), keycheck (KEYCHECK_PORT), keyadmin (KEYADMIN_PORT).
+# Doc cong tu .env.
 #
 # Chay bang root/sudo:  sudo bash scripts/setup-ols-proxy.sh <domain>
 # Vi du:                sudo bash scripts/setup-ols-proxy.sh api.mmodiary.com
@@ -11,20 +12,20 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
-# --- Doc cong tu .env (mac dinh 8080/8081) ---
+# --- Doc cong tu .env (mac dinh 8080/8081/8082) ---
 KIRO_PORT=8080
 KEYCHECK_PORT=8081
+KEYADMIN_PORT=8082
 if [ -f .env ]; then
   # shellcheck disable=SC1091
   set +u; . ./.env; set -u
   KIRO_PORT="${KIRO_PORT:-8080}"
   KEYCHECK_PORT="${KEYCHECK_PORT:-8081}"
+  KEYADMIN_PORT="${KEYADMIN_PORT:-8082}"
 fi
 
 DOMAIN="${1:-}"
 if [ -z "$DOMAIN" ]; then
-  # FlashPanel dat ten thu muc site TRUNG ten mien (vd .../api.mmodiary.com).
-  # -> Tu lay ten thu muc lam domain neu no giong ten mien (co dau cham).
   CAND="$(basename "$REPO_DIR")"
   if echo "$CAND" | grep -q '\.'; then
     DOMAIN="$CAND"
@@ -40,18 +41,16 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Ten external app rieng theo site de nhieu site khong dung ten (dung SITE_NAME).
 APP_KIRO="${SITE_NAME:-kiro}go"
 APP_KC="${SITE_NAME:-kiro}kc"
+APP_KA="${SITE_NAME:-kiro}ka"
 
 echo "==> Tim vhost config cho $DOMAIN ..."
-# Tim file vhosts.conf co chua ten mien, hoac thu muc trung ten mien.
 VHOST=""
 for f in /usr/local/lsws/conf/vhosts/*/vhosts.conf; do
   [ -f "$f" ] || continue
   if grep -q "$DOMAIN" "$f" 2>/dev/null; then VHOST="$f"; break; fi
 done
-# Neu khong grep thay, thu tim theo thu muc chua file (fallback: file duy nhat).
 if [ -z "$VHOST" ]; then
   cnt=$(ls -1 /usr/local/lsws/conf/vhosts/*/vhosts.conf 2>/dev/null | wc -l)
   if [ "$cnt" = "1" ]; then
@@ -66,20 +65,106 @@ if [ -z "$VHOST" ] || [ ! -f "$VHOST" ]; then
 fi
 echo "   Tim thay: $VHOST"
 
-# --- Idempotent: neu da chen roi thi bo qua ---
-if grep -q "extprocessor $APP_KIRO" "$VHOST" 2>/dev/null; then
-  echo "==> Proxy da duoc cau hinh truoc do (bo qua chen)."
-  echo "   Neu muon cau hinh lai, xoa cac khoi '$APP_KIRO'/'$APP_KC' trong $VHOST roi chay lai."
+insert_keyadmin_before_root() {
+  local port="$1"
+  local app="$2"
+  local tmp="${VHOST}.tmp-ka"
+  awk -v app="$app" -v port="$port" '
+    BEGIN { inserted=0 }
+    /^context[[:space:]]+\/[[:space:]]*\{/ && !inserted {
+      print ""
+      print "# ---- keyadmin (bot Telegram) — auto by setup-ols-proxy.sh ----"
+      print "extprocessor " app " {"
+      print "  type                    proxy"
+      print "  address                 127.0.0.1:" port
+      print "  maxConns                20"
+      print "  pcKeepAliveTimeout      60"
+      print "  initTimeout             30"
+      print "  retryTimeout            0"
+      print "  respBuffer              0"
+      print "}"
+      print ""
+      print "context /keyadmin/ {"
+      print "  type                    proxy"
+      print "  handler                 " app
+      print "  addDefaultCharset       off"
+      print "}"
+      print ""
+      inserted=1
+    }
+    { print }
+    END {
+      if (!inserted) {
+        print ""
+        print "extprocessor " app " {"
+        print "  type                    proxy"
+        print "  address                 127.0.0.1:" port
+        print "  maxConns                20"
+        print "  pcKeepAliveTimeout      60"
+        print "  initTimeout             30"
+        print "  retryTimeout            0"
+        print "  respBuffer              0"
+        print "}"
+        print "context /keyadmin/ {"
+        print "  type                    proxy"
+        print "  handler                 " app
+        print "  addDefaultCharset       off"
+        print "}"
+      }
+    }
+  ' "$VHOST" > "$tmp"
+  mv "$tmp" "$VHOST"
+}
+
+balance_check_or_restore() {
+  local bak="$1"
+  local OPEN CLOSE
+  OPEN=$(grep -o '{' "$VHOST" | wc -l)
+  CLOSE=$(grep -o '}' "$VHOST" | wc -l)
+  if [ "$OPEN" != "$CLOSE" ]; then
+    echo "!! LOI: dau ngoac khong can bang ({ =$OPEN, } =$CLOSE). Khoi phuc backup."
+    cp "$bak" "$VHOST"
+    exit 1
+  fi
+  echo "==> Dau ngoac can bang ({ =$OPEN, } =$CLOSE). OK."
+}
+
+restart_and_probe() {
+  echo "==> Restart OpenLiteSpeed ..."
+  /usr/local/lsws/bin/lswsctrl restart
+  sleep 3
+  echo "==> Kiem tra endpoint (qua HTTPS noi bo):"
+  for path in /admin /check-key /keyadmin/healthz; do
+    code=$(curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1$path" -H "Host: $DOMAIN" || echo "ERR")
+    echo "   $path -> $code"
+  done
+}
+
+# --- Da co keyadmin? ---
+if grep -qE "extprocessor[[:space:]]+$APP_KA|context[[:space:]]+/keyadmin" "$VHOST" 2>/dev/null; then
+  echo "==> keyadmin proxy da co trong vhost (bo qua)."
   exit 0
 fi
 
-# --- Backup ---
+# --- Proxy kiro da co nhung thieu keyadmin -> chi bo sung ---
+if grep -q "extprocessor $APP_KIRO" "$VHOST" 2>/dev/null; then
+  echo "==> Proxy kiro da co, dang BO SUNG keyadmin (port $KEYADMIN_PORT) ..."
+  BAK="${VHOST}.bak-keyadmin-$(date +%Y%m%d-%H%M%S)"
+  cp "$VHOST" "$BAK"
+  echo "==> Da backup: $BAK"
+  insert_keyadmin_before_root "$KEYADMIN_PORT" "$APP_KA"
+  balance_check_or_restore "$BAK"
+  restart_and_probe
+  echo "==> Xong (upgrade keyadmin). /keyadmin/healthz ky vong 200 (body: ok)."
+  echo "   Backup: $BAK"
+  exit 0
+fi
+
+# --- Chen full lan dau ---
 BAK="${VHOST}.bak-$(date +%Y%m%d-%H%M%S)"
 cp "$VHOST" "$BAK"
 echo "==> Da backup: $BAK"
 
-# --- Chen extprocessor + context vao CUOI file ---
-# Context cu the (/check-key, /api/check-key) dat truoc; context "/" dat cuoi cung.
 cat >> "$VHOST" <<OLSBLOCK
 
 # ==== KIRO-GO REVERSE PROXY (tu dong them boi setup-ols-proxy.sh) ====
@@ -103,6 +188,16 @@ extprocessor $APP_KC {
   respBuffer              0
 }
 
+extprocessor $APP_KA {
+  type                    proxy
+  address                 127.0.0.1:$KEYADMIN_PORT
+  maxConns                20
+  pcKeepAliveTimeout      60
+  initTimeout             30
+  retryTimeout            0
+  respBuffer              0
+}
+
 context /api/check-key {
   type                    proxy
   handler                 $APP_KC
@@ -115,6 +210,13 @@ context /check-key {
   addDefaultCharset       off
 }
 
+# Bot Telegram: https://DOMAIN/keyadmin/api/... + Bearer KEYADMIN_TOKEN
+context /keyadmin/ {
+  type                    proxy
+  handler                 $APP_KA
+  addDefaultCharset       off
+}
+
 context / {
   type                    proxy
   handler                 $APP_KIRO
@@ -123,27 +225,7 @@ context / {
 # ==== HET KIRO-GO REVERSE PROXY ====
 OLSBLOCK
 
-# --- Kiem tra can bang { } truoc khi restart (tranh lam sap OLS) ---
-OPEN=$(grep -o '{' "$VHOST" | wc -l)
-CLOSE=$(grep -o '}' "$VHOST" | wc -l)
-if [ "$OPEN" != "$CLOSE" ]; then
-  echo "!! LOI: dau ngoac khong can bang ({ =$OPEN, } =$CLOSE). Khoi phuc backup."
-  cp "$BAK" "$VHOST"
-  exit 1
-fi
-echo "==> Dau ngoac can bang ({ =$OPEN, } =$CLOSE). OK."
-
-# --- Restart OLS ---
-echo "==> Restart OpenLiteSpeed ..."
-/usr/local/lsws/bin/lswsctrl restart
-sleep 3
-
-# --- Kiem tra nhanh qua HTTPS noi bo ---
-echo "==> Kiem tra endpoint (qua HTTPS noi bo):"
-for path in /admin /check-key; do
-  code=$(curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1$path" -H "Host: $DOMAIN" || echo "ERR")
-  echo "   $path -> $code"
-done
-
-echo "==> Xong. Neu /admin tra 200 la proxy da hoat dong."
+balance_check_or_restore "$BAK"
+restart_and_probe
+echo "==> Xong. /keyadmin/healthz ky vong 200 (body: ok)."
 echo "   Backup vhost cu: $BAK"

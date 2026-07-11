@@ -230,6 +230,24 @@ func auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// stripKeyadminPrefix: OpenLiteSpeed proxy context /keyadmin/ thuong GIU nguyen URI
+// (/keyadmin/healthz) thay vi cat prefix nhu nginx proxy_pass .../.
+// Cho phep goi ca /healthz lan /keyadmin/healthz.
+func stripKeyadminPrefix(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/keyadmin" {
+			r.URL.Path = "/"
+		} else if strings.HasPrefix(p, "/keyadmin/") {
+			r.URL.Path = strings.TrimPrefix(p, "/keyadmin")
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func decodeBody(r *http.Request, v interface{}) error {
 	r.Body = http.MaxBytesReader(nil, r.Body, 8192)
 	return json.NewDecoder(r.Body).Decode(v)
@@ -721,7 +739,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           mux,
+		Handler:           stripKeyadminPrefix(mux),
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      20 * time.Second,

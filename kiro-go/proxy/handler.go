@@ -2243,6 +2243,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/grok-accounts/") && strings.HasSuffix(path, "/enabled") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/grok-accounts/"), "/enabled")
 		h.apiSetGrokAccountEnabled(w, r, id)
+	case strings.HasPrefix(path, "/grok-accounts/") && (r.Method == "PUT" || r.Method == "PATCH"):
+		h.apiPatchGrokAccount(w, r, strings.TrimPrefix(path, "/grok-accounts/"))
+	case strings.HasPrefix(path, "/grok-accounts/") && r.Method == "GET":
+		h.apiGetGrokAccount(w, r, strings.TrimPrefix(path, "/grok-accounts/"))
 	case strings.HasPrefix(path, "/grok-accounts/") && r.Method == "DELETE":
 		h.apiDeleteGrokAccount(w, r, strings.TrimPrefix(path, "/grok-accounts/"))
 	case path == "/accounts/batch" && r.Method == "POST":

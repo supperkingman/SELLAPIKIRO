@@ -31,11 +31,14 @@ type GrokAccount struct {
 	ErrorCount   int   `json:"errorCount,omitempty"`
 	LastUsed     int64 `json:"lastUsed,omitempty"`
 	TotalTokens  int   `json:"totalTokens,omitempty"`
-	// TotalCredits uses the same unit as ApiKeyEntry.CreditsUsed:
-	// 1 credit = 1000 tokens (input+output). See proxy/grok.go TokensToCredits.
+	// TotalCredits uses the same unit as ApiKeyEntry.CreditsUsed (customer billing unit).
 	TotalCredits float64 `json:"totalCredits,omitempty"`
 	BanStatus    string  `json:"banStatus,omitempty"`
 	BanReason    string  `json:"banReason,omitempty"`
+
+	// Per-account identity / egress (same idea as Kiro Account).
+	MachineId string `json:"machineId,omitempty"`
+	ProxyURL  string `json:"proxyURL,omitempty"`
 }
 
 // DefaultGrokClientID is the public OAuth client id used by Grok Build / grok-cli (9router).
@@ -124,6 +127,12 @@ func AddGrokAccount(account GrokAccount) error {
 				if account.BanStatus == "" {
 					account.BanStatus = a.BanStatus
 					account.BanReason = a.BanReason
+				}
+				if account.MachineId == "" {
+					account.MachineId = a.MachineId
+				}
+				if account.ProxyURL == "" {
+					account.ProxyURL = a.ProxyURL
 				}
 				cfg.GrokAccounts[i] = account
 				return Save()
@@ -237,6 +246,35 @@ func UpdateGrokAccountStats(id string, requestCount, errorCount, totalTokens int
 }
 
 // GetGrokAccountByID returns a copy of one account, or nil.
+
+// PatchGrokAccountFields updates editable admin fields without replacing tokens.
+func PatchGrokAccountFields(id string, machineId, proxyURL *string, nickname, displayName *string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	for i, a := range cfg.GrokAccounts {
+		if a.ID != id {
+			continue
+		}
+		if machineId != nil {
+			cfg.GrokAccounts[i].MachineId = *machineId
+		}
+		if proxyURL != nil {
+			cfg.GrokAccounts[i].ProxyURL = *proxyURL
+		}
+		if nickname != nil {
+			cfg.GrokAccounts[i].Nickname = *nickname
+		}
+		if displayName != nil {
+			cfg.GrokAccounts[i].DisplayName = *displayName
+		}
+		return Save()
+	}
+	return fmt.Errorf("grok account not found")
+}
+
 func GetGrokAccountByID(id string) *GrokAccount {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
