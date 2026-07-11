@@ -53,19 +53,20 @@ func extractProvidedKey(r *http.Request) string {
 // Returns (entry, nil) on success. entry is nil when the legacy single-key path
 // is used or when the master switch is off.
 func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
-	if !config.IsApiKeyRequired() {
-		return nil, nil
-	}
-
 	provided := extractProvidedKey(r)
+	required := config.IsApiKeyRequired()
 
-	if config.HasApiKeys() {
-		if provided == "" {
-			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
-		}
+	// Always try to resolve a multi-key entry when the client sent a key, even if
+	// RequireApiKey is off. Otherwise admin-created keys never get creditsUsed /
+	// requestsCount (usage only updates global stats).
+	if config.HasApiKeys() && provided != "" {
 		entry := config.FindApiKeyByValue(provided)
 		if entry == nil {
-			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+			if required {
+				return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+			}
+			// Open mode + unknown key: allow request but do not attribute usage.
+			return nil, nil
 		}
 		if !entry.Enabled {
 			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
@@ -79,10 +80,18 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		return entry, nil
 	}
 
+	if !required {
+		return nil, nil
+	}
+
+	if config.HasApiKeys() {
+		// Auth required, keys exist, but client omitted Authorization / X-Api-Key.
+		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+	}
+
 	// Legacy single-key path.
 	expected := config.GetApiKey()
 	if expected == "" {
-		// Auth required but nothing configured → fail closed.
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key authentication is required but no keys are configured")
 	}
 	if provided == "" || provided != expected {
