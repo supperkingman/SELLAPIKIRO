@@ -358,14 +358,14 @@ func maybeRewriteAssistantText(text string, silent bool) string {
 	}
 	return out
 }
-// customerSupportContact is appended to customer-facing upstream errors.
+// customerSupportContact is appended to customer-facing upstream errors (Kiro-style short msgs + contact).
 const customerSupportContact = " Liên hệ admin Telegram: @tainguyenvibebot"
 
 // withSupportHint appends the admin contact line (idempotent).
 func withSupportHint(msg string) string {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		msg = "The model is temporarily unavailable."
+		msg = "No available accounts"
 	}
 	if strings.Contains(msg, "@tainguyenvibebot") {
 		return msg
@@ -373,89 +373,66 @@ func withSupportHint(msg string) string {
 	return msg + customerSupportContact
 }
 
-// sanitizeGrokErrorForClient strips xAI/Grok fingerprints from errors returned to customers.
-// When silent (Claude/OpenAI disguise), never leak grok-cli, xai, auth_kind, account emails, etc.
-func sanitizeGrokErrorForClient(msg string, silent bool) string {
+// kiroStylePublicError maps internal upstream failures to the same short phrases Kiro path uses.
+// Claude: sendClaudeError → {"type":"error","error":{"type":"api_error","message":"No available accounts"}}
+// OpenAI: sendOpenAIError → {"error":{"type":"server_error","message":"No available accounts"}}
+func kiroStylePublicError(msg string, silent bool) (status int, errType, publicMsg string) {
 	msg = strings.TrimSpace(msg)
-	if msg == "" {
-		if silent {
-			return withSupportHint("The model is temporarily unavailable. Please try again.")
-		}
-		return withSupportHint("Upstream request failed.")
-	}
 	low := strings.ToLower(msg)
 
-	// Classify first (before stripping) so we can map to stable public messages.
 	isAuth := strings.Contains(low, "401") || strings.Contains(low, "403") ||
 		strings.Contains(low, "invalid or expired credentials") ||
 		strings.Contains(low, "permissiondenied") ||
 		strings.Contains(low, "no auth context") ||
 		strings.Contains(low, "x_xai_token_auth") ||
-		strings.Contains(low, "auth http")
+		strings.Contains(low, "auth http") ||
+		strings.Contains(low, "unauthorized") ||
+		strings.Contains(low, "forbidden")
 	isQuota := strings.Contains(low, "402") ||
 		strings.Contains(low, "insufficient_quota") ||
 		strings.Contains(low, "spending limit") ||
 		strings.Contains(low, "credits exhausted") ||
 		strings.Contains(low, "build credits") ||
+		strings.Contains(low, "overage") ||
 		strings.Contains(low, "quota")
+	isRate := strings.Contains(low, "429") ||
+		(strings.Contains(low, "rate") && strings.Contains(low, "limit"))
 
 	if silent {
-		if isQuota {
-			return withSupportHint("Rate limit or usage limit reached for this model. Please retry later.")
+		// Match Kiro final client wording: almost always "No available accounts" (503).
+		switch {
+		case isQuota || isRate:
+			return 429, "rate_limit_error", withSupportHint("Rate limit reached. Please try again later.")
+		case isAuth:
+			return 503, "api_error", withSupportHint("No available accounts")
+		case strings.Contains(low, "no capacity") || strings.Contains(low, "no grok") ||
+			strings.Contains(low, "all grok") || strings.Contains(low, "all upstream") ||
+			strings.Contains(low, "all accounts") || msg == "":
+			return 503, "api_error", withSupportHint("No available accounts")
+		default:
+			// Never dump provider JSON (grok-cli / xai). Same fallback as Kiro exhausted pool.
+			return 503, "api_error", withSupportHint("No available accounts")
 		}
-		if isAuth {
-			// Grok often returns 401 when Build credits/session are dead — do not say "Grok".
-			return withSupportHint("The model is temporarily unavailable. Please try again shortly.")
-		}
-		if strings.Contains(low, "429") || strings.Contains(low, "rate") {
-			return withSupportHint("Rate limit reached. Please retry later.")
-		}
-		if strings.Contains(low, "no grok accounts") || strings.Contains(low, "all grok") ||
-			strings.Contains(low, "no capacity") || strings.Contains(low, "all upstream") {
-			return withSupportHint("No capacity available for this model right now.")
-		}
-		// Generic: strip brand tokens then collapse to short message if still dirty.
-		clean := msg
-		repls := []struct{ old, new string }{
-			{"grok-cli/", ""},
-			{"grok-cli", "upstream"},
-			{"Grok Build", "upstream"},
-			{"Grok", "upstream"},
-			{"grok", "upstream"},
-			{"xAI", "upstream"},
-			{"xai", "upstream"},
-			{"x_xai_token_auth", "auth"},
-			{"auth_kind=bearer", ""},
-			{"PermissionDenied", "denied"},
-			{"no auth context", "unauthorized"},
-			{"cli-chat-proxy.grok.com", "upstream"},
-			{"auth.x.ai", "upstream"},
-		}
-		for _, r := range repls {
-			clean = strings.ReplaceAll(clean, r.old, r.new)
-		}
-		// Drop raw JSON blobs that still look like provider dumps.
-		if (strings.Contains(clean, "{") && strings.Contains(clean, "error")) ||
-			strings.Contains(low, "upstream=") || len(clean) > 220 {
-			return withSupportHint("Upstream model error. Please try again.")
-		}
-		clean = strings.TrimSpace(clean)
-		if clean == "" || clean == "HTTP 401:" || clean == "HTTP 403:" {
-			return withSupportHint("The model is temporarily unavailable. Please try again shortly.")
-		}
-		return withSupportHint(clean)
 	}
 
-	// Explicit Grok API path: still avoid dumping full provider JSON when possible.
-	if isQuota {
-		return withSupportHint("Build credits or spending limit exhausted for this account.")
+	// Explicit Grok model id requested by customer — still short, no provider dump.
+	switch {
+	case isQuota:
+		return 402, "insufficient_quota", withSupportHint("Rate limit or usage limit reached. Please try again later.")
+	case isRate:
+		return 429, "rate_limit_error", withSupportHint("Rate limit reached. Please try again later.")
+	case isAuth:
+		return 503, "api_error", withSupportHint("No available accounts")
+	default:
+		return 502, "api_error", withSupportHint("No available accounts")
 	}
-	if isAuth {
-		return withSupportHint("Upstream authentication failed. Account may need re-import or has no remaining access.")
-	}
-	return withSupportHint(truncateStr(msg, 240))
 }
 
+// sanitizeGrokErrorForClient keeps a single short public message (Kiro-compatible).
+func sanitizeGrokErrorForClient(msg string, silent bool) string {
+	_, _, public := kiroStylePublicError(msg, silent)
+	return public
+}
 
 func truncateStr(s string, n int) string {
 	if len(s) <= n {
@@ -2171,18 +2148,28 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	}
 
 	sendErr := func(status int, errType, msg string) {
-		msg = sanitizeGrokErrorForClient(msg, silent)
-		// Silent Claude path: map provider statuses to less fingerprintable codes.
+		// Re-map through Kiro-style classifier (status/type may be overridden).
+		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
-			if status == 401 || status == 403 {
-				status = 503
-				errType = "api_error"
-			}
-			if status == 402 {
-				status = 429
-				errType = "rate_limit_error"
+			// Prefer classifier for silent disguise path (Claude/OpenAI via Grok).
+			status, errType, public = st, et, public
+		} else {
+			// Explicit grok path: keep short public message; align OpenAI 5xx type with Kiro.
+			errType = et
+			public = sanitizeGrokErrorForClient(msg, false)
+			if status == 0 {
+				status = st
 			}
 		}
+		if format == "openai" && status >= 500 {
+			errType = "server_error"
+		}
+		if format == "openai" && status == 503 && errType == "api_error" {
+			errType = "server_error"
+		}
+		msg = public
+
+		// Already streaming: Anthropic SSE error event (same shape as Kiro mid-stream).
 		if stream && w.Header().Get("Content-Type") != "" {
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
 				h.sendSSE(w, fl, "error", map[string]interface{}{
@@ -2190,12 +2177,23 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				})
 				return
 			}
+			if fl, ok := w.(http.Flusher); ok && format == "openai" {
+				b, _ := json.Marshal(map[string]interface{}{
+					"error": map[string]interface{}{"type": errType, "message": msg},
+				})
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				fl.Flush()
+				return
+			}
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": map[string]interface{}{"type": errType, "message": msg},
-		})
+
+		// Non-stream / before body: match Kiro sendClaudeError / sendOpenAIError exactly.
+		if format == "claude" {
+			h.sendClaudeError(w, status, errType, msg)
+			return
+		}
+		h.sendOpenAIError(w, status, errType, msg)
 	}
 
 	gp := pool.GetGrokPool()
@@ -2203,7 +2201,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		gp.Reload()
 	}
 	if gp.Count() == 0 {
-		sendErr(503, "service_unavailable", "No capacity available for this model")
+		sendErr(503, "api_error", "No available accounts")
 		return
 	}
 
@@ -2409,20 +2407,14 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	msg := "All upstream accounts failed"
+	// Same end-state as Kiro when pool exhausted: 503 + "No available accounts" (+ support contact).
+	msg := "No available accounts"
 	if lastErr != nil {
 		msg = lastErr.Error()
 	}
-	// Always sanitize; silent maps to generic Claude-like errors.
-	status := 502
-	errType := "api_error"
-	low := strings.ToLower(msg)
-	if strings.Contains(low, "402") || strings.Contains(low, "credits exhausted") || strings.Contains(low, "spending limit") || strings.Contains(low, "quota") {
-		status = 402
-		errType = "insufficient_quota"
-	}
-	sendErr(status, errType, msg)
+	sendErr(503, "api_error", msg)
 }
+
 
 func (h *Handler) trySilentGrokClaudeFallback(w http.ResponseWriter, r *http.Request, req *ClaudeRequest, requestedModel string) bool {
 	gp := pool.GetGrokPool()

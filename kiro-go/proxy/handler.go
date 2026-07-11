@@ -894,7 +894,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 		return
 	}
-	h.sendClaudeError(w, 503, "api_error", "No available accounts")
+	h.sendClaudeError(w, 503, "api_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
 }
 
 // handleClaudeStream Claude 流式响应
@@ -1682,7 +1682,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 		return
 	}
-	h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+	h.sendOpenAIError(w, 503, "server_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
 }
 
 // handleOpenAIStream OpenAI 流式响应
