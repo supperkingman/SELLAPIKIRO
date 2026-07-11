@@ -358,15 +358,30 @@ func maybeRewriteAssistantText(text string, silent bool) string {
 	}
 	return out
 }
+// customerSupportContact is appended to customer-facing upstream errors.
+const customerSupportContact = " Liên hệ admin Telegram: @tainguyenvibebot"
+
+// withSupportHint appends the admin contact line (idempotent).
+func withSupportHint(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		msg = "The model is temporarily unavailable."
+	}
+	if strings.Contains(msg, "@tainguyenvibebot") {
+		return msg
+	}
+	return msg + customerSupportContact
+}
+
 // sanitizeGrokErrorForClient strips xAI/Grok fingerprints from errors returned to customers.
 // When silent (Claude/OpenAI disguise), never leak grok-cli, xai, auth_kind, account emails, etc.
 func sanitizeGrokErrorForClient(msg string, silent bool) string {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		if silent {
-			return "The model is temporarily unavailable. Please try again."
+			return withSupportHint("The model is temporarily unavailable. Please try again.")
 		}
-		return "upstream request failed"
+		return withSupportHint("Upstream request failed.")
 	}
 	low := strings.ToLower(msg)
 
@@ -386,17 +401,18 @@ func sanitizeGrokErrorForClient(msg string, silent bool) string {
 
 	if silent {
 		if isQuota {
-			return "Rate limit or usage limit reached for this model. Please retry later."
+			return withSupportHint("Rate limit or usage limit reached for this model. Please retry later.")
 		}
 		if isAuth {
 			// Grok often returns 401 when Build credits/session are dead — do not say "Grok".
-			return "The model is temporarily unavailable. Please try again shortly."
+			return withSupportHint("The model is temporarily unavailable. Please try again shortly.")
 		}
 		if strings.Contains(low, "429") || strings.Contains(low, "rate") {
-			return "Rate limit reached. Please retry later."
+			return withSupportHint("Rate limit reached. Please retry later.")
 		}
-		if strings.Contains(low, "no grok accounts") || strings.Contains(low, "all grok") {
-			return "No capacity available for this model right now."
+		if strings.Contains(low, "no grok accounts") || strings.Contains(low, "all grok") ||
+			strings.Contains(low, "no capacity") || strings.Contains(low, "all upstream") {
+			return withSupportHint("No capacity available for this model right now.")
 		}
 		// Generic: strip brand tokens then collapse to short message if still dirty.
 		clean := msg
@@ -421,23 +437,23 @@ func sanitizeGrokErrorForClient(msg string, silent bool) string {
 		// Drop raw JSON blobs that still look like provider dumps.
 		if (strings.Contains(clean, "{") && strings.Contains(clean, "error")) ||
 			strings.Contains(low, "upstream=") || len(clean) > 220 {
-			return "Upstream model error. Please try again."
+			return withSupportHint("Upstream model error. Please try again.")
 		}
 		clean = strings.TrimSpace(clean)
 		if clean == "" || clean == "HTTP 401:" || clean == "HTTP 403:" {
-			return "The model is temporarily unavailable. Please try again shortly."
+			return withSupportHint("The model is temporarily unavailable. Please try again shortly.")
 		}
-		return clean
+		return withSupportHint(clean)
 	}
 
 	// Explicit Grok API path: still avoid dumping full provider JSON when possible.
 	if isQuota {
-		return "Build credits or spending limit exhausted for this account."
+		return withSupportHint("Build credits or spending limit exhausted for this account.")
 	}
 	if isAuth {
-		return "Upstream authentication failed. Account may need re-import or has no remaining access."
+		return withSupportHint("Upstream authentication failed. Account may need re-import or has no remaining access.")
 	}
-	return truncateStr(msg, 240)
+	return withSupportHint(truncateStr(msg, 240))
 }
 
 
