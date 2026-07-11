@@ -2240,6 +2240,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetGrokAccounts(w, r)
 	case path == "/grok-accounts" && r.Method == "POST":
 		h.apiAddGrokAccount(w, r)
+	case path == "/grok-accounts/quota/refresh" && r.Method == "POST":
+		h.apiRefreshAllGrokQuota(w, r)
+	case strings.HasPrefix(path, "/grok-accounts/") && strings.HasSuffix(path, "/quota") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/grok-accounts/"), "/quota")
+		h.apiRefreshGrokQuota(w, r, id)
 	case strings.HasPrefix(path, "/grok-accounts/") && strings.HasSuffix(path, "/enabled") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/grok-accounts/"), "/enabled")
 		h.apiSetGrokAccountEnabled(w, r, id)
@@ -2401,7 +2406,8 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"daysRemaining":     a.DaysRemaining,
 			"usageCurrent":      a.UsageCurrent,
 			"usageLimit":        a.UsageLimit,
-			"usagePercent":      a.UsagePercent,
+			"usageRemaining":    maxFloat64(0, a.UsageLimit-a.UsageCurrent),
+			"usagePercent":      usagePercent(a.UsageCurrent, a.UsageLimit),
 			"nextResetDate":     a.NextResetDate,
 			"lastRefresh":       a.LastRefresh,
 			"trialUsageCurrent": a.TrialUsageCurrent,
@@ -3698,7 +3704,8 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"daysRemaining":     account.DaysRemaining,
 		"usageCurrent":      account.UsageCurrent,
 		"usageLimit":        account.UsageLimit,
-		"usagePercent":      account.UsagePercent,
+		"usageRemaining":    maxFloat64(0, account.UsageLimit-account.UsageCurrent),
+		"usagePercent":      usagePercent(account.UsageCurrent, account.UsageLimit),
 		"nextResetDate":     account.NextResetDate,
 		"lastRefresh":       account.LastRefresh,
 		"trialUsageCurrent": account.TrialUsageCurrent,

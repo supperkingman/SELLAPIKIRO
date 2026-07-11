@@ -118,6 +118,27 @@ func GrokCreditsForRequest(effort string, totalTokens int) float64 {
 	}
 	return math.Round(credits*10000) / 10000
 }
+func maxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func usagePercent(cur, lim float64) float64 {
+	if lim <= 0 {
+		return 0
+	}
+	p := cur / lim * 100
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
 func IsGrokModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	return strings.HasPrefix(m, "grok-") ||
@@ -1893,6 +1914,8 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if s := strings.TrimSpace(string(b)); s != "" {
 				msg += " " + truncateStr(s, 200)
 			}
+			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
+			gp.Reload()
 			sendErr(402, "insufficient_quota", msg)
 			return
 		}
@@ -2070,6 +2093,11 @@ func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
 		ProxyURL     string  `json:"proxyURL,omitempty"`
 		LastUsed     int64   `json:"lastUsed,omitempty"`
 		UserID       string  `json:"userId,omitempty"`
+		QuotaStatus    string  `json:"quotaStatus,omitempty"`
+		QuotaMessage   string  `json:"quotaMessage,omitempty"`
+		QuotaCheckedAt int64   `json:"quotaCheckedAt,omitempty"`
+		QuotaRemaining float64 `json:"quotaRemaining,omitempty"`
+		QuotaLimit     float64 `json:"quotaLimit,omitempty"`
 	}
 	out := make([]view, 0, len(accs))
 	for _, a := range accs {
@@ -2081,6 +2109,8 @@ func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
 			BanStatus: a.BanStatus, BanReason: a.BanReason,
 			HasRefresh: a.RefreshToken != "",
 			MachineId: a.MachineId, ProxyURL: a.ProxyURL, LastUsed: a.LastUsed, UserID: a.UserID,
+			QuotaStatus: a.QuotaStatus, QuotaMessage: a.QuotaMessage, QuotaCheckedAt: a.QuotaCheckedAt,
+			QuotaRemaining: a.QuotaRemaining, QuotaLimit: a.QuotaLimit,
 		})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"accounts": out, "count": len(out)})
@@ -2181,6 +2211,8 @@ func (h *Handler) apiGetGrokAccount(w http.ResponseWriter, r *http.Request, id s
 		"hasRefreshToken": acc.RefreshToken != "",
 		"machineId": acc.MachineId, "proxyURL": acc.ProxyURL,
 		"lastUsed": acc.LastUsed, "userId": acc.UserID, "clientId": acc.ClientID,
+		"quotaStatus": acc.QuotaStatus, "quotaMessage": acc.QuotaMessage,
+		"quotaCheckedAt": acc.QuotaCheckedAt, "quotaRemaining": acc.QuotaRemaining, "quotaLimit": acc.QuotaLimit,
 	})
 }
 
@@ -2237,6 +2269,212 @@ func (h *Handler) apiPatchGrokAccount(w http.ResponseWriter, r *http.Request, id
 		out["displayName"] = acc.DisplayName
 	}
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+
+// probeGrokAccountQuota best-effort check of Grok Build remaining capacity.
+// xAI does not expose a stable public usage API for CLI OAuth; we:
+//  1) refresh token
+//  2) GET /v1/billing (if available)
+//  3) fallback: tiny non-stream completion (max_output_tokens=1) — detects 402 exhausted
+func (h *Handler) probeGrokAccountQuota(acc *config.GrokAccount) (status, message string, remaining, limit float64, err error) {
+	status = "unknown"
+	remaining = -1
+	limit = 0
+	if acc == nil {
+		return "error", "nil account", -1, 0, fmt.Errorf("nil account")
+	}
+	if err = h.ensureValidGrokToken(acc); err != nil {
+		_ = config.SetGrokAccountQuota(acc.ID, "error", err.Error(), -1, 0)
+		return "error", err.Error(), -1, 0, err
+	}
+
+	client := getGrokHTTPClient(acc)
+	// 1) Try billing endpoint
+	req, e := http.NewRequest(http.MethodGet, "https://cli-chat-proxy.grok.com/v1/billing", nil)
+	if e == nil {
+		req.Header = buildGrokHeaders(acc, uuid.New().String(), uuid.New().String(), 0, "grok-4.5")
+		resp, e2 := client.Do(req)
+		if e2 == nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			resp.Body.Close()
+			if resp.StatusCode == 402 {
+				msg := truncateStr(string(body), 300)
+				if msg == "" {
+					msg = "Build credits exhausted"
+				}
+				_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
+				return "exhausted", msg, 0, 0, nil
+			}
+			if resp.StatusCode == 200 {
+				rem, lim, msg := parseGrokQuotaJSON(body)
+				st := "ok"
+				if rem == 0 && lim > 0 {
+					st = "exhausted"
+				}
+				if msg == "" {
+					msg = "billing ok"
+				}
+				_ = config.SetGrokAccountQuota(acc.ID, st, msg, rem, lim)
+				return st, msg, rem, lim, nil
+			}
+		}
+	}
+
+	// 2) Tiny probe completion (detects spending-limit 402 without long generation)
+	probeBody := map[string]interface{}{
+		"model":             "grok-4.5",
+		"input":             "ping",
+		"stream":            false,
+		"store":             false,
+		"max_output_tokens": 1,
+	}
+	raw, _ := json.Marshal(probeBody)
+	httpReq, e := http.NewRequest(http.MethodPost, grokResponsesURL, bytes.NewReader(raw))
+	if e != nil {
+		_ = config.SetGrokAccountQuota(acc.ID, "error", e.Error(), -1, 0)
+		return "error", e.Error(), -1, 0, e
+	}
+	httpReq.Header = buildGrokHeaders(acc, uuid.New().String(), uuid.New().String(), 1, "grok-4.5")
+	resp, e := client.Do(httpReq)
+	if e != nil {
+		_ = config.SetGrokAccountQuota(acc.ID, "error", e.Error(), -1, 0)
+		return "error", e.Error(), -1, 0, e
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == 402:
+		msg := truncateStr(string(body), 300)
+		if msg == "" {
+			msg = "Build credits exhausted (spending limit)"
+		}
+		_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
+		return "exhausted", msg, 0, 0, nil
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		msg := "auth failed: " + truncateStr(string(body), 200)
+		_ = config.SetGrokAccountQuota(acc.ID, "error", msg, -1, 0)
+		return "error", msg, -1, 0, fmt.Errorf("%s", msg)
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		msg := "upstream accepted probe (quota available; exact remaining unknown)"
+		_ = config.SetGrokAccountQuota(acc.ID, "ok", msg, -1, 0)
+		return "ok", msg, -1, 0, nil
+	default:
+		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+		_ = config.SetGrokAccountQuota(acc.ID, "unknown", msg, -1, 0)
+		return "unknown", msg, -1, 0, nil
+	}
+}
+
+func parseGrokQuotaJSON(body []byte) (remaining, limit float64, message string) {
+	remaining = -1
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return -1, 0, ""
+	}
+	// common shapes
+	for _, k := range []string{"remaining", "remaining_credits", "credits_remaining", "balance"} {
+		if v, ok := m[k]; ok {
+			if f, ok2 := asFloat(v); ok2 {
+				remaining = f
+			}
+		}
+	}
+	for _, k := range []string{"limit", "credits_limit", "spending_limit", "total"} {
+		if v, ok := m[k]; ok {
+			if f, ok2 := asFloat(v); ok2 {
+				limit = f
+			}
+		}
+	}
+	if u, ok := m["usage"].(map[string]interface{}); ok {
+		if v, ok2 := asFloat(u["remaining"]); ok2 {
+			remaining = v
+		}
+		if v, ok2 := asFloat(u["limit"]); ok2 {
+			limit = v
+		}
+	}
+	if s, ok := m["message"].(string); ok {
+		message = s
+	}
+	b, _ := json.Marshal(m)
+	if message == "" {
+		message = truncateStr(string(b), 200)
+	}
+	return remaining, limit, message
+}
+
+func asFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		var f float64
+		_, err := fmt.Sscanf(n, "%f", &f)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (h *Handler) apiRefreshGrokQuota(w http.ResponseWriter, r *http.Request, id string) {
+	id = strings.Trim(strings.TrimSpace(id), "/")
+	acc := config.GetGrokAccountByID(id)
+	if acc == nil {
+		w.WriteHeader(404)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		return
+	}
+	status, msg, rem, lim, err := h.probeGrokAccountQuota(acc)
+	pool.GetGrokPool().Reload()
+	out := map[string]interface{}{
+		"success":        err == nil || status != "error",
+		"id":             id,
+		"email":          acc.Email,
+		"quotaStatus":    status,
+		"quotaMessage":   msg,
+		"quotaRemaining": rem,
+		"quotaLimit":     lim,
+		"quotaCheckedAt": time.Now().Unix(),
+	}
+	if err != nil && status == "error" {
+		w.WriteHeader(502)
+		out["error"] = err.Error()
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (h *Handler) apiRefreshAllGrokQuota(w http.ResponseWriter, r *http.Request) {
+	accs := config.GetGrokAccounts()
+	results := make([]map[string]interface{}, 0, len(accs))
+	for i := range accs {
+		a := accs[i]
+		status, msg, rem, lim, err := h.probeGrokAccountQuota(&a)
+		row := map[string]interface{}{
+			"id": a.ID, "email": a.Email,
+			"quotaStatus": status, "quotaMessage": msg,
+			"quotaRemaining": rem, "quotaLimit": lim,
+		}
+		if err != nil {
+			row["error"] = err.Error()
+		}
+		results = append(results, row)
+	}
+	pool.GetGrokPool().Reload()
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(results),
+		"results": results,
+	})
 }
 
 // parseGrokAccountJSON accepts:

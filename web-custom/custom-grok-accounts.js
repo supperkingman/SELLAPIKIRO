@@ -31,6 +31,32 @@
     catch (e) { return String(unix); }
   }
 
+  function quotaBadge(a) {
+    var st = (a && a.quotaStatus) || '';
+    var rem = a && a.quotaRemaining;
+    var color = 'var(--muted-foreground,#525252)';
+    var label = 'quota: —';
+    if (st === 'ok') {
+      color = 'var(--success,#0f766e)';
+      if (rem != null && rem >= 0) label = 'còn ~' + rem + (a.quotaLimit ? ('/' + a.quotaLimit) : '');
+      else label = 'quota OK';
+    } else if (st === 'exhausted') {
+      color = 'var(--destructive,#e54b4f)';
+      label = 'HẾT quota';
+    } else if (st === 'error') {
+      color = 'var(--destructive,#e54b4f)';
+      label = 'quota lỗi';
+    } else if (st === 'unknown') {
+      color = 'var(--muted-foreground,#525252)';
+      label = 'quota ?';
+    }
+    var tip = (a && a.quotaMessage) || '';
+    if (a && a.quotaCheckedAt) {
+      tip = (tip ? tip + ' · ' : '') + 'check ' + fmtTime(a.quotaCheckedAt);
+    }
+    return '<span title="' + esc(tip) + '" style="color:' + color + ';font-weight:600">' + esc(label) + '</span>';
+  }
+
   function toast(msg, ok) {
     if (window.toast) {
       try { window.toast(msg, ok ? 'success' : 'error'); return; } catch (e) {}
@@ -63,6 +89,8 @@
       '<div class="card-actions" style="display:flex;gap:8px;flex-wrap:wrap">' +
       '<button type="button" class="btn btn-outline btn-sm" id="grokRefreshBtn">' +
       '<i class="fa-solid fa-arrows-rotate"></i> <span class="btn-text">Refresh</span></button>' +
+      '<button type="button" class="btn btn-outline btn-sm" id="grokQuotaAllBtn" title="Probe quota for all Grok accounts">' +
+      '<i class="fa-solid fa-gauge-high"></i> <span class="btn-text">Check quota</span></button>' +
       '</div></div>' +
       '<p style="font-size:12.5px;color:var(--muted-foreground,#525252);margin:0 0 12px;line-height:1.5">' +
       'Pool <code>grokAccounts[]</code> riêng — không hiện trong danh sách Kiro. ' +
@@ -73,6 +101,8 @@
     tab.appendChild(card);
     var btn = document.getElementById('grokRefreshBtn');
     if (btn) btn.addEventListener('click', loadGrokAccounts);
+    var qb = document.getElementById('grokQuotaAllBtn');
+    if (qb) qb.addEventListener('click', checkAllQuota);
     return card;
   }
 
@@ -191,7 +221,9 @@
       metaCell('Requests', esc(a.requestCount || 0)) +
       metaCell('Token exp', esc(fmtTime(a.expiresAt))) +
       metaCell('User ID', esc(a.userId || '—'), ' style="font-size:11px;word-break:break-all"') +
-      metaCell('Last used', esc(fmtTime(a.lastUsed)));
+      metaCell('Last used', esc(fmtTime(a.lastUsed))) +
+      metaCell('Quota', esc((a.quotaStatus || '—') + (a.quotaRemaining != null && a.quotaRemaining >= 0 ? (' · còn ' + a.quotaRemaining) : '')), '') +
+      metaCell('Quota check', esc((a.quotaMessage || '—') + (a.quotaCheckedAt ? (' · ' + fmtTime(a.quotaCheckedAt)) : '')));
     document.getElementById('gdmNickname').value = a.nickname || '';
     document.getElementById('gdmDisplayName').value = a.displayName || '';
     document.getElementById('gdmMachineId').value = a.machineId || '';
@@ -306,10 +338,12 @@
         '<span>reqs: <b style="color:var(--foreground,#000)">' + esc(a.requestCount || 0) + '</b></span>' +
         '<span>' + esc(midHint) + '</span>' +
         '<span>' + esc(pxHint) + '</span>' +
+        '<span>' + quotaBadge(a) + '</span>' +
         '<span>exp: ' + esc(fmtTime(a.expiresAt)) + '</span>' +
         '</div></div></div>' +
         '<div class="grok-actions" style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button type="button" class="btn btn-outline btn-xs" data-grok-act="detail" data-id="' + esc(a.id) + '">Chi tiết</button>' +
+        '<button type="button" class="btn btn-outline btn-xs" data-grok-act="quota" data-id="' + esc(a.id) + '">Check quota</button>' +
         '<button type="button" class="btn btn-secondary btn-xs" data-grok-act="toggle" data-id="' + esc(a.id) + '" data-enabled="' + (a.enabled ? '1' : '0') + '">' +
         (a.enabled ? 'Disable' : 'Enable') + '</button>' +
         '<button type="button" class="btn btn-danger btn-xs" data-grok-act="delete" data-id="' + esc(a.id) + '">Delete</button>' +
@@ -317,6 +351,64 @@
       );
     }).join('');
     el.innerHTML = html;
+  }
+
+  async function checkOneQuota(id) {
+    var pw = getPassword();
+    if (!pw || !id) return;
+    toast('Đang check quota…', true);
+    try {
+      var res = await fetch('/admin/api/grok-accounts/' + encodeURIComponent(id) + '/quota', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': pw }
+      });
+      var d = {};
+      try { d = await res.json(); } catch (e) {}
+      if (!res.ok && !d.quotaStatus) {
+        toast(d.error || ('HTTP ' + res.status), false);
+        return;
+      }
+      var st = d.quotaStatus || 'unknown';
+      var msg = st;
+      if (d.quotaRemaining != null && d.quotaRemaining >= 0) msg += ' · còn ' + d.quotaRemaining;
+      if (d.quotaMessage) msg += ' — ' + d.quotaMessage;
+      toast(msg, st === 'ok' || st === 'unknown');
+      await loadGrokAccounts();
+    } catch (e) {
+      toast('Lỗi mạng khi check quota', false);
+    }
+  }
+
+  async function checkAllQuota() {
+    var pw = getPassword();
+    if (!pw) return;
+    var btn = document.getElementById('grokQuotaAllBtn');
+    if (btn) btn.disabled = true;
+    toast('Đang check quota tất cả Grok…', true);
+    try {
+      var res = await fetch('/admin/api/grok-accounts/quota/refresh', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': pw }
+      });
+      var d = {};
+      try { d = await res.json(); } catch (e) {}
+      if (!res.ok) {
+        toast(d.error || ('HTTP ' + res.status), false);
+        return;
+      }
+      var ok = 0, ex = 0, er = 0;
+      (d.results || []).forEach(function (r) {
+        if (r.quotaStatus === 'ok') ok++;
+        else if (r.quotaStatus === 'exhausted') ex++;
+        else er++;
+      });
+      toast('Quota: OK=' + ok + ' · Hết=' + ex + ' · Khác=' + er, ex === 0);
+      await loadGrokAccounts();
+    } catch (e) {
+      toast('Lỗi mạng', false);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   async function loadGrokAccounts() {
@@ -407,6 +499,7 @@
         return;
       }
       if (act === 'detail') { openDetail(id); return; }
+      if (act === 'quota') { checkOneQuota(id); return; }
       return;
     }
 

@@ -39,6 +39,15 @@ type GrokAccount struct {
 	// Per-account identity / egress (same idea as Kiro Account).
 	MachineId string `json:"machineId,omitempty"`
 	ProxyURL  string `json:"proxyURL,omitempty"`
+
+	// Upstream Build quota snapshot (best-effort; xAI has no stable public usage API).
+	// QuotaStatus: ok | exhausted | unknown | error
+	QuotaStatus     string  `json:"quotaStatus,omitempty"`
+	QuotaMessage    string  `json:"quotaMessage,omitempty"`
+	QuotaCheckedAt  int64   `json:"quotaCheckedAt,omitempty"`
+	// QuotaRemaining is set only when upstream returns a numeric remaining value; -1 = unknown.
+	QuotaRemaining  float64 `json:"quotaRemaining,omitempty"`
+	QuotaLimit      float64 `json:"quotaLimit,omitempty"`
 }
 
 // DefaultGrokClientID is the public OAuth client id used by Grok Build / grok-cli (9router).
@@ -248,6 +257,28 @@ func UpdateGrokAccountStats(id string, requestCount, errorCount, totalTokens int
 // GetGrokAccountByID returns a copy of one account, or nil.
 
 // PatchGrokAccountFields updates editable admin fields without replacing tokens.
+
+// SetGrokAccountQuota persists last upstream quota probe for an account.
+func SetGrokAccountQuota(id, status, message string, remaining, limit float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	for i, a := range cfg.GrokAccounts {
+		if a.ID != id {
+			continue
+		}
+		cfg.GrokAccounts[i].QuotaStatus = status
+		cfg.GrokAccounts[i].QuotaMessage = message
+		cfg.GrokAccounts[i].QuotaCheckedAt = time.Now().Unix()
+		cfg.GrokAccounts[i].QuotaRemaining = remaining
+		cfg.GrokAccounts[i].QuotaLimit = limit
+		return Save()
+	}
+	return fmt.Errorf("grok account not found")
+}
+
 func PatchGrokAccountFields(id string, machineId, proxyURL *string, nickname, displayName *string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
