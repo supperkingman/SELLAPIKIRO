@@ -60,9 +60,21 @@ func (p *GrokPool) Count() int {
 	return len(p.accounts)
 }
 
-// AvailableCount is same as Count for Grok (no model filter).
+// AvailableCount counts enabled accounts not in temporary cooldown.
 func (p *GrokPool) AvailableCount() int {
-	return p.Count()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for i := range p.accounts {
+		if !p.accounts[i].Enabled {
+			continue
+		}
+		if p.isCoolingDownLocked(p.accounts[i].ID) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // GetNext returns the next enabled account (round-robin), or nil.

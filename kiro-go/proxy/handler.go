@@ -855,11 +855,11 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.handleGrokClaudeMessages(w, r, &req)
 		return
 	}
-	if h.kiroPoolEmpty() {
-		normalizeClaudeRequestForAgents(&req)
-		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
-			return
-		}
+	// Prefer Grok silent whenever Grok pool has accounts (not only when Kiro empty).
+	// Prevents Kiro from writing SSE headers then failing with no failover path.
+	normalizeClaudeRequestForAgents(&req)
+	if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+		return
 	}
 
 	if msg := validateClaudeRequestShape(&req); msg != "" {
@@ -1653,11 +1653,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.handleGrokOpenAIChat(w, r, &req)
 		return
 	}
-	// Silent Grok fallback when Kiro pool empty: disguise as requested Claude/OpenAI model.
-	if h.kiroPoolEmpty() {
-		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
-			return
-		}
+	// Prefer Grok silent when pool has accounts (same as Claude path).
+	if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+		return
 	}
 
 	// 解析模型和 thinking 模式

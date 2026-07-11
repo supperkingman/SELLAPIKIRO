@@ -2213,21 +2213,32 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 
 	excluded := map[string]bool{}
 	var lastErr error
-	// Try every available account on failure, but prefer sticky first account.
+	// Try every enabled account (not capped at 8). Sticky is dropped when excluded.
 	maxTry := gp.Count()
 	if maxTry < 1 {
 		maxTry = 1
 	}
-	if maxTry > 8 {
-		maxTry = 8 // safety cap
+	// Extra attempts beyond Count to allow refresh-retry of sticky after token refresh.
+	if maxTry < gp.Count()+2 {
+		maxTry = gp.Count() + 2
+	}
+	if maxTry > 24 {
+		maxTry = 24
 	}
 
 	for attempt := 0; attempt < maxTry; attempt++ {
 		acc := gp.GetNextForCustomer(apiKeyID, excluded)
 		if acc == nil {
+			// Sticky may have pinned a cooling account; clear and try pure RR.
+			gp.ClearStickyCustomer(apiKeyID)
+			acc = gp.GetNextExcluding(excluded)
+		}
+		if acc == nil {
+			logger.Warnf("[Grok] no account left attempt=%d excluded=%d count=%d available=%d last=%v",
+				attempt, len(excluded), gp.Count(), gp.AvailableCount(), lastErr)
 			break
 		}
-		logger.Debugf("[Grok] account=%s customer=%s sticky", acc.Email, apiKeyID)
+		logger.Infof("[Grok] try account=%s attempt=%d/%d customer=%s", acc.Email, attempt+1, maxTry, apiKeyID)
 		if err := h.ensureValidGrokToken(acc); err != nil {
 			lastErr = err
 			excluded[acc.ID] = true
@@ -2282,16 +2293,19 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			lastErr = fmt.Errorf("auth HTTP %d: invalid or expired credentials", resp.StatusCode)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
+			gp.ClearStickyCustomer(apiKeyID)
 			if resp.StatusCode == 401 {
 				if h.refreshGrokToken(acc) == nil {
 					delete(excluded, acc.ID)
 					logger.Infof("[Grok] token refreshed after 401, will retry account=%s", acc.Email)
 				} else {
 					// Soft cooldown — do NOT permanently disable (empties pool for all customers).
-					gp.Cooldown(acc.ID, "auth failed", 15*time.Minute)
-					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access (cooldown 15m)", -1, 0)
-					logger.Warnf("[Grok] cooldown 15m after auth fail account=%s", acc.Email)
+					gp.Cooldown(acc.ID, "auth failed", 5*time.Minute)
+					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access (cooldown 5m)", -1, 0)
+					logger.Warnf("[Grok] cooldown 5m after auth fail account=%s", acc.Email)
 				}
+			} else {
+				gp.Cooldown(acc.ID, "auth forbidden", 5*time.Minute)
 			}
 			continue
 		}
@@ -2303,7 +2317,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				msg += " " + truncateStr(s, 200)
 			}
 			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
-			gp.Cooldown(acc.ID, "quota exhausted", 30*time.Minute)
+			gp.Cooldown(acc.ID, "quota exhausted", 10*time.Minute)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			lastErr = fmt.Errorf("%s", msg)
@@ -2414,6 +2428,8 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	if lastErr != nil {
 		msg = lastErr.Error()
 	}
+	logger.Warnf("[Grok] FAIL all accounts silent=%v display=%s available=%d excluded=%d last=%v",
+		silent, responseModel, gp.AvailableCount(), len(excluded), lastErr)
 	sendErr(503, "api_error", msg)
 }
 
