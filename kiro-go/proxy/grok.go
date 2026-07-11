@@ -515,14 +515,15 @@ func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[
 		"max_output_tokens": grokMaxOutputTokens,
 		"reasoning": map[string]interface{}{
 			"effort":  effort,
-			"summary": "concise",
+			"summary": "detailed", // visible thinking for *-thinking client models
 		},
 	}
 	if instr := extractOpenAISystem(req.Messages); instr != "" {
 		body["instructions"] = instr
 	}
 	if effort != "" && effort != "none" {
-		body["include"] = []string{"reasoning.encrypted_content"}
+		// encrypted_content for continuity; summary text is what clients display as thinking
+		body["include"] = []string{"reasoning.encrypted_content", "reasoning.summary"}
 	}
 	// Agent tools (Claude Code / Cursor / OpenCode / 9router) â€” required for tool loops.
 	if tools := convertOpenAIToolsToGrokResponses(req.Tools); len(tools) > 0 {
@@ -622,6 +623,7 @@ type grokToolCall struct {
 
 type grokCollectResult struct {
 	Text       string
+	Thinking   string
 	InTok      int
 	OutTok     int
 	Incomplete bool
@@ -689,6 +691,153 @@ func extractOutputTextDelta(ev map[string]interface{}) string {
 	}
 	return ""
 }
+
+// extractReasoningSummaryDelta pulls visible reasoning/thinking text from Grok Responses SSE.
+// Without this, clients using claude-*-thinking never see thinking blocks (only final text).
+func extractReasoningSummaryDelta(ev map[string]interface{}) string {
+	t := eventType(ev)
+	// Common Responses API event names for reasoning summaries
+	if strings.Contains(t, "reasoning_summary_text.delta") ||
+		strings.Contains(t, "reasoning_summary.delta") ||
+		strings.Contains(t, "reasoning.summary_text.delta") ||
+		t == "response.reasoning.delta" ||
+		strings.HasSuffix(t, "reasoning_text.delta") {
+		if d, ok := ev["delta"].(string); ok && d != "" {
+			return d
+		}
+		if d, ok := ev["text"].(string); ok && d != "" {
+			return d
+		}
+		if d, ok := ev["summary"].(string); ok && d != "" {
+			return d
+		}
+	}
+	// Part-based summary
+	if strings.Contains(t, "reasoning_summary_part") {
+		if part, ok := ev["part"].(map[string]interface{}); ok {
+			if s, ok := part["text"].(string); ok {
+				return s
+			}
+		}
+	}
+	// output_item.added / done with type=reasoning and summary array
+	if strings.Contains(t, "output_item") {
+		item, _ := ev["item"].(map[string]interface{})
+		if item == nil {
+			return ""
+		}
+		itype, _ := item["type"].(string)
+		if !strings.Contains(strings.ToLower(itype), "reasoning") {
+			return ""
+		}
+		// summary: [{type:summary_text, text:"..."}]
+		if sum, ok := item["summary"].([]interface{}); ok {
+			var b strings.Builder
+			for _, p := range sum {
+				pm, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if s, ok := pm["text"].(string); ok {
+					b.WriteString(s)
+				}
+			}
+			return b.String()
+		}
+		if s, ok := item["text"].(string); ok {
+			return s
+		}
+		if content, ok := item["content"].([]interface{}); ok {
+			var b strings.Builder
+			for _, p := range content {
+				pm, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				pt, _ := pm["type"].(string)
+				if strings.Contains(pt, "summary") || pt == "text" || pt == "output_text" {
+					if s, ok := pm["text"].(string); ok {
+						b.WriteString(s)
+					}
+				}
+			}
+			return b.String()
+		}
+	}
+	return ""
+}
+
+// reasoningTextFromResponseOutput extracts full reasoning summary from a completed response object.
+func reasoningTextFromResponseOutput(resp map[string]interface{}) string {
+	if resp == nil {
+		return ""
+	}
+	out, _ := resp["output"].([]interface{})
+	var b strings.Builder
+	for _, item := range out {
+		im, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		itype, _ := im["type"].(string)
+		if !strings.Contains(strings.ToLower(itype), "reasoning") {
+			continue
+		}
+		if sum, ok := im["summary"].([]interface{}); ok {
+			for _, p := range sum {
+				pm, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if s, ok := pm["text"].(string); ok {
+					b.WriteString(s)
+				}
+			}
+		}
+		if s, ok := im["text"].(string); ok && b.Len() == 0 {
+			b.WriteString(s)
+		}
+	}
+	return b.String()
+}
+
+func extractCompletedReasoningText(ev map[string]interface{}) string {
+	t := eventType(ev)
+	if t == "response.completed" || t == "response.done" || strings.Contains(t, "output_item.done") {
+		if item, ok := ev["item"].(map[string]interface{}); ok {
+			itype, _ := item["type"].(string)
+			if strings.Contains(strings.ToLower(itype), "reasoning") {
+				// reuse via fake resp
+				return reasoningTextFromResponseOutput(map[string]interface{}{"output": []interface{}{item}})
+			}
+		}
+		if resp, ok := ev["response"].(map[string]interface{}); ok {
+			return reasoningTextFromResponseOutput(resp)
+		}
+		return reasoningTextFromResponseOutput(ev)
+	}
+	return ""
+}
+
+// modelWantsThinkingUI is true for customer model ids that expect Anthropic thinking blocks
+// (e.g. claude-opus-4.8-thinking) or explicit grok thinking aliases.
+func modelWantsThinkingUI(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	if strings.Contains(m, "thinking") || strings.Contains(m, "reason") {
+		return true
+	}
+	// grok effort suffixes often imply visible reasoning for UI clients
+	if strings.HasSuffix(m, "-high") || strings.HasSuffix(m, "-xhigh") || strings.HasSuffix(m, "-max") {
+		if IsGrokModel(m) {
+			return true
+		}
+	}
+	return false
+}
+
 
 func textFromResponseOutput(resp map[string]interface{}) string {
 	out, _ := resp["output"].([]interface{})
@@ -830,7 +979,9 @@ func toolCallFromItem(item map[string]interface{}) *grokToolCall {
 func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 	var res grokCollectResult
 	var delta strings.Builder
+	var thinkDelta strings.Builder
 	var bestFull string
+	var bestThink string
 
 	scanner := bufio.NewScanner(body)
 	buf := make([]byte, 0, 64*1024)
@@ -849,11 +1000,17 @@ func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			continue
 		}
+		if d := extractReasoningSummaryDelta(ev); d != "" {
+			thinkDelta.WriteString(d)
+		}
 		if d := extractOutputTextDelta(ev); d != "" {
 			delta.WriteString(d)
 		}
 		if f := extractCompletedOutputText(ev); f != "" && len([]rune(f)) > len([]rune(bestFull)) {
 			bestFull = f
+		}
+		if th := extractCompletedReasoningText(ev); th != "" && len([]rune(th)) > len([]rune(bestThink)) {
+			bestThink = th
 		}
 		// Collect function_call items from completed snapshots for non-stream Claude JSON.
 		if t := eventType(ev); t == "response.completed" || t == "response.done" || strings.Contains(t, "output_item.done") {
@@ -879,6 +1036,11 @@ func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 		text = bestFull
 	}
 	res.Text = text
+	thinking := thinkDelta.String()
+	if bestThink != "" && len([]rune(bestThink)) >= len([]rune(thinking)) {
+		thinking = bestThink
+	}
+	res.Thinking = thinking
 	if res.OutTok <= 0 {
 		res.OutTok = maxInt(1, len([]rune(text))/4)
 	}
@@ -890,6 +1052,10 @@ func writeOpenAIJSON(w http.ResponseWriter, model, text string, inTok, outTok in
 }
 
 func writeOpenAIJSONWithTools(w http.ResponseWriter, model, text string, inTok, outTok int, finish string, tools []grokToolCall) {
+	writeOpenAIJSONWithToolsAndThinking(w, model, text, "", inTok, outTok, finish, tools)
+}
+
+func writeOpenAIJSONWithToolsAndThinking(w http.ResponseWriter, model, text, thinking string, inTok, outTok int, finish string, tools []grokToolCall) {
 	if finish == "" {
 		if len(tools) > 0 {
 			finish = "tool_calls"
@@ -898,6 +1064,9 @@ func writeOpenAIJSONWithTools(w http.ResponseWriter, model, text string, inTok, 
 		}
 	}
 	msg := map[string]interface{}{"role": "assistant", "content": text}
+	if thinking != "" && modelWantsThinkingUI(model) {
+		msg["reasoning_content"] = thinking
+	}
 	if len(tools) > 0 {
 		// OpenAI chat.completion: content may be null when only tool_calls
 		if text == "" {
@@ -938,6 +1107,10 @@ func writeClaudeJSON(w http.ResponseWriter, model, text string, inTok, outTok in
 }
 
 func writeClaudeJSONWithTools(w http.ResponseWriter, model, text string, inTok, outTok int, stop string, tools []grokToolCall) {
+	writeClaudeJSONWithToolsAndThinking(w, model, text, "", inTok, outTok, stop, tools)
+}
+
+func writeClaudeJSONWithToolsAndThinking(w http.ResponseWriter, model, text, thinking string, inTok, outTok int, stop string, tools []grokToolCall) {
 	setAnthropicResponseHeaders(w, "")
 	if stop == "" {
 		if len(tools) > 0 {
@@ -946,8 +1119,11 @@ func writeClaudeJSONWithTools(w http.ResponseWriter, model, text string, inTok, 
 			stop = "end_turn"
 		}
 	}
-	content := make([]map[string]interface{}, 0, 1+len(tools))
-	if text != "" || len(tools) == 0 {
+	content := make([]map[string]interface{}, 0, 2+len(tools))
+	if thinking != "" && modelWantsThinkingUI(model) {
+		content = append(content, map[string]interface{}{"type": "thinking", "thinking": thinking})
+	}
+	if text != "" || (len(tools) == 0 && thinking == "") {
 		content = append(content, map[string]interface{}{"type": "text", "text": text})
 	}
 	for _, tc := range tools {
@@ -1320,6 +1496,9 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 
 	var assembled strings.Builder
 	var bestFull string
+	var thinkingAssembled strings.Builder
+	var bestThinking string
+	wantThinking := modelWantsThinkingUI(model)
 	toolCalls := []grokToolCall{}
 	toolIndex := 0
 	type activeFC struct {
@@ -1329,6 +1508,14 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		args  strings.Builder
 	}
 	var cur *activeFC
+
+	emitThinking := func(d string) {
+		if !wantThinking || d == "" {
+			return
+		}
+		thinkingAssembled.WriteString(d)
+		writeChunk(map[string]interface{}{"reasoning_content": d}, nil)
+	}
 
 	finishFC := func() {
 		if cur == nil {
@@ -1364,11 +1551,18 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		}
 		t := eventType(ev)
 
+		if d := extractReasoningSummaryDelta(ev); d != "" {
+			emitThinking(d)
+			lastPing = time.Now()
+		}
 		if d := extractOutputTextDelta(ev); d != "" {
 			finishFC()
 			assembled.WriteString(d)
 			writeChunk(map[string]interface{}{"content": d}, nil)
 			lastPing = time.Now()
+		}
+		if th := extractCompletedReasoningText(ev); th != "" && len([]rune(th)) > len([]rune(bestThinking)) {
+			bestThinking = th
 		}
 
 		// function_call started
@@ -1491,7 +1685,19 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		return res, err
 	}
 
-	got := assembled.String()
+		gotThink := thinkingAssembled.String()
+	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(gotThink)) {
+		rest := bestThinking
+		if gotThink != "" && strings.HasPrefix(bestThinking, gotThink) {
+			rest = strings.TrimPrefix(bestThinking, gotThink)
+		}
+		if rest != "" {
+			logger.Infof("[Grok] live OpenAI thinking gap-fill +%d runes", len([]rune(rest)))
+			emitThinking(rest)
+		}
+	}
+
+got := assembled.String()
 	if bestFull != "" && len([]rune(bestFull)) > len([]rune(got)) {
 		rest := bestFull
 		if got != "" && strings.HasPrefix(bestFull, got) {
@@ -1511,6 +1717,10 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		toolCalls = res.ToolCalls
 	}
 	res.Text = got
+	res.Thinking = thinkingAssembled.String()
+	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(res.Thinking)) {
+		res.Thinking = bestThinking
+	}
 	res.ToolCalls = toolCalls
 	if res.OutTok <= 0 {
 		res.OutTok = maxInt(1, (len([]rune(got))+len(toolCalls)*16)/4)
@@ -1565,8 +1775,13 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 
 	var assembled strings.Builder
 	var bestFull string
+	var thinkingAssembled strings.Builder
+	var bestThinking string
+	wantThinking := modelWantsThinkingUI(model)
 	textBlockOpen := false
+	thinkingOpen := false
 	textIndex := 0
+	thinkingIndex := 0
 	nextIndex := 0
 	type activeFC struct {
 		index int
@@ -1577,10 +1792,41 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	var cur *activeFC
 	toolCalls := []grokToolCall{}
 
+	openThinking := func() {
+		if !wantThinking || thinkingOpen {
+			return
+		}
+		thinkingIndex = nextIndex
+		nextIndex++
+		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": thinkingIndex,
+			"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+		})
+		thinkingOpen = true
+	}
+	closeThinking := func() {
+		if !thinkingOpen {
+			return
+		}
+		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": thinkingIndex})
+		thinkingOpen = false
+	}
+	emitThinking := func(d string) {
+		if !wantThinking || d == "" {
+			return
+		}
+		openThinking()
+		thinkingAssembled.WriteString(d)
+		h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			"type": "content_block_delta", "index": thinkingIndex,
+			"delta": map[string]string{"type": "thinking_delta", "thinking": d},
+		})
+	}
 	openText := func() {
 		if textBlockOpen {
 			return
 		}
+		closeThinking()
 		textIndex = nextIndex
 		nextIndex++
 		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
@@ -1639,10 +1885,17 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		}
 		t := eventType(ev)
 
+		if d := extractReasoningSummaryDelta(ev); d != "" {
+			emitThinking(d)
+			lastPing = time.Now()
+		}
 		if d := extractOutputTextDelta(ev); d != "" {
 			finishFC()
 			emitText(d)
 			lastPing = time.Now()
+		}
+		if th := extractCompletedReasoningText(ev); th != "" && len([]rune(th)) > len([]rune(bestThinking)) {
+			bestThinking = th
 		}
 
 		if t == "response.output_item.added" || strings.HasSuffix(t, "output_item.added") {
@@ -1655,6 +1908,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 			if item != nil {
 				itype, _ := item["type"].(string)
 				if itype == "function_call" || itype == "custom_tool_call" {
+					closeThinking()
 					closeText()
 					finishFC()
 					name, _ := item["name"].(string)
@@ -1740,6 +1994,19 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		return res, err
 	}
 
+	gotThink := thinkingAssembled.String()
+	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(gotThink)) {
+		rest := bestThinking
+		if gotThink != "" && strings.HasPrefix(bestThinking, gotThink) {
+			rest = strings.TrimPrefix(bestThinking, gotThink)
+		}
+		if rest != "" {
+			logger.Infof("[Grok] live Claude thinking gap-fill +%d runes", len([]rune(rest)))
+			emitThinking(rest)
+		}
+	}
+	closeThinking()
+
 	got := assembled.String()
 	if bestFull != "" && len([]rune(bestFull)) > len([]rune(got)) {
 		rest := bestFull
@@ -1753,9 +2020,14 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		}
 	}
 	finishFC()
+	closeThinking()
 	closeText()
 
 	res.Text = got
+	res.Thinking = thinkingAssembled.String()
+	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(res.Thinking)) {
+		res.Thinking = bestThinking
+	}
 	res.ToolCalls = toolCalls
 	if res.OutTok <= 0 {
 		res.OutTok = maxInt(1, len([]rune(got))/4)
@@ -2007,12 +2279,12 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if len(result.ToolCalls) > 0 && stopReason == "end_turn" {
 				stopReason = "tool_use"
 			}
-			writeClaudeJSONWithTools(w, responseModel, result.Text, result.InTok, result.OutTok, stopReason, result.ToolCalls)
+			writeClaudeJSONWithToolsAndThinking(w, responseModel, result.Text, result.Thinking, result.InTok, result.OutTok, stopReason, result.ToolCalls)
 		} else {
 			if len(result.ToolCalls) > 0 && finish == "stop" {
 				finish = "tool_calls"
 			}
-			writeOpenAIJSONWithTools(w, responseModel, result.Text, result.InTok, result.OutTok, finish, result.ToolCalls)
+			writeOpenAIJSONWithToolsAndThinking(w, responseModel, result.Text, result.Thinking, result.InTok, result.OutTok, finish, result.ToolCalls)
 		}
 		return
 	}
