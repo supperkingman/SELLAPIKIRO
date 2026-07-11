@@ -1,0 +1,48 @@
+# Secret & cấu hình runtime - KHÔNG commit
+.env
+
+# Dữ liệu Kiro-Go: chứa token tài khoản + API key của khách
+data/
+
+# Log
+*.log
+
+# Override chi dung cho demo local (doi cong), khong dung tren VPS
+docker-compose.override.yml
+
+# File CSV chua API key sinh ra hang loat - la secret, KHONG commit
+keys_output.csv
+*_keys.csv
+scripts/keys_output.csv
+
+# Runtime / local secrets
+storefront-data/
+*.sqlite
+*.sqlite-*
+*.bak*
+.env.*
+!.env.example
+
+# Local patches / temp
+**/patch_*.py
+**/write_grok.py
+**/_admin_tail.txt
+**/_p1.go.txt
+**/_grok_core_new.go
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+kiro-go/kiro-go
+**/__pycache__/
+*.exe
+
+# Local credential dumps (NEVER commit)
+scripts/*grok*dump*
+scripts/grok-export*.txt
+scripts/9router_*.txt

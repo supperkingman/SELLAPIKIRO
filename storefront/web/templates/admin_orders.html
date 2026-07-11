@@ -1,0 +1,51 @@
+{{define "admin_orders.html"}}
+{{template "admin_head" (dict "Title" "Đơn hàng")}}
+{{template "admin_shell_open" .}}
+<div class="page-head"><h2>Đơn hàng</h2></div>
+
+<div class="tabs">
+  <a href="/frontadmin/orders" class="tab {{if eq .Filter ""}}active{{end}}">Tất cả</a>
+  <a href="/frontadmin/orders?status=reported" class="tab {{if eq .Filter "reported"}}active{{end}}">Chờ duyệt</a>
+  <a href="/frontadmin/orders?status=pending" class="tab {{if eq .Filter "pending"}}active{{end}}">Chờ thanh toán</a>
+  <a href="/frontadmin/orders?status=approved" class="tab {{if eq .Filter "approved"}}active{{end}}">Đã giao key</a>
+  <a href="/frontadmin/orders?status=cancelled" class="tab {{if eq .Filter "cancelled"}}active{{end}}">Đã hủy</a>
+</div>
+
+<div class="p-card">
+  <div class="p-table-wrap">
+    <table class="p-table">
+      <thead><tr><th>Mã đơn</th><th>Khách</th><th>Gói</th><th>Credit</th><th>Giá</th><th>Trạng thái</th><th>Ghi chú CK</th><th>Thao tác</th></tr></thead>
+      <tbody>
+      {{range .Orders}}
+        <tr>
+          <td style="font-weight:600;">{{.Code}}</td>
+          <td>{{.Email}}</td>
+          <td>{{.PackageName}}</td>
+          <td>{{.Credits}}</td>
+          <td>${{money .PriceUSD}}<br><span style="color:var(--p-ink-faint);font-size:.78rem;">{{vndInt .PriceVND}}₫</span></td>
+          <td>{{template "status_pill" .Status}}</td>
+          <td style="max-width:160px;font-size:.82rem;color:var(--p-ink-sub);">{{if .PaymentNote}}{{.PaymentNote}}{{else}}—{{end}}</td>
+          <td>
+            {{if or (eq .Status "reported") (eq .Status "pending")}}
+            <div style="display:flex;gap:6px;">
+              <form method="POST" action="/frontadmin/orders/action" onsubmit="return confirm('Duyệt đơn {{.Code}} và tạo key?')">
+                <input type="hidden" name="code" value="{{.Code}}"><input type="hidden" name="action" value="approve">
+                <button class="pb pb-primary pb-sm" type="submit">Duyệt & tạo key</button>
+              </form>
+              <form method="POST" action="/frontadmin/orders/action" onsubmit="return confirm('Hủy đơn {{.Code}}?')">
+                <input type="hidden" name="code" value="{{.Code}}"><input type="hidden" name="action" value="cancel">
+                <button class="pb pb-danger pb-sm" type="submit">Hủy</button>
+              </form>
+            </div>
+            {{else}}<span style="color:var(--p-ink-faint);font-size:.82rem;">—</span>{{end}}
+          </td>
+        </tr>
+      {{else}}
+        <tr><td colspan="8" class="empty">Không có đơn hàng nào.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "admin_shell_close" .}}
+{{end}}

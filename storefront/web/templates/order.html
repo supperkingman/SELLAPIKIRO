@@ -1,0 +1,172 @@
+{{define "order.html"}}
+{{template "head" (dict "Title" "Đơn hàng" "SiteName" .SiteName "Desc" "Chi tiết đơn hàng")}}
+{{template "nav" .}}
+{{$o := .Order}}
+<section style="padding:var(--space-8) 0;min-height:70vh;">
+  <div class="container" style="max-width:720px;">
+    <a href="/dashboard" class="muted" style="font-size:.9rem;">{{t .Lang "ord_back"}}</a>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 24px;flex-wrap:wrap;gap:12px;">
+      <h1 style="font-size:1.9rem;">{{t .Lang "dash_order"}} {{$o.Code}}</h1>
+      {{if eq $o.Status "approved"}}<span class="badge" style="background:#e3f1ea;color:var(--brand-600);font-size:.9rem;">{{t .Lang (printf "st_%s" $o.Status)}}</span>
+      {{else if eq $o.Status "cancelled"}}<span class="badge" style="background:#fbeae5;color:var(--danger);font-size:.9rem;">{{t .Lang (printf "st_%s" $o.Status)}}</span>
+      {{else}}<span class="badge" style="background:#fdf3e0;color:#b98900;font-size:.9rem;">{{t .Lang (printf "st_%s" $o.Status)}}</span>{{end}}
+    </div>
+
+    <div class="card" style="padding:24px;margin-bottom:20px;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:12px;"><span class="muted">{{t .Lang "ord_plan"}}</span><span style="font-weight:600;">{{$o.PackageName}} · {{$o.Credits}} {{t .Lang "price_credits"}}</span></div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:12px;"><span class="muted">{{t .Lang "ord_amount"}}</span><span style="font-weight:600;">{{if eq .Lang "vi"}}{{vndInt $o.PriceVND}}₫{{else}}${{money $o.PriceUSD}}{{end}}</span></div>
+      <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "ord_created"}}</span><span style="font-weight:600;">{{$o.CreatedTime}}</span></div>
+    </div>
+
+    {{if eq $o.Status "approved"}}
+      {{if .Key}}
+      <div class="card" style="padding:24px;border:2px solid var(--brand-400);">
+        <h3 style="margin-bottom:6px;">{{t .Lang "ord_yourkey"}}</h3>
+        <p class="muted" style="margin-bottom:16px;font-size:.9rem;">{{t .Lang "ord_key_note"}}</p>
+        <div style="display:flex;align-items:center;gap:8px;background:var(--ink-900);padding:14px;border-radius:10px;">
+          <code style="color:#4bc79a;font-size:.85rem;word-break:break-all;flex:1;" id="okey">{{.Key.APIKey}}</code>
+          <button class="btn btn-ghost" style="padding:6px 12px;font-size:.8rem;border-color:#444;color:#ccc;" onclick="navigator.clipboard.writeText(document.getElementById('okey').innerText);this.innerText='✔'">Copy</button>
+        </div>
+      </div>
+      {{end}}
+    {{else if eq $o.Status "cancelled"}}
+      <div class="card" style="padding:24px;"><p class="muted">{{t .Lang "ord_cancelled"}}</p></div>
+    {{else}}
+      {{if eq $o.Status "reported"}}
+      <div class="card" style="padding:20px 24px;margin-bottom:20px;border-left:4px solid #b98900;background:#fdf3e0;">
+        <h3 style="color:#b98900;margin-bottom:6px;display:flex;align-items:center;gap:8px;"><span>⏳</span> {{t .Lang "ord_reported_title"}}</h3>
+        <p class="muted">{{t .Lang "ord_reported_msg"}}</p>
+      </div>
+      {{end}}
+      <!-- Huong dan thanh toan -->
+      <div class="card" style="padding:24px;">
+        <h3 style="margin-bottom:16px;">{{t .Lang "pay_choose"}}</h3>
+
+        <!-- Tabs chon cong -->
+        <div class="pay-tabs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;">
+          {{if .SepayEnabled}}<button class="pay-tab active" data-pay="sepay" onclick="selPay('sepay')">{{t .Lang "pay_bank"}}</button>{{end}}
+          {{if .CryptoEnabled}}<button class="pay-tab" data-pay="crypto" onclick="selPay('crypto')">{{t .Lang "pay_usdt"}}</button>{{end}}
+          {{if .PaypalEnabled}}<button class="pay-tab" data-pay="paypal" onclick="selPay('paypal')">{{t .Lang "pay_paypal"}}</button>{{end}}
+        </div>
+
+        <div id="pay-status" style="display:none;margin-bottom:16px;padding:12px 14px;border-radius:8px;font-size:.92rem;"></div>
+
+        <!-- SePay: chuyen khoan tu dong -->
+        {{if .SepayEnabled}}
+        <div class="pay-pane" id="pane-sepay">
+          <div style="display:grid;grid-template-columns:{{if .Bank.QRURL}}auto 1fr{{else}}1fr{{end}};gap:24px;align-items:start;">
+            {{if .Bank.QRURL}}<img src="{{.Bank.QRURL}}" alt="QR" style="width:180px;border-radius:12px;border:1px solid var(--ink-200);">{{end}}
+            <div style="font-size:.95rem;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_bankname"}}</span><b>{{.Bank.Bank}}</b></div>
+              <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_account"}}</span><b>{{.Bank.Account}}</b></div>
+              <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_holder"}}</span><b>{{.Bank.Holder}}</b></div>
+              <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_amount"}}</span><b style="color:var(--brand-600);">{{vndInt $o.PriceVND}}₫</b></div>
+              <div style="background:var(--ink-50);padding:12px;border-radius:8px;">
+                <span class="muted" style="font-size:.82rem;">{{t .Lang "pay_content"}}</span>
+                <div style="font-weight:700;font-family:monospace;font-size:1.05rem;margin-top:2px;">{{.Bank.Content}} {{$o.Code}}</div>
+              </div>
+              <p class="muted" style="font-size:.82rem;">{{t .Lang "pay_auto_note"}}</p>
+            </div>
+          </div>
+        </div>
+        {{end}}
+
+        <!-- Crypto USDT BEP20 -->
+        {{if .CryptoEnabled}}
+        <div class="pay-pane" id="pane-crypto" style="display:none;">
+          <div style="font-size:.95rem;display:flex;flex-direction:column;gap:10px;">
+            <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_network"}}</span><b>BEP20 (Binance Smart Chain)</b></div>
+            <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_token"}}</span><b>USDT</b></div>
+            <div style="display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_exact"}}</span><b style="color:var(--brand-600);">{{money .PayAmount}} USDT</b></div>
+            <div style="background:var(--ink-50);padding:12px;border-radius:8px;">
+              <span class="muted" style="font-size:.82rem;">{{t .Lang "pay_wallet"}}</span>
+              <div style="font-weight:700;font-family:monospace;font-size:.9rem;margin-top:2px;word-break:break-all;">{{.USDTWallet}}</div>
+            </div>
+            <p class="muted" style="font-size:.82rem;">{{t .Lang "pay_usdt_note"}}</p>
+            <button class="btn btn-primary btn-block" onclick="checkCrypto()">{{t .Lang "pay_usdt_check"}}</button>
+          </div>
+        </div>
+        {{end}}
+
+        <!-- PayPal -->
+        {{if .PaypalEnabled}}
+        <div class="pay-pane" id="pane-paypal" style="display:none;">
+          <div style="font-size:.95rem;margin-bottom:14px;display:flex;justify-content:space-between;"><span class="muted">{{t .Lang "pay_amount"}}</span><b style="color:var(--brand-600);">${{money $o.PriceUSD}} USD</b></div>
+          <div id="paypal-buttons"></div>
+        </div>
+        {{end}}
+
+        <!-- Khong co cong thanh toan nao duoc bat -> bao khach lien he, KHONG hien nut xac nhan thu cong -->
+        {{if not (or .SepayEnabled (or .CryptoEnabled .PaypalEnabled))}}
+        <div style="text-align:center;padding:24px 12px;">
+          <div style="font-size:2rem;margin-bottom:10px;">🛠️</div>
+          <p class="muted" style="margin:0;">{{t .Lang "pay_none"}}</p>
+        </div>
+        {{end}}
+      </div>
+
+      <script>
+        const ORDER_CODE = "{{$o.Code}}";
+        const ORDER_STATUS = "{{$o.Status}}";
+        // Tu dong kiem tra trang thai don: neu duoc duyet (co key) thi tu reload.
+        if (ORDER_STATUS === "pending" || ORDER_STATUS === "reported") {
+          let pollCount = 0;
+          const poll = setInterval(async () => {
+            pollCount++;
+            if (pollCount > 120) { clearInterval(poll); return; } // dung sau ~10 phut
+            try {
+              const r = await fetch('/order/' + ORDER_CODE + '/status', { headers: { 'Accept': 'application/json' } });
+              if (!r.ok) return;
+              const d = await r.json();
+              if (d.status === 'approved') { clearInterval(poll); location.reload(); }
+              else if (d.status === 'cancelled') { clearInterval(poll); location.reload(); }
+            } catch (e) {}
+          }, 5000);
+        }
+        function selPay(m){
+          document.querySelectorAll('.pay-tab').forEach(t=>t.classList.toggle('active', t.dataset.pay===m));
+          document.querySelectorAll('.pay-pane').forEach(p=>p.style.display='none');
+          const pane=document.getElementById('pane-'+m); if(pane) pane.style.display='block';
+        }
+        function showStatus(msg, ok){
+          const el=document.getElementById('pay-status');
+          el.style.display='block';
+          el.style.background = ok ? '#e3f1ea' : '#fdf3e0';
+          el.style.color = ok ? '#008060' : '#b98900';
+          el.textContent=msg;
+        }
+        async function checkCrypto(){
+          showStatus('Đang kiểm tra giao dịch trên blockchain...', true);
+          const fd=new FormData(); fd.append('code', ORDER_CODE);
+          const r=await fetch('/pay/crypto/check',{method:'POST',body:fd});
+          const d=await r.json();
+          showStatus(d.message, d.approved);
+          if(d.approved) setTimeout(()=>location.reload(),1500);
+        }
+        {{if .PaypalEnabled}}
+        (function(){
+          const s=document.createElement('script');
+          s.src="https://www.paypal.com/sdk/js?client-id={{.PaypalID}}&currency=USD";
+          s.onload=function(){
+            if(!window.paypal) return;
+            paypal.Buttons({
+              createOrder:(data,actions)=>actions.order.create({purchase_units:[{amount:{value:"{{money $o.PriceUSD}}"}}]}),
+              onApprove:async(data,actions)=>{
+                showStatus('Đang xác nhận thanh toán PayPal...', true);
+                const r=await fetch('/pay/paypal/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:ORDER_CODE,paypalOrderID:data.orderID})});
+                const d=await r.json();
+                showStatus(d.message, d.approved);
+                if(d.approved) setTimeout(()=>location.reload(),1500);
+              }
+            }).render('#paypal-buttons');
+          };
+          document.head.appendChild(s);
+        })();
+        {{end}}
+      </script>
+    {{end}}
+  </div>
+</section>
+{{template "footer" .}}
+{{template "foot" .}}
+{{end}}

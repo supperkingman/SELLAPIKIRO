@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Check API Key · Kiro API Store</title>
+  <meta name="description" content="Check your Kiro API key status, remaining credits and usage. Powered by Opus 4.8, billed 100% accurately by Kiro." />
+  <meta name="robots" content="index, follow" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet" />
+  <style>
+    :root {
+      --brand-700: #004c3f;
+      --brand-600: #008060;
+      --brand-500: #00a37a;
+      --brand-400: #4bc79a;
+      --brand-100: #e3f1ea;
+      --ink-900: #1a1a1a;
+      --ink-700: #303030;
+      --ink-500: #6d7175;
+      --ink-400: #8c9196;
+      --ink-300: #c9cccf;
+      --ink-200: #e1e3e5;
+      --ink-100: #f1f2f3;
+      --ink-50: #f6f6f7;
+      --ok: #008060;
+      --ok-bg: #e3f1ea;
+      --err: #d72c0d;
+      --err-bg: #fbeae5;
+      --warn: #b98900;
+      --warn-bg: #fdf3e0;
+      --radius: 16px;
+      --font: 'Outfit', system-ui, -apple-system, sans-serif;
+      --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.12);
+      --shadow-brand: 0 16px 40px rgba(0, 128, 96, 0.22);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      color: var(--ink-900);
+      min-height: 100vh;
+      background:
+        radial-gradient(900px 480px at 80% -10%, rgba(0, 163, 122, 0.14), transparent 60%),
+        radial-gradient(700px 420px at -10% 10%, rgba(75, 199, 154, 0.12), transparent 55%),
+        linear-gradient(180deg, #ffffff, #f6f6f7);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px;
+    }
+
+    /* ===== Top nav ===== */
+    .topnav {
+      width: 100%;
+      max-width: 1080px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 4px 0;
+      margin-bottom: auto;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--ink-900);
+    }
+
+    .brand .logo {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--brand-600), var(--brand-400));
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 18px;
+      color: #fff;
+      box-shadow: var(--shadow-brand);
+    }
+
+    .brand .name { font-weight: 700; font-size: 16px; letter-spacing: .2px; }
+
+    .nav-right { display: flex; align-items: center; gap: 16px; }
+
+    .nav-right a.link {
+      text-decoration: none;
+      color: var(--ink-500);
+      font-size: 14px;
+      font-weight: 500;
+      transition: color .15s;
+    }
+
+    .nav-right a.link:hover { color: var(--brand-600); }
+
+    .lang-switch { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; }
+    .lang-switch button {
+      background: none; border: none; cursor: pointer;
+      color: var(--ink-400); padding: 3px 6px; border-radius: 6px;
+      font-family: inherit; font-weight: 700; font-size: 13px;
+      transition: color .15s, background .15s;
+    }
+    .lang-switch button:hover { color: var(--ink-700); }
+    .lang-switch button.on { color: var(--brand-600); background: var(--brand-100); }
+    .lang-switch .sep { color: var(--ink-300); }
+
+    /* ===== Card ===== */
+    .wrap {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex: 1;
+      padding: 40px 0;
+    }
+
+    .card {
+      position: relative;
+      width: 100%;
+      max-width: 500px;
+      background: #fff;
+      border: 1px solid var(--ink-200);
+      border-radius: var(--radius);
+      padding: 40px 36px;
+      box-shadow: var(--shadow-lg);
+      animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(16px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--brand-100);
+      color: var(--brand-700);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 12px;
+      border-radius: 99px;
+      margin-bottom: 16px;
+    }
+
+    .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brand-500); animation: pulse 1.8s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+
+    h1 { font-size: 26px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.4px; }
+
+    .sub { color: var(--ink-500); font-size: 14.5px; line-height: 1.55; margin-bottom: 28px; }
+
+    label { display: block; font-size: 13px; color: var(--ink-700); margin-bottom: 8px; font-weight: 600; }
+
+    .field { position: relative; margin-bottom: 18px; }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 15px 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+      color: var(--ink-900);
+      background: var(--ink-50);
+      border: 1.5px solid var(--ink-200);
+      border-radius: 12px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+    }
+
+    input::placeholder { color: var(--ink-400); }
+    input:focus { border-color: var(--brand-500); background: #fff; box-shadow: 0 0 0 4px rgba(0, 163, 122, 0.14); }
+
+    button.check {
+      width: 100%;
+      padding: 15px;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      background: linear-gradient(135deg, var(--brand-600), var(--brand-500));
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
+      box-shadow: var(--shadow-brand);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+    }
+
+    button.check:hover { transform: translateY(-2px); box-shadow: 0 20px 46px rgba(0, 128, 96, 0.32); }
+    button.check:active { transform: translateY(0); }
+    button.check:disabled { opacity: 0.65; cursor: not-allowed; transform: none; }
+
+    .spinner {
+      width: 17px; height: 17px;
+      border: 2.2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: none;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .result {
+      margin-top: 22px; padding: 0; max-height: 0; overflow: hidden;
+      border-radius: 12px; opacity: 0;
+      transition: max-height 0.4s ease, opacity 0.35s ease, padding 0.4s ease;
+    }
+
+    .result.show { max-height: 400px; opacity: 1; padding: 18px; }
+
+    .result .r-head { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; }
+
+    .result .r-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0; font-size: 18px; }
+
+    .result .r-msg { margin-top: 10px; font-size: 13.5px; line-height: 1.55; color: var(--ink-500); }
+
+    .result.ok { background: var(--ok-bg); border: 1px solid rgba(0, 128, 96, 0.25); }
+    .result.ok .r-head { color: var(--ok); }
+    .result.ok .r-icon { background: rgba(0, 128, 96, 0.16); color: var(--ok); }
+
+    .result.err { background: var(--err-bg); border: 1px solid rgba(215, 44, 13, 0.22); }
+    .result.err .r-head { color: var(--err); }
+    .result.err .r-icon { background: rgba(215, 44, 13, 0.14); color: var(--err); }
+
+    .result.warn { background: var(--warn-bg); border: 1px solid rgba(185, 137, 0, 0.25); }
+    .result.warn .r-head { color: var(--warn); }
+    .result.warn .r-icon { background: rgba(185, 137, 0, 0.16); color: var(--warn); }
+
+    .usage { margin-top: 16px; display: none; flex-direction: column; gap: 14px; }
+    .usage.show { display: flex; }
+
+    .u-block .u-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 7px; }
+    .u-block .u-label { font-size: 13px; font-weight: 600; color: var(--ink-900); }
+    .u-block .u-val { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ink-500); }
+
+    .u-bar { height: 9px; border-radius: 99px; background: var(--ink-100); overflow: hidden; }
+    .u-fill { height: 100%; border-radius: 99px; width: 0%; background: linear-gradient(90deg, var(--brand-600), var(--brand-400)); transition: width 0.7s cubic-bezier(0.2, 0.8, 0.2, 1); }
+    .u-fill.mid { background: linear-gradient(90deg, var(--warn), #f59e0b); }
+    .u-fill.high { background: linear-gradient(90deg, var(--err), #dc2626); }
+
+    .u-left { font-size: 12px; color: var(--ink-500); margin-top: 5px; }
+    .u-left b { color: var(--ink-900); font-weight: 700; }
+
+    .u-meta { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--ink-500); }
+    .u-chip { background: var(--ink-50); border: 1px solid var(--ink-200); padding: 4px 10px; border-radius: 8px; }
+    .u-chip b { color: var(--ink-900); font-weight: 700; }
+
+    .card-foot { margin-top: 26px; text-align: center; font-size: 12px; color: var(--ink-400); line-height: 1.6; }
+    .card-foot code { font-family: 'JetBrains Mono', monospace; color: var(--brand-600); background: var(--brand-100); padding: 1px 6px; border-radius: 5px; }
+
+    /* ===== Page footer ===== */
+    .pagefoot {
+      width: 100%;
+      max-width: 1080px;
+      margin-top: auto;
+      padding: 24px 4px;
+      border-top: 1px solid var(--ink-200);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--ink-400);
+    }
+
+    .pagefoot a { color: var(--ink-500); text-decoration: none; margin-left: 18px; transition: color .15s; }
+    .pagefoot a:hover { color: var(--brand-600); }
+
+    @media (max-width: 560px) {
+      .nav-right a.link { display: none; }
+      .card { padding: 32px 22px; }
+    }
+  </style>
+  <!-- Cloudflare Turnstile captcha. Neu KHONG dung captcha, xoa doan nay + widget ben duoi. -->
+  <script>
+    window.TURNSTILE_SITEKEY = "REPLACE_WITH_TURNSTILE_SITEKEY";
+  </script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</head>
+
+<body>
+  <nav class="topnav">
+    <a href="/" class="brand">
+      <span class="logo">K</span>
+      <span class="name">Kiro API Store</span>
+    </a>
+    <div class="nav-right">
+      <a href="/pricing" class="link" data-i18n="nav_pricing">Pricing</a>
+      <a href="/" class="link" data-i18n="nav_store">Store</a>
+      <span class="lang-switch">
+        <button type="button" data-lang="en" onclick="setLang('en')">EN</button>
+        <span class="sep">|</span>
+        <button type="button" data-lang="vi" onclick="setLang('vi')">VI</button>
+      </span>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <main class="card">
+      <span class="eyebrow"><span class="dot"></span><span data-i18n="badge">Opus 4.8 · Powered by Kiro-Go</span></span>
+      <h1 data-i18n="title">Check your API Key</h1>
+      <p class="sub" data-i18n="sub">Paste your API key below to check its status, remaining credits and usage. We run a tiny test request to verify — it never costs your credits.</p>
+
+      <form id="checkForm" autocomplete="off">
+        <div class="field">
+          <label for="apiKey" data-i18n="label">API Key</label>
+          <input type="text" id="apiKey" name="apiKey" placeholder="sk-..." spellcheck="false" autocapitalize="off" />
+        </div>
+        <div id="turnstileBox" style="margin:14px 0;display:none;">
+          <div id="turnstileWidget"></div>
+        </div>
+        <button type="submit" class="check" id="checkBtn">
+          <span class="spinner" id="spinner"></span>
+          <span id="btnLabel" data-i18n="btn">Check now</span>
+        </button>
+      </form>
+
+      <div class="result" id="result" role="status" aria-live="polite">
+        <div class="r-head">
+          <span class="r-icon" id="rIcon"></span>
+          <span id="rTitle"></span>
+        </div>
+        <div class="r-msg" id="rMsg"></div>
+        <div class="usage" id="usage"></div>
+      </div>
+
+      <p class="card-foot" data-i18n="cardfoot">Safe check · Never costs your credits<br />OpenAI &amp; Anthropic compatible · Secured over HTTPS</p>
+    </main>
+  </div>
+
+  <footer class="pagefoot">
+    <span>© <span id="year"></span> Kiro API Store · <span data-i18n="foot_tagline">Credits billed 100% accurately by Kiro</span></span>
+    <span>
+      <a href="/" data-i18n="nav_store">Store</a>
+      <a href="/pricing" data-i18n="nav_pricing">Pricing</a>
+      <a href="/#faq">FAQ</a>
+    </span>
+  </footer>
+
+  <script>
+    // ===== i18n (EN default, VI optional) =====
+    var I18N = {
+      en: {
+        nav_pricing: 'Pricing', nav_store: 'Store',
+        badge: 'Opus 4.8 · Powered by Kiro-Go',
+        title: 'Check your API Key',
+        sub: 'Paste your API key below to check its status, remaining credits and usage. We run a tiny test request to verify — it never costs your credits.',
+        label: 'API Key', btn: 'Check now', btn_loading: 'Checking...',
+        cardfoot: 'Safe check · Never costs your credits<br />OpenAI & Anthropic compatible · Secured over HTTPS',
+        foot_tagline: 'Credits billed 100% accurately by Kiro',
+        no_key_t: 'No key entered', no_key_m: 'Please paste your API key in the field above.',
+        no_cap_t: 'Not verified', no_cap_m: 'Please complete the verification (captcha) above.',
+        rate_t: 'Too many attempts', rate_m: 'You have tried too many times. Please come back in a few minutes.',
+        busy_t: 'System busy', busy_m: 'The system is temporarily unavailable. Please try again later.',
+        ok_t: 'Key is valid and active', ok_m: 'Your API key is ready to use.',
+        bad_t: 'Invalid key', bad_m: 'This API key does not exist, has been disabled, or is incorrect. Please check again or contact where you bought it.',
+        neterr_t: 'Connection failed', neterr_m: 'Could not reach the server. Check your network and try again.',
+        u_token: 'Token', u_credit: 'Credit', u_left: 'Remaining', u_unlimited: 'Unlimited',
+        u_called: 'Called', u_requests: 'requests',
+        u_expiry: 'Time remaining', u_expired: 'Expired', u_paused: 'Paused', u_permanent: 'No expiry',
+        u_d: 'd', u_h: 'h', u_m: 'm', u_s: 's'
+      },
+      vi: {
+        nav_pricing: 'Bảng giá', nav_store: 'Cửa hàng',
+        badge: 'Opus 4.8 · Vận hành bởi Kiro-Go',
+        title: 'Kiểm tra API Key',
+        sub: 'Dán API key của bạn vào ô bên dưới để kiểm tra trạng thái, credit còn lại và mức sử dụng. Hệ thống chạy một yêu cầu thử cực nhỏ để xác minh — không tốn credit của bạn.',
+        label: 'API Key', btn: 'Kiểm tra ngay', btn_loading: 'Đang kiểm tra...',
+        cardfoot: 'Kiểm tra an toàn · Không tốn credit của bạn<br />Tương thích OpenAI & Anthropic · Bảo mật qua HTTPS',
+        foot_tagline: 'Credit tính chính xác 100% từ Kiro',
+        no_key_t: 'Chưa nhập key', no_key_m: 'Vui lòng dán API key của bạn vào ô phía trên.',
+        no_cap_t: 'Chưa xác minh', no_cap_m: 'Vui lòng hoàn tất ô xác minh (captcha) phía trên.',
+        rate_t: 'Quá nhiều lần thử', rate_m: 'Bạn đã thử quá nhiều lần. Vui lòng quay lại sau ít phút.',
+        busy_t: 'Hệ thống bận', busy_m: 'Hệ thống tạm thời chưa sẵn sàng. Vui lòng thử lại sau.',
+        ok_t: 'Key hợp lệ và đang hoạt động', ok_m: 'API key của bạn sẵn sàng sử dụng.',
+        bad_t: 'Key không hợp lệ', bad_m: 'API key này không tồn tại, đã bị vô hiệu hóa, hoặc không đúng. Vui lòng kiểm tra lại hoặc liên hệ nơi bạn đã mua.',
+        neterr_t: 'Không kết nối được', neterr_m: 'Không thể kết nối tới máy chủ. Kiểm tra lại mạng rồi thử lại.',
+        u_token: 'Token', u_credit: 'Credit', u_left: 'Còn lại', u_unlimited: 'Không giới hạn',
+        u_called: 'Đã gọi', u_requests: 'request',
+        u_expiry: 'Thời gian còn lại', u_expired: 'Đã hết hạn', u_paused: 'Tạm dừng', u_permanent: 'Không giới hạn',
+        u_d: 'ngày', u_h: 'giờ', u_m: 'phút', u_s: 'giây'
+      }
+    };
+
+    function getLang() {
+      var m = document.cookie.match(/(?:^|; )lang=(en|vi)/);
+      return m ? m[1] : 'en';
+    }
+    function setLang(l) {
+      document.cookie = 'lang=' + l + ';path=/;max-age=31536000';
+      applyLang(l);
+    }
+    var LANG = getLang();
+    function T(k) { return (I18N[LANG] && I18N[LANG][k]) || I18N.en[k] || k; }
+
+    function applyLang(l) {
+      LANG = l;
+      document.documentElement.lang = l;
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        el.innerHTML = T(el.getAttribute('data-i18n'));
+      });
+      document.querySelectorAll('.lang-switch button').forEach(function (b) {
+        b.classList.toggle('on', b.getAttribute('data-lang') === l);
+      });
+    }
+
+    document.getElementById('year').textContent = new Date().getFullYear();
+    applyLang(LANG);
+
+    // ===== Resolve store links =====
+    // Local dev: storefront chay o cong khac (8083) voi keycheck (8081) -> tro tuyet doi.
+    // Production: cung ten mien qua reverse-proxy -> dung duong dan tuong doi.
+    (function () {
+      var host = location.hostname;
+      var isLocal = host === 'localhost' || host === '127.0.0.1';
+      var storeBase = isLocal ? location.protocol + '//' + host + ':8083' : '';
+      document.querySelectorAll('a[href="/"], a[href="/pricing"], a[href="/#faq"]').forEach(function (a) {
+        var path = a.getAttribute('href');
+        a.setAttribute('href', storeBase + path);
+      });
+    })();
+  </script>
+
+  <script>
+    (function () {
+      'use strict';
+      var form = document.getElementById('checkForm');
+      var input = document.getElementById('apiKey');
+      var btn = document.getElementById('checkBtn');
+      var btnLabel = document.getElementById('btnLabel');
+      var spinner = document.getElementById('spinner');
+      var result = document.getElementById('result');
+      var rIcon = document.getElementById('rIcon');
+      var rTitle = document.getElementById('rTitle');
+      var rMsg = document.getElementById('rMsg');
+      var usage = document.getElementById('usage');
+
+      function render(kind, icon, title, msg) {
+        result.className = 'result show ' + kind;
+        rIcon.textContent = icon;
+        rTitle.textContent = title;
+        rMsg.textContent = msg;
+        usage.className = 'usage';
+        usage.innerHTML = '';
+      }
+
+      function fmtInt(n) { return (n || 0).toLocaleString(LANG === 'vi' ? 'vi-VN' : 'en-US'); }
+      function fmtNum(n) { return (n || 0).toLocaleString(LANG === 'vi' ? 'vi-VN' : 'en-US', { maximumFractionDigits: 4 }); }
+
+      function bar(label, used, limit, left, isCredit) {
+        var pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+        var cls = pct >= 90 ? 'high' : (pct >= 70 ? 'mid' : '');
+        var fmt = isCredit ? fmtNum : fmtInt;
+        return '<div class="u-block">' +
+          '<div class="u-top"><span class="u-label">' + label + '</span>' +
+          '<span class="u-val">' + fmt(used) + ' / ' + fmt(limit) + ' (' + pct + '%)</span></div>' +
+          '<div class="u-bar"><div class="u-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
+          '<div class="u-left">' + T('u_left') + ': <b>' + fmt(left) + '</b></div>' +
+          '</div>';
+      }
+
+      // ---- Dem nguoc thoi han ----
+      var cdTimer = null;
+      function fmtCountdown(secs) {
+        if (secs < 0) secs = 0;
+        var d = Math.floor(secs / 86400);
+        var h = Math.floor((secs % 86400) / 3600);
+        var m = Math.floor((secs % 3600) / 60);
+        var s = secs % 60;
+        var out = [];
+        if (d > 0) out.push(d + ' ' + T('u_d'));
+        if (h > 0 || d > 0) out.push(h + ' ' + T('u_h'));
+        out.push(m + ' ' + T('u_m'));
+        out.push(s + ' ' + T('u_s'));
+        return out.join(' ');
+      }
+      function expiryBlock(d) {
+        // Tra ve HTML khoi thoi han (co id de dong ho cap nhat).
+        if (!d.expiryMode || d.expiryMode === 'none') {
+          return '<div class="u-block"><div class="u-top"><span class="u-label">' + T('u_expiry') +
+            '</span><span class="u-val"><b>' + T('u_permanent') + '</b></span></div></div>';
+        }
+        return '<div class="u-block" id="expBlock"><div class="u-top"><span class="u-label">' + T('u_expiry') +
+          '</span><span class="u-val" id="expVal">—</span></div>' +
+          '<div class="u-bar"><div class="u-fill" id="expBar" style="width:0%"></div></div></div>';
+      }
+      function startCountdown(d) {
+        if (cdTimer) { clearInterval(cdTimer); cdTimer = null; }
+        if (!d.expiryMode || d.expiryMode === 'none') return;
+        // Neu paused: hien so giay con lai co dinh (dong ho tam dung).
+        var paused = d.expiryMode === 'paused';
+        // Moc het han tuyet doi (ms) de dem lui chinh xac theo dong ho may khach.
+        var deadlineMs = (d.expiresAt ? d.expiresAt * 1000 : Date.now() + (d.secondsLeft || 0) * 1000);
+        var totalLeft0 = d.secondsLeft || 0;
+        function upd() {
+          var valEl = document.getElementById('expVal');
+          var barEl = document.getElementById('expBar');
+          if (!valEl) { if (cdTimer) { clearInterval(cdTimer); cdTimer = null; } return; }
+          var left = paused ? totalLeft0 : Math.floor((deadlineMs - Date.now()) / 1000);
+          if (left <= 0 && !paused) {
+            valEl.innerHTML = '<b style="color:#ef4444;">' + T('u_expired') + '</b>';
+            if (barEl) { barEl.style.width = '100%'; barEl.className = 'u-fill high'; }
+            if (cdTimer) { clearInterval(cdTimer); cdTimer = null; }
+            return;
+          }
+          var prefix = paused ? ('⏸ ' + T('u_paused') + ' · ') : '';
+          var warn = left <= 3 * 86400;
+          valEl.innerHTML = '<b style="color:' + (paused ? '#94a3b8' : (warn ? '#f59e0b' : '#10b981')) + ';">' +
+            prefix + fmtCountdown(left) + '</b>';
+          if (barEl && !paused) {
+            // Thanh tien do: uoc luong theo 30 ngay (chi de truc quan).
+            var pct = Math.max(0, Math.min(100, 100 - (left / (30 * 86400)) * 100));
+            barEl.style.width = pct + '%';
+            barEl.className = 'u-fill' + (warn ? ' high' : '');
+          }
+        }
+        upd();
+        if (!paused) cdTimer = setInterval(upd, 1000);
+      }
+
+      function renderUsage(d) {
+        var html = '';
+        if (d.tokenLimited) html += bar(T('u_token'), d.tokensUsed, d.tokenLimit, d.tokensLeft, false);
+        if (d.creditLimited) html += bar(T('u_credit'), d.creditsUsed, d.creditLimit, d.creditsLeft, true);
+        html += expiryBlock(d);
+        var chips = '<div class="u-meta">';
+        if (!d.tokenLimited) chips += '<span class="u-chip">' + T('u_token') + ': <b>' + T('u_unlimited') + '</b></span>';
+        if (!d.creditLimited) chips += '<span class="u-chip">' + T('u_credit') + ': <b>' + T('u_unlimited') + '</b></span>';
+        chips += '<span class="u-chip">' + T('u_called') + ': <b>' + fmtInt(d.requestsCount) + '</b> ' + T('u_requests') + '</span>';
+        chips += '</div>';
+        html += chips;
+        usage.innerHTML = html;
+        usage.className = 'usage show';
+        startCountdown(d);
+      }
+
+      function setLoading(on) {
+        btn.disabled = on;
+        spinner.style.display = on ? 'inline-block' : 'none';
+        btnLabel.textContent = on ? T('btn_loading') : T('btn');
+      }
+
+      var tsWidgetId = null;
+      function initTurnstile() {
+        var sitekey = window.TURNSTILE_SITEKEY;
+        if (!sitekey || sitekey.indexOf('REPLACE_WITH') === 0) return;
+        if (!window.turnstile) { setTimeout(initTurnstile, 300); return; }
+        document.getElementById('turnstileBox').style.display = '';
+        tsWidgetId = window.turnstile.render('#turnstileWidget', { sitekey: sitekey });
+      }
+      initTurnstile();
+
+      form.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        var key = input.value.trim();
+        if (!key) { render('warn', '!', T('no_key_t'), T('no_key_m')); return; }
+
+        var tsToken = '';
+        if (tsWidgetId !== null && window.turnstile) {
+          tsToken = window.turnstile.getResponse(tsWidgetId) || '';
+          if (!tsToken) { render('warn', '!', T('no_cap_t'), T('no_cap_m')); return; }
+        }
+
+        setLoading(true);
+        result.className = 'result';
+
+        try {
+          var res = await fetch('/api/check-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: key, turnstileToken: tsToken })
+          });
+          if (tsWidgetId !== null && window.turnstile) window.turnstile.reset(tsWidgetId);
+
+          var d = {};
+          try { d = await res.json(); } catch (_) { d = {}; }
+
+          if (res.status === 429) {
+            render('warn', '⏱', T('rate_t'), (d && d.error) || T('rate_m'));
+          } else if (res.status === 503) {
+            render('warn', '!', T('busy_t'), (d && d.error) || T('busy_m'));
+          } else if (d && d.valid) {
+            render('ok', '✓', T('ok_t'), d.message || T('ok_m'));
+            renderUsage(d);
+          } else {
+            render('err', '✕', T('bad_t'), (d && d.message) || T('bad_m'));
+          }
+        } catch (err) {
+          render('err', '!', T('neterr_t'), T('neterr_m'));
+        } finally {
+          setLoading(false);
+        }
+      });
+    })();
+  </script>
+</body>
+
+</html>

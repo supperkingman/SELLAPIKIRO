@@ -1,0 +1,119 @@
+{{define "head"}}
+<!DOCTYPE html>
+<html lang="{{if .Lang}}{{.Lang}}{{else}}en{{end}}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Title}} · {{.SiteName}}</title>
+<meta name="description" content="{{.Desc}}">
+<meta name="robots" content="index, follow">
+<meta name="keywords" content="Kiro API, Opus 4.8, Kiro-Go, buy Kiro API, API credits, Claude Opus, AI coding API">
+<link rel="canonical" href="{{.BaseURL}}{{.Path}}">
+<link rel="alternate" hreflang="en" href="{{.BaseURL}}{{.Path}}">
+<link rel="alternate" hreflang="vi" href="{{.BaseURL}}{{.Path}}">
+<link rel="alternate" hreflang="x-default" href="{{.BaseURL}}{{.Path}}">
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{.SiteName}}">
+<meta property="og:title" content="{{.Title}} · {{.SiteName}}">
+<meta property="og:description" content="{{.Desc}}">
+<meta property="og:url" content="{{.BaseURL}}{{.Path}}">
+<meta property="og:locale" content="{{if eq .Lang "vi"}}vi_VN{{else}}en_US{{end}}">
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{.Title}} · {{.SiteName}}">
+<meta name="twitter:description" content="{{.Desc}}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="/static/css/design-system.css?v={{if .Ver}}{{.Ver}}{{else}}9{{end}}">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Organization","name":"{{.SiteName}}","url":"{{.BaseURL}}","description":"{{.Desc}}"}
+</script>
+</head>
+<body>
+{{end}}
+
+{{define "nav"}}
+<header class="nav">
+  <div class="container nav-inner">
+    <a href="/" class="brand"><span class="brand-mark">K</span> {{.SiteName}}</a>
+    <nav class="nav-links">
+      <a href="/#features">{{t .Lang "nav_features"}}</a>
+      <a href="/pricing">{{t .Lang "nav_pricing"}}</a>
+      <a href="/#faq">{{t .Lang "nav_faq"}}</a>
+      <a href="{{.CheckKeyURL}}">{{t .Lang "nav_checkkey"}}</a>
+      <span class="lang-switch">
+        <a href="/lang?l=vi" class="{{if eq .Lang "vi"}}on{{end}}">VI</a>
+        <span class="sep">|</span>
+        <a href="/lang?l=en" class="{{if eq .Lang "en"}}on{{end}}">EN</a>
+      </span>
+      {{if .Session}}
+        <a href="/dashboard" class="btn btn-ghost">{{t .Lang "nav_account"}}</a>
+        <a href="/logout" class="btn btn-dark">{{t .Lang "nav_logout"}}</a>
+      {{else}}
+        <a href="/login" class="btn btn-ghost">{{t .Lang "nav_login"}}</a>
+        <a href="/register" class="btn btn-primary">{{t .Lang "nav_start"}}</a>
+      {{end}}
+    </nav>
+  </div>
+</header>
+{{end}}
+
+{{define "footer"}}
+<footer class="footer">
+  <div class="container" style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:24px;">
+    <div style="max-width:320px;">
+      <div class="brand" style="color:#fff;margin-bottom:10px;"><span class="brand-mark">K</span> {{.SiteName}}</div>
+      <p style="color:#8c9196;font-size:.92rem;">{{t .Lang "footer_tagline"}}</p>
+    </div>
+    <div>
+      <h4 style="color:#fff;font-size:.95rem;margin-bottom:12px;">{{t .Lang "footer_product"}}</h4>
+      <p style="margin-bottom:8px;"><a href="/pricing">{{t .Lang "nav_pricing"}}</a></p>
+      <p style="margin-bottom:8px;"><a href="/register">{{t .Lang "nav_start"}}</a></p>
+      <p><a href="/dashboard">{{t .Lang "nav_account"}}</a></p>
+    </div>
+    <div>
+      <h4 style="color:#fff;font-size:.95rem;margin-bottom:12px;">{{t .Lang "footer_support"}}</h4>
+      <p style="margin-bottom:8px;"><a href="{{.CheckKeyURL}}">{{t .Lang "nav_checkkey"}}</a></p>
+      <p style="margin-bottom:8px;"><a href="/#faq">{{t .Lang "faq_title"}}</a></p>
+      <p><a href="#">{{t .Lang "footer_contact"}}</a></p>
+    </div>
+  </div>
+  <div class="container" style="border-top:1px solid #2b2b2b;margin-top:28px;padding-top:20px;color:#6d7175;font-size:.85rem;">
+    © {{.Year}} {{.SiteName}}. {{t .Lang "footer_rights"}}
+  </div>
+</footer>
+{{end}}
+
+{{define "foot"}}
+<script>
+  // Copy code from the nearest terminal block.
+  function copyCode(btn) {
+    var term = btn.closest('.term');
+    var pane = term.querySelector('.sdk-pane:not([style*="display:none"]), .sdk-pane:not([style*="display: none"])') || term.querySelector('.term-body');
+    if (!pane) return;
+    var text = pane.innerText;
+    navigator.clipboard.writeText(text).then(function () {
+      var done = btn.getAttribute('data-done') || '✔';
+      var label = btn.getAttribute('data-label') || 'Copy';
+      btn.textContent = done;
+      setTimeout(function () { btn.textContent = label; }, 1600);
+    });
+  }
+
+  // SDK language tab switch.
+  function selSdk(btn, lang) {
+    var wrap = btn.closest('.sdk');
+    wrap.querySelectorAll('.sdk-tab').forEach(function (t) { t.classList.remove('active'); });
+    btn.classList.add('active');
+    var files = { py: 'main.py', js: 'index.js', go: 'main.go', curl: 'request.sh' };
+    var fileEl = wrap.querySelector('#sdk-file');
+    if (fileEl) fileEl.textContent = files[lang] || '';
+    wrap.querySelectorAll('.sdk-pane').forEach(function (p) {
+      p.style.display = p.getAttribute('data-sdk') === lang ? '' : 'none';
+    });
+  }
+</script>
+</body>
+</html>
+{{end}}

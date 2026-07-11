@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Import Grok CLI · Kiro-Go</title>
+  <meta name="description" content="Dán JSON export từ 9router Grok CLI (Grok Build) vào pool grokAccounts." />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-0: #0a0e1a; --bg-1: #111627;
+      --card: rgba(255,255,255,0.04); --card-border: rgba(255,255,255,0.08);
+      --text: #e8ebf5; --text-dim: #8b93a9;
+      --accent: #a855f7; --accent-2: #22d3ee;
+      --ok: #34d399; --err: #f87171; --radius: 18px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Outfit', system-ui, sans-serif; color: var(--text); min-height: 100vh;
+      background:
+        radial-gradient(1000px 500px at 10% -10%, rgba(168,85,247,.25), transparent 55%),
+        radial-gradient(800px 400px at 100% 0%, rgba(34,211,238,.15), transparent 50%),
+        linear-gradient(180deg, var(--bg-0), var(--bg-1));
+      display: flex; align-items: center; justify-content: center; padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 720px; background: var(--card); border: 1px solid var(--card-border);
+      border-radius: var(--radius); backdrop-filter: blur(18px); padding: 32px;
+      box-shadow: 0 30px 80px rgba(0,0,0,.45);
+    }
+    h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; }
+    .sub { color: var(--text-dim); font-size: 13px; margin-bottom: 18px; line-height: 1.5; }
+    label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 6px; font-weight: 500; }
+    input, textarea {
+      width: 100%; background: rgba(0,0,0,.35); border: 1px solid var(--card-border);
+      border-radius: 12px; color: var(--text); padding: 12px 14px; font-size: 14px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    textarea { min-height: 220px; resize: vertical; line-height: 1.45; }
+    .row { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+    button {
+      border: 0; border-radius: 12px; padding: 12px 18px; font-weight: 600; cursor: pointer;
+      font-family: inherit; font-size: 14px;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #6366f1); color: #fff;
+      box-shadow: 0 8px 24px rgba(168,85,247,.35);
+    }
+    .btn-ghost { background: rgba(255,255,255,.06); color: var(--text); border: 1px solid var(--card-border); }
+    .note {
+      margin-top: 16px; padding: 12px 14px; border-radius: 12px; font-size: 12.5px; line-height: 1.55;
+      background: rgba(168,85,247,.1); border: 1px solid rgba(168,85,247,.25); color: var(--text-dim);
+    }
+    .note strong { color: var(--text); }
+    #log { margin-top: 16px; font-size: 13px; white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; }
+    .ok { color: var(--ok); } .err { color: var(--err); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Import Grok CLI (Grok Build)</h1>
+    <p class="sub">
+      Dán JSON export từ script <code>scripts/export-grok-9router.ps1</code>
+      (hoặc từng object connection 9router). Lưu vào pool <strong>riêng</strong>
+      <code>grokAccounts[]</code> — không trộn với tài khoản Kiro/Claude.
+    </p>
+
+    <label for="pwd">Mật khẩu admin Kiro-Go</label>
+    <input id="pwd" type="password" placeholder="ADMIN_PASSWORD" autocomplete="current-password" />
+
+    <label for="raw">JSON tài khoản Grok (1 object, array, hoặc nhiều dòng)</label>
+    <textarea id="raw" placeholder='[{"id":"...","email":"...","accessToken":"...","refreshToken":"...","expiresAt":...}]'></textarea>
+
+    <div class="row">
+      <button class="btn-primary" id="btnImport" type="button">Import vào grokAccounts</button>
+      <button class="btn-ghost" id="btnList" type="button">Xem danh sách hiện có</button>
+    </div>
+
+    <div class="note">
+      <strong>Credit khách:</strong> khi gọi model <code>grok-4.5*</code>, hệ thống trừ
+      trên <em>API key khách</em> (cùng ví Claude):
+      <br />• tokensUsed += prompt + completion
+      <br />• creditsUsed += (prompt + completion) / 1000
+      <br />• 1 credit ≈ 1000 tokens · request lỗi / 402 Grok: <strong>không trừ</strong>
+      <br />• Lỗi Grok trả rõ (402 spending limit…), <strong>không</strong> fallback Claude.
+    </div>
+
+    <div id="log"></div>
+  </div>
+  <script>
+    (function () {
+      var pwdEl = document.getElementById('pwd');
+      var rawEl = document.getElementById('raw');
+      var logEl = document.getElementById('log');
+      try {
+        pwdEl.value = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
+      } catch (e) {}
+
+      function log(cls, msg) {
+        logEl.innerHTML += '<div class="' + cls + '">' + msg + '</div>';
+      }
+      function clearLog() { logEl.innerHTML = ''; }
+
+      function parseAccounts(raw) {
+        raw = (raw || '').trim();
+        if (!raw) return [];
+        try {
+          var j = JSON.parse(raw);
+          if (Array.isArray(j)) return j;
+          if (j && typeof j === 'object') return [j];
+        } catch (e) {}
+        var out = [];
+        raw.split(/\r?\n/).forEach(function (line) {
+          line = line.trim();
+          if (!line) return;
+          try { out.push(JSON.parse(line)); } catch (e) {}
+        });
+        return out;
+      }
+
+      async function postOne(acc, password) {
+        var res = await fetch('/admin/api/grok-accounts', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Password': password
+          },
+          body: JSON.stringify(acc)
+        });
+        var data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        return data;
+      }
+
+      document.getElementById('btnImport').onclick = async function () {
+        clearLog();
+        var password = pwdEl.value.trim();
+        if (!password) return log('err', 'Nhập mật khẩu admin.');
+        try {
+          sessionStorage.setItem('admin_password', password);
+        } catch (e) {}
+        var list = parseAccounts(rawEl.value);
+        if (!list.length) return log('err', 'Không parse được JSON tài khoản.');
+        var ok = 0, fail = 0;
+        for (var i = 0; i < list.length; i++) {
+          try {
+            var r = await postOne(list[i], password);
+            ok++;
+            log('ok', 'OK #' + (i + 1) + ' id=' + (r.id || list[i].id || '?'));
+          } catch (e) {
+            fail++;
+            log('err', 'FAIL #' + (i + 1) + ': ' + e.message);
+          }
+        }
+        log(fail ? 'err' : 'ok', 'Xong: ' + ok + ' ok, ' + fail + ' fail.');
+      };
+
+      document.getElementById('btnList').onclick = async function () {
+        clearLog();
+        var password = pwdEl.value.trim();
+        if (!password) return log('err', 'Nhập mật khẩu admin.');
+        try {
+          var res = await fetch('/admin/api/grok-accounts', {
+            headers: { 'X-Admin-Password': password }
+          });
+          var data = await res.json();
+          if (!res.ok) return log('err', data.error || ('HTTP ' + res.status));
+          log('ok', 'Số tài khoản: ' + (data.count || 0));
+          (data.accounts || []).forEach(function (a) {
+            log('', '• ' + (a.email || a.displayName || a.id) +
+              ' enabled=' + a.enabled + ' tokens=' + a.totalTokens +
+              ' credits=' + a.totalCredits);
+          });
+        } catch (e) {
+          log('err', e.message);
+        }
+      };
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+# ============================================================================
+# Cau hinh OpenLiteSpeed reverse proxy cho api.mmodiary.com
+# ============================================================================
+#
+# Dung khi VPS chay OpenLiteSpeed (khong phai Nginx).
+#
+# CO 2 CACH AP DUNG:
+#
+# --- CACH A: Dan truc tiep vao Virtual Host Config (de nhat) ---
+#   FlashPanel -> site api.mmodiary.com -> "vHost Conf" / "OpenLiteSpeed Config"
+#   -> dan TOAN BO noi dung ben duoi (cac khoi extprocessor + context) vao,
+#   -> Save -> Graceful Restart.
+#
+# --- CACH B: Qua WebAdmin Console (cong 7080) ---
+#   Xem phan huong dan tung o o cuoi file.
+#
+# DIEM QUAN TRONG: respBuffer 0  => TAT buffering de stream SSE (token realtime).
+#                  Neu bat buffer, khach se thay tra loi bi "khuc" hoac cho lau.
+# ============================================================================
+
+
+# ---- Chong DDoS tang ung dung: gioi han moi IP (Per-Client Throttling) ----
+# Chan 1 IP mo qua nhieu ket noi / ban qua nhieu request. Day la "van an toan"
+# tai reverse proxy - KHONG thay the Cloudflare (chong DDoS the tich o edge).
+# Chinh so theo luu luong that: neu khach that bi chan, tang gioi han len.
+perClientConnLimit {
+  staticReqPerSec         0      # 0 = khong gioi han file tinh (SSE khong bi anh huong)
+  dynReqPerSec            25     # toi da ~25 request dong/giay moi IP
+  outBandwidth            0
+  inBandwidth             0
+  softLimit               60     # bat dau throttle khi > 60 ket noi dong thoi/IP
+  hardLimit               80     # chan cung o 80 ket noi/IP
+  gracePeriod             15     # giay an han truoc khi block
+  banPeriod               60     # block IP vi pham trong 60 giay
+}
+
+# ---- External App 1: kiro-go (API chinh, cong 8080) ----
+extprocessor kirogo {
+  type                    proxy
+  address                 127.0.0.1:8080
+  maxConns                100
+  pcKeepAliveTimeout      3600
+  initTimeout             60
+  retryTimeout            0
+  respBuffer              0
+}
+
+# ---- External App 2: keycheck (trang kiem tra key, cong 8081) ----
+extprocessor keycheck {
+  type                    proxy
+  address                 127.0.0.1:8081
+  maxConns                50
+  pcKeepAliveTimeout      60
+  initTimeout             60
+  retryTimeout            0
+  respBuffer              0
+}
+
+
+# ---- External App 3: keyadmin (API co quyen cho bot Telegram, cong 8082) ----
+# Bao ve bang bearer token (KEYADMIN_TOKEN). Chi them proxy nay neu bot chay
+# tren VPS KHAC (can goi qua Internet). Neu bot chay ngay tren VPS nay, KHONG
+# can proxy - bot goi thang 127.0.0.1:8082, an toan hon (khong lo ra ngoai).
+extprocessor keyadmin {
+  type                    proxy
+  address                 127.0.0.1:8082
+  maxConns                20
+  pcKeepAliveTimeout      60
+  initTimeout             30
+  retryTimeout            0
+  respBuffer              0
+}
+
+
+# ---- Context: /check-key va /api/check-key -> sidecar keycheck ----
+# LUU Y THU TU: cac context cu the (/check-key) phai dat TRUOC context "/".
+context /api/check-key {
+  type                    proxy
+  handler                 keycheck
+  addDefaultCharset       off
+}
+
+context /check-key {
+  type                    proxy
+  handler                 keycheck
+  addDefaultCharset       off
+}
+
+# ---- Context: /admin -> CHI cho IP tin cay (allowlist) ----
+# Chan brute-force mat khau admin o tang reverse proxy: chi IP trong allow moi vao
+# duoc /admin va /admin/api/*. IP khac nhan 403 truoc khi cham toi kiro-go.
+# QUAN TRONG: dat context nay TRUOC context "/" (catch-all).
+# Doi IP: sua danh sach "allow" ben duoi HOAC dung scripts/update-admin-ip.sh.
+context /admin {
+  type                    proxy
+  handler                 kirogo
+  addDefaultCharset       off
+  accessControl {
+    # Cho phep: localhost + IP quan tri. Them IP moi o day (moi dong 1 allow).
+    allow                 127.0.0.1, 91.98.134.129
+    # Tu choi tat ca IP con lai.
+    deny                  ALL
+  }
+}
+
+# ---- Context: /keyadmin -> sidecar keyadmin (CHI them neu bot o VPS khac) ----
+# Bot goi: https://api.mmodiary.com/keyadmin/api/keys/create  kem header
+#   Authorization: Bearer <KEYADMIN_TOKEN>
+# OLS cat tien to /keyadmin roi chuyen den 127.0.0.1:8082 (uri /api/keys/...).
+context /keyadmin/ {
+  type                    proxy
+  handler                 keyadmin
+  addDefaultCharset       off
+}
+
+# ---- Context: tat ca con lai -> kiro-go ----
+context / {
+  type                    proxy
+  handler                 kirogo
+  addDefaultCharset       off
+}
+
+
+# ============================================================================
+# CACH B — Tao qua WebAdmin Console (https://IP_VPS:7080)
+# ============================================================================
+#
+# 1) External App thu 1:
+#    Server / Virtual Hosts -> chon vhost api.mmodiary.com -> tab "External App"
+#    -> Add (+) -> Type = "Web Server" (proxy):
+#       - Name:            kirogo
+#       - Address:         127.0.0.1:8080
+#       - Max Connections: 100
+#       - Response Buffering: No        <-- QUAN TRONG cho SSE
+#       - Keepalive Timeout: 3600
+#
+# 2) External App thu 2 (lam tuong tu):
+#       - Name:            keycheck
+#       - Address:         127.0.0.1:8081
+#       - Response Buffering: No
+#
+# 3) Context cho keycheck (tab "Context" -> Add -> Type = "Proxy"):
+#       - URI:            /check-key
+#       - Web Server:     keycheck
+#    Them 1 context nua tuong tu voi URI = /api/check-key -> keycheck
+#
+# 4) Context cho phan con lai (Type = "Proxy"):
+#       - URI:            /
+#       - Web Server:     kirogo
+#
+# 5) Graceful Restart (nut trong WebAdmin hoac FlashPanel).
+#
+# ============================================================================
+# SSL: FlashPanel/OLS da tu lo cert Let's Encrypt + listener 443 cho vhost.
+#      Khong can cau hinh SSL o day.
+# ============================================================================

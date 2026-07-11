@@ -1,0 +1,61 @@
+# Cau hinh Nginx reverse proxy cho FlashPanel
+#
+# Trong FlashPanel: mo site api.mmodiary.com -> tab "Nginx Config" (hoac
+# "Custom Config" / "Reverse Proxy"), dan PHAN BEN TRONG khoi "location /"
+# duoi day vao. FlashPanel da tu lo phan SSL, server_name, listen 443...
+#
+# Diem quan trong: TAT buffering de stream SSE (token tra ve realtime).
+
+# Trang khach kiem tra key + xem usage: https://api.mmodiary.com/check-key
+# Tro sang sidecar keycheck (cong 8081). Sidecar phuc vu ca trang lan API.
+# QUAN TRONG: truyen X-Real-IP de sidecar rate-limit / ban theo IP that cua khach.
+location = /check-key {
+    proxy_pass http://127.0.0.1:8081/check-key;
+    proxy_set_header Host      $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+
+location = /api/check-key {
+    proxy_pass http://127.0.0.1:8081/api/check-key;
+    proxy_set_header Host         $host;
+    proxy_set_header X-Real-IP    $remote_addr;
+    proxy_set_header Content-Type $content_type;
+    client_max_body_size 8k;
+}
+
+# API keyadmin cho bot Telegram (CHI them neu bot chay o VPS KHAC).
+# Neu bot chay ngay tren VPS nay -> bo qua, bot goi thang 127.0.0.1:8082.
+# Bot goi: https://api.mmodiary.com/keyadmin/api/keys/create
+#   kem header  Authorization: Bearer <KEYADMIN_TOKEN>
+location /keyadmin/ {
+    proxy_pass http://127.0.0.1:8082/;
+    proxy_set_header Host          $host;
+    proxy_set_header X-Real-IP     $remote_addr;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Content-Type  $content_type;
+    client_max_body_size 16k;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Streaming SSE: bat buoc tat buffer + cache
+    proxy_buffering    off;
+    proxy_cache        off;
+    proxy_set_header   Connection '';
+    chunked_transfer_encoding off;
+
+    # Timeout dai cho cac request AI chay lau
+    proxy_read_timeout    3600s;
+    proxy_send_timeout    3600s;
+    proxy_connect_timeout 60s;
+
+    # Cho phep body lon (prompt dai)
+    client_max_body_size 50m;
+}

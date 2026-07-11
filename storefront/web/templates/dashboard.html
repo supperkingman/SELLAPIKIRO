@@ -1,0 +1,137 @@
+{{define "dashboard.html"}}
+{{template "head" (dict "Title" "Tài khoản" "SiteName" .SiteName "Desc" "Quản lý API key và đơn hàng")}}
+{{template "nav" .}}
+<section style="padding:var(--space-6) 0 var(--space-10);min-height:70vh;">
+  <div class="container" style="max-width:960px;">
+    <h1 style="font-size:2rem;margin-bottom:6px;">{{t .Lang "dash_hello"}}</h1>
+    <p class="muted" style="margin-bottom:28px;">{{t .Lang "dash_sub"}}</p>
+
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:1.3rem;">{{t .Lang "dash_mykeys"}}</h2>
+      <a href="/pricing" class="btn btn-primary">{{t .Lang "dash_buymore"}}</a>
+    </div>
+
+    {{if .Keys}}
+    <div class="grid" style="grid-template-columns:1fr;margin-bottom:40px;">
+      {{range .Keys}}
+      <div class="card" style="padding:22px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="brand-mark">K</span>
+            <div><div style="font-weight:700;">{{t $.Lang "dash_order"}} {{.OrderCode}}</div><div class="muted" style="font-size:.82rem;">{{.CreditLimit}} {{t $.Lang "price_credits"}}</div></div>
+          </div>
+          <span class="badge" style="background:#e3f1ea;color:var(--brand-600);">{{t $.Lang "card_active"}}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;background:var(--ink-900);padding:12px 14px;border-radius:10px;">
+          <code style="color:#4bc79a;font-size:.82rem;word-break:break-all;flex:1;" id="key-{{.ID}}">{{.APIKey}}</code>
+          <button class="btn btn-ghost" style="padding:6px 12px;font-size:.8rem;border-color:#444;color:#ccc;" onclick="navigator.clipboard.writeText(document.getElementById('key-{{.ID}}').innerText);this.innerText='{{t $.Lang "copied"}}'">{{t $.Lang "copy"}}</button>
+        </div>
+        <div style="margin-top:16px;">
+          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:6px;">
+            <span class="muted">{{t $.Lang "card_used"}}</span>
+            <span style="font-weight:600;">{{money .CreditsUsed}} / {{.CreditLimit}}</span>
+          </div>
+          <div style="height:8px;background:var(--ink-100);border-radius:99px;overflow:hidden;">
+            <div style="width:{{pct .CreditsUsed (money .CreditLimit)}}%;height:100%;background:linear-gradient(90deg,var(--brand-600),var(--brand-400));"></div>
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;font-size:.85rem;">
+          <span class="muted">{{t $.Lang "dash_expiry"}}</span>
+          {{if eq .ExpiryMode "none"}}
+          <span style="font-weight:600;color:var(--brand-600);">{{t $.Lang "dash_permanent"}}</span>
+          {{else}}
+          <span class="key-countdown" style="font-weight:700;" data-exp-mode="{{.ExpiryMode}}" data-exp-at="{{.ExpiresAt}}" data-exp-left="{{.SecondsLeft}}">—</span>
+          {{end}}
+        </div>
+        <form method="POST" action="/order/renew" style="margin-top:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <input type="hidden" name="key_id" value="{{.ID}}">
+          <select name="package_id" required style="flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--ink-200);border-radius:8px;font-size:.9rem;">
+            <option value="">{{t $.Lang "dash_renew_pick"}}</option>
+            {{range $.Packages}}
+            <option value="{{.ID}}">{{.Name}} — {{if eq $.Lang "vi"}}{{vnd .Price}}₫{{else}}${{money .Price}}{{end}}</option>
+            {{end}}
+          </select>
+          <button type="submit" class="btn btn-ghost" style="white-space:nowrap;">{{t $.Lang "dash_renew"}}</button>
+        </form>
+      </div>
+      {{end}}
+    </div>
+    {{else}}
+    <div class="card" style="padding:48px;text-align:center;margin-bottom:40px;">
+      <div style="font-size:2.5rem;margin-bottom:12px;">🔑</div>
+      <h3 style="margin-bottom:8px;">{{t .Lang "dash_nokeys_t"}}</h3>
+      <p class="muted" style="margin-bottom:20px;">{{t .Lang "dash_nokeys_d"}}</p>
+      <a href="/pricing" class="btn btn-primary btn-lg">{{t .Lang "dash_viewprice"}}</a>
+    </div>
+    {{end}}
+
+    <h2 style="font-size:1.3rem;margin-bottom:16px;">{{t .Lang "dash_history"}}</h2>
+    <div class="card" style="overflow:hidden;">
+      {{if .Orders}}
+      <table style="width:100%;border-collapse:collapse;font-size:.92rem;">
+        <thead><tr style="background:var(--ink-50);">
+          <th style="text-align:left;padding:12px 18px;font-size:.8rem;text-transform:uppercase;color:var(--ink-500);">{{t .Lang "col_code"}}</th>
+          <th style="text-align:left;padding:12px 18px;font-size:.8rem;text-transform:uppercase;color:var(--ink-500);">{{t .Lang "col_plan"}}</th>
+          <th style="text-align:left;padding:12px 18px;font-size:.8rem;text-transform:uppercase;color:var(--ink-500);">{{t .Lang "col_price"}}</th>
+          <th style="text-align:left;padding:12px 18px;font-size:.8rem;text-transform:uppercase;color:var(--ink-500);">{{t .Lang "col_status"}}</th>
+          <th style="padding:12px 18px;"></th>
+        </tr></thead>
+        <tbody>
+        {{range .Orders}}
+          <tr style="border-top:1px solid var(--ink-200);">
+            <td style="padding:14px 18px;font-weight:600;">{{.Code}}</td>
+            <td style="padding:14px 18px;">{{.PackageName}}</td>
+            <td style="padding:14px 18px;">${{money .PriceUSD}}</td>
+            <td style="padding:14px 18px;">
+              {{if eq .Status "approved"}}<span class="badge" style="background:#e3f1ea;color:var(--brand-600);">{{t $.Lang (printf "st_%s" .Status)}}</span>
+              {{else if eq .Status "cancelled"}}<span class="badge" style="background:#fbeae5;color:var(--danger);">{{t $.Lang (printf "st_%s" .Status)}}</span>
+              {{else}}<span class="badge" style="background:#fdf3e0;color:#b98900;">{{t $.Lang (printf "st_%s" .Status)}}</span>{{end}}
+            </td>
+            <td style="padding:14px 18px;text-align:right;"><a href="/order/{{.Code}}" style="color:var(--brand-600);font-weight:600;">{{t $.Lang "col_detail"}}</a></td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <div style="padding:40px;text-align:center;" class="muted">{{t .Lang "dash_noorders"}}</div>
+      {{end}}
+    </div>
+  </div>
+</section>
+<script>
+  (function () {
+    var L = { d: "{{t .Lang "dur_days"}}", h: "{{t .Lang "dur_hours"}}", m: "{{t .Lang "dur_min"}}", s: "{{t .Lang "dur_sec"}}",
+              expired: "{{t .Lang "dash_expired"}}", paused: "{{t .Lang "dash_paused"}}" };
+    function fmt(secs) {
+      if (secs < 0) secs = 0;
+      var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
+          m = Math.floor((secs % 3600) / 60), s = secs % 60, out = [];
+      if (d > 0) out.push(d + " " + L.d);
+      if (h > 0 || d > 0) out.push(h + " " + L.h);
+      out.push(m + " " + L.m); out.push(s + " " + L.s);
+      return out.join(" ");
+    }
+    function tick() {
+      var now = Date.now();
+      document.querySelectorAll(".key-countdown").forEach(function (el) {
+        var mode = el.getAttribute("data-exp-mode");
+        if (mode === "paused") {
+          var left = parseInt(el.getAttribute("data-exp-left"), 10) || 0;
+          el.textContent = "⏸ " + L.paused + " · " + fmt(left);
+          el.style.color = "#94a3b8"; return;
+        }
+        var at = parseInt(el.getAttribute("data-exp-at"), 10) || 0;
+        var left = Math.floor((at * 1000 - now) / 1000);
+        if (left <= 0) { el.textContent = L.expired; el.style.color = "#ef4444"; return; }
+        var warn = left <= 3 * 86400;
+        el.textContent = fmt(left);
+        el.style.color = warn ? "#f59e0b" : "#10b981";
+      });
+    }
+    tick();
+    setInterval(tick, 1000);
+  })();
+</script>
+{{template "footer" .}}
+{{template "foot" .}}
+{{end}}

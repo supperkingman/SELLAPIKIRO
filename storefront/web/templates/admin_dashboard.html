@@ -1,0 +1,62 @@
+{{define "admin_dashboard.html"}}
+{{template "admin_head" (dict "Title" "Tổng quan")}}
+{{template "admin_shell_open" .}}
+{{$s := .Stats}}
+<div class="stats-grid">
+  <div class="p-card stat">
+    <div class="label"><span class="ic-box ic-green">💵</span> Doanh thu</div>
+    <div class="value">${{money $s.RevenueUSD}}</div>
+    <div class="sub">{{vndInt $s.RevenueVND}}₫ đã thu</div>
+  </div>
+  <div class="p-card stat">
+    <div class="label"><span class="ic-box ic-blue">🧾</span> Đơn hàng</div>
+    <div class="value">{{$s.TotalOrders}}</div>
+    <div class="sub">{{$s.PendingOrders}} chờ xử lý</div>
+  </div>
+  <div class="p-card stat">
+    <div class="label"><span class="ic-box ic-purple">👥</span> Khách hàng</div>
+    <div class="value">{{$s.TotalCustomers}}</div>
+    <div class="sub">tổng tài khoản</div>
+  </div>
+  <div class="p-card stat">
+    <div class="label"><span class="ic-box ic-amber">🔑</span> Key đã giao</div>
+    <div class="value">{{$s.KeysIssued}}</div>
+    <div class="sub">API key đang hoạt động</div>
+  </div>
+</div>
+
+<div class="p-card">
+  <div class="p-card-pad" style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--p-border);">
+    <h3 style="font-size:1.05rem;">Đơn hàng gần đây</h3>
+    <a href="/frontadmin/orders" class="pb pb-sm">Xem tất cả</a>
+  </div>
+  <div class="p-table-wrap">
+    <table class="p-table">
+      <thead><tr><th>Mã đơn</th><th>Khách</th><th>Gói</th><th>Giá</th><th>Trạng thái</th><th></th></tr></thead>
+      <tbody>
+      {{range .Recent}}
+        <tr>
+          <td style="font-weight:600;">{{.Code}}</td>
+          <td>{{.Email}}</td>
+          <td>{{.PackageName}}</td>
+          <td>${{money .PriceUSD}}</td>
+          <td>{{template "status_pill" .Status}}</td>
+          <td style="text-align:right;"><a href="/frontadmin/orders" class="pb pb-sm">Xử lý</a></td>
+        </tr>
+      {{else}}
+        <tr><td colspan="6" class="empty">Chưa có đơn hàng nào.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "admin_shell_close" .}}
+{{end}}
+
+{{define "status_pill"}}
+{{if eq . "pending"}}<span class="pill pill-pending">Chờ thanh toán</span>
+{{else if eq . "reported"}}<span class="pill pill-reported">Chờ duyệt</span>
+{{else if eq . "approved"}}<span class="pill pill-approved">Đã giao key</span>
+{{else if eq . "cancelled"}}<span class="pill pill-cancelled">Đã hủy</span>
+{{else}}<span class="pill">{{.}}</span>{{end}}
+{{end}}

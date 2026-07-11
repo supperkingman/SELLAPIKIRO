@@ -1,0 +1,226 @@
+{{define "admin_customers.html"}}
+{{template "admin_head" (dict "Title" "Khách hàng")}}
+{{template "admin_shell_open" .}}
+<div class="page-head"><h2>Khách hàng</h2></div>
+<div class="p-card">
+  <div class="p-table-wrap">
+    <table class="p-table">
+      <thead><tr><th>Email</th><th>Họ tên</th><th>Số đơn</th><th>Số key</th><th>Trạng thái</th></tr></thead>
+      <tbody>
+      {{range .Customers}}
+        <tr>
+          <td style="font-weight:600;">{{.Email}}</td>
+          <td>{{if .FullName}}{{.FullName}}{{else}}—{{end}}</td>
+          <td>{{.NOrders}}</td>
+          <td>{{.NKeys}}</td>
+          <td>{{if .IsBlocked}}<span class="pill pill-cancelled">Bị khóa</span>{{else}}<span class="pill pill-approved">Hoạt động</span>{{end}}</td>
+        </tr>
+      {{else}}
+        <tr><td colspan="5" class="empty">Chưa có khách hàng nào.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "admin_shell_close" .}}
+{{end}}
+
+{{define "admin_keys.html"}}
+{{template "admin_head" (dict "Title" "API Keys")}}
+{{template "admin_shell_open" .}}
+<div class="page-head"><h2>API Keys đã giao</h2></div>
+<div class="p-card">
+  <div class="p-table-wrap">
+    <table class="p-table">
+      <thead><tr><th>Mã đơn</th><th>Khách</th><th>API Key</th><th>Credit (đã dùng / tổng)</th><th>Thời hạn</th><th>Thao tác</th></tr></thead>
+      <tbody>
+      {{range .Keys}}
+        <tr>
+          <td style="font-weight:600;">{{.OrderCode}}</td>
+          <td>{{.Email}}</td>
+          <td class="mono" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;">{{.APIKey}}</td>
+          <td>{{money .CreditsUsed}} / {{.CreditLimit}}{{if not .Enabled}} <span class="pill pill-cancelled">Tắt</span>{{end}}</td>
+          <td>
+            {{if eq .ExpiryMode "none"}}<span style="color:var(--p-ink-sub);">Vĩnh viễn</span>
+            {{else}}<span class="key-cd" data-mode="{{.ExpiryMode}}" data-at="{{.ExpiresAt}}" data-left="{{.SecondsLeft}}" style="font-weight:600;">—</span>{{end}}
+          </td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;">
+              <button class="pb pb-sm" onclick="openKeyModal({{.ID}},'credit')">Credit</button>
+              <button class="pb pb-sm" onclick="openKeyModal({{.ID}},'time')">Thời gian</button>
+              <button class="pb pb-sm" onclick="openKeyModal({{.ID}},'rename')">Đổi tên</button>
+              <button class="pb pb-sm" style="color:#c0392b;" onclick="openKeyModal({{.ID}},'delete')">Xóa</button>
+            </div>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td colspan="6" class="empty">Chưa có key nào được giao.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Form ẩn để submit thao tác -->
+<form id="keyActForm" method="POST" action="/frontadmin/keys/action" style="display:none;">
+  <input type="hidden" name="id" id="ka_id">
+  <input type="hidden" name="action" id="ka_action">
+  <input type="hidden" name="amount" id="ka_amount">
+  <input type="hidden" name="days" id="ka_days">
+  <input type="hidden" name="hours" id="ka_hours">
+  <input type="hidden" name="name" id="ka_name">
+</form>
+
+<!-- Modal thao tác key -->
+<div id="keyModal" class="km-overlay" onclick="if(event.target===this)closeKeyModal()">
+  <div class="km-box">
+    <div class="km-head"><h3 id="km_title">Thao tác</h3><button class="km-x" onclick="closeKeyModal()">×</button></div>
+    <div class="km-body" id="km_body"></div>
+    <div class="km-foot">
+      <button class="pb" onclick="closeKeyModal()">Hủy</button>
+      <button class="pb pb-primary" id="km_ok" onclick="confirmKeyModal()">Xác nhận</button>
+    </div>
+  </div>
+</div>
+
+<style>
+  .km-overlay{display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1000;align-items:center;justify-content:center;padding:20px;}
+  .km-overlay.on{display:flex;}
+  .km-box{background:#fff;border-radius:14px;max-width:420px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.3);overflow:hidden;animation:kmIn .16s ease;}
+  @keyframes kmIn{from{transform:translateY(12px);opacity:0;}to{transform:translateY(0);opacity:1;}}
+  .km-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--p-ink-200,#e5e7eb);}
+  .km-head h3{margin:0;font-size:1.1rem;}
+  .km-x{background:none;border:none;font-size:1.6rem;line-height:1;cursor:pointer;color:var(--p-ink-sub,#94a3b8);}
+  .km-body{padding:20px;display:flex;flex-direction:column;gap:14px;}
+  .km-body label{font-size:.85rem;font-weight:600;color:var(--p-ink-sub,#64748b);display:block;margin-bottom:5px;}
+  .km-body input,.km-body select{width:100%;padding:10px 12px;border:1px solid var(--p-ink-200,#e5e7eb);border-radius:9px;font-size:.95rem;box-sizing:border-box;}
+  .km-seg{display:flex;gap:6px;}
+  .km-seg button{flex:1;padding:9px;border:1px solid var(--p-ink-200,#e5e7eb);background:#fff;border-radius:9px;cursor:pointer;font-size:.85rem;font-weight:600;color:var(--p-ink-sub,#64748b);}
+  .km-seg button.on{background:var(--p-brand,#4f46e5);color:#fff;border-color:var(--p-brand,#4f46e5);}
+  .km-hint{font-size:.8rem;color:var(--p-ink-sub,#94a3b8);margin:0;}
+  .km-row{display:flex;gap:10px;}
+  .km-row>div{flex:1;}
+  .pb-primary{background:var(--p-brand,#4f46e5);color:#fff;border-color:var(--p-brand,#4f46e5);}
+  .km-danger{color:#c0392b;}
+</style>
+
+<script>
+  var kmState = { id: 0, kind: '', mode: 'add' };
+
+  function submitKeyAct(id, action, fields) {
+    document.getElementById('ka_id').value = id;
+    document.getElementById('ka_action').value = action;
+    document.getElementById('ka_amount').value = fields.amount || '';
+    document.getElementById('ka_days').value = fields.days || '';
+    document.getElementById('ka_hours').value = fields.hours || '';
+    document.getElementById('ka_name').value = fields.name || '';
+    document.getElementById('keyActForm').submit();
+  }
+
+  function segHtml(defMode) {
+    return '<div class="km-seg" id="km_seg">' +
+      '<button type="button" data-m="add" onclick="kmSetMode(\'add\')">Cộng thêm</button>' +
+      '<button type="button" data-m="sub" onclick="kmSetMode(\'sub\')">Trừ bớt</button>' +
+      '<button type="button" data-m="set" onclick="kmSetMode(\'set\')">Đặt luôn</button>' +
+      '</div>';
+  }
+  function kmSetMode(m) {
+    kmState.mode = m;
+    document.querySelectorAll('#km_seg button').forEach(function(b){
+      b.classList.toggle('on', b.getAttribute('data-m') === m);
+    });
+    var hint = document.getElementById('km_hint');
+    if (hint) {
+      if (kmState.kind === 'credit')
+        hint.textContent = m === 'set' ? 'Đặt tổng credit của key thành giá trị này.' : (m === 'add' ? 'Cộng thêm credit vào key.' : 'Trừ bớt credit khỏi key.');
+      else
+        hint.textContent = m === 'set' ? 'Đặt hạn mới = hiện tại + thời gian nhập (0/0 = vĩnh viễn).' : (m === 'add' ? 'Cộng thêm thời gian vào hạn hiện có.' : 'Trừ bớt thời gian khỏi hạn hiện có.');
+    }
+  }
+
+  function openKeyModal(id, kind) {
+    // Dua modal ra thang <body> de position:fixed khong bi cat vien boi grid/overflow cua .admin-shell.
+    var modalEl = document.getElementById('keyModal');
+    if (modalEl && modalEl.parentNode !== document.body) {
+      document.body.appendChild(modalEl);
+    }
+    kmState = { id: id, kind: kind, mode: 'add' };
+    var title = document.getElementById('km_title');
+    var body = document.getElementById('km_body');
+    if (kind === 'credit') {
+      title.textContent = 'Điều chỉnh Credit';
+      body.innerHTML = segHtml() +
+        '<div><label>Số credit</label><input type="number" id="km_credit" step="1" min="0" value="100" autofocus></div>' +
+        '<p class="km-hint" id="km_hint"></p>';
+      kmSetMode('add');
+    } else if (kind === 'time') {
+      title.textContent = 'Điều chỉnh Thời gian';
+      body.innerHTML = segHtml() +
+        '<div class="km-row"><div><label>Ngày</label><input type="number" id="km_days" step="1" value="30"></div>' +
+        '<div><label>Giờ</label><input type="number" id="km_hours" step="1" value="0"></div></div>' +
+        '<p class="km-hint" id="km_hint"></p>';
+      kmSetMode('add');
+    } else if (kind === 'rename') {
+      title.textContent = 'Đổi tên Key';
+      body.innerHTML = '<div><label>Tên mới</label><input type="text" id="km_name" placeholder="Tên hiển thị" autofocus></div>';
+    } else if (kind === 'delete') {
+      title.textContent = 'Xóa Key';
+      body.innerHTML = '<p class="km-danger" style="margin:0;">Xóa key này? Key sẽ ngừng hoạt động ngay và bị gỡ khỏi hệ thống. Hành động không thể hoàn tác.</p>';
+    }
+    document.getElementById('keyModal').classList.add('on');
+  }
+  function closeKeyModal() {
+    document.getElementById('keyModal').classList.remove('on');
+  }
+  function confirmKeyModal() {
+    var id = kmState.id, kind = kmState.kind, mode = kmState.mode;
+    if (kind === 'credit') {
+      var n = parseFloat(document.getElementById('km_credit').value);
+      if (isNaN(n)) return;
+      if (mode === 'set') submitKeyAct(id, 'set_credit', { amount: n });
+      else if (mode === 'sub') submitKeyAct(id, 'sub_credit', { amount: Math.abs(n) });
+      else submitKeyAct(id, 'add_credit', { amount: Math.abs(n) });
+    } else if (kind === 'time') {
+      var dn = parseInt(document.getElementById('km_days').value, 10) || 0;
+      var hn = parseInt(document.getElementById('km_hours').value, 10) || 0;
+      if (mode === 'set') submitKeyAct(id, 'set_time', { days: dn, hours: hn });
+      else if (mode === 'sub') submitKeyAct(id, 'sub_time', { days: Math.abs(dn), hours: Math.abs(hn) });
+      else submitKeyAct(id, 'add_time', { days: Math.abs(dn), hours: Math.abs(hn) });
+    } else if (kind === 'rename') {
+      var name = document.getElementById('km_name').value.trim();
+      if (!name) return;
+      submitKeyAct(id, 'rename', { name: name });
+    } else if (kind === 'delete') {
+      submitKeyAct(id, 'delete', {});
+    }
+  }
+  document.addEventListener('keydown', function(e){ if(e.key==='Escape')closeKeyModal(); });
+
+  // Đồng hồ đếm ngược cho các key có hạn.
+  function fmtCd(secs) {
+    if (secs < 0) secs = 0;
+    var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
+        m = Math.floor((secs % 3600) / 60), s = secs % 60, out = [];
+    if (d > 0) out.push(d + 'n');
+    if (h > 0 || d > 0) out.push(h + 'g');
+    out.push(m + 'p'); out.push(s + 's');
+    return out.join(' ');
+  }
+  function tickKeys() {
+    var now = Date.now();
+    document.querySelectorAll('.key-cd').forEach(function (el) {
+      if (el.getAttribute('data-mode') === 'paused') {
+        var left = parseInt(el.getAttribute('data-left'), 10) || 0;
+        el.textContent = '⏸ ' + fmtCd(left); el.style.color = '#94a3b8'; return;
+      }
+      var at = parseInt(el.getAttribute('data-at'), 10) || 0;
+      var left = Math.floor((at * 1000 - now) / 1000);
+      if (left <= 0) { el.textContent = 'Đã hết hạn'; el.style.color = '#e74c3c'; return; }
+      el.textContent = fmtCd(left);
+      el.style.color = left <= 3 * 86400 ? '#e67e22' : '#27ae60';
+    });
+  }
+  tickKeys(); setInterval(tickKeys, 1000);
+</script>
+{{template "admin_shell_close" .}}
+{{end}}

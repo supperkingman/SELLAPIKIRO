@@ -1,0 +1,142 @@
+services:
+  kiro-go:
+    # Build tu FORK zsecducna/Kiro-Go (ho tro dang nhap external_idp / Microsoft
+    # Entra ID / Azure AD - ma ban goc Quorinex khong co). Fork khong xuat ban
+    # image dung san nen phai build tu source.
+    # Local vendor (Grok CLI support). Push fork to GitHub later.
+    # Previously: https://github.com/zsecducna/Kiro-Go.git#main
+    build: ./kiro-go
+    image: kiro-go-fork:local
+    container_name: ${SITE_NAME:-kiro}-go
+    # Chi lang nghe noi bo. Nginx cua FlashPanel se reverse proxy HTTPS vao day.
+    # KHONG expose "8080:8080" tran ra ngoai de tranh truy cap admin qua IP:8080.
+    ports:
+      # Cong host lay tu .env (mac dinh 8080). Doi KIRO_PORT trong .env neu chay
+      # nhieu site tren cung VPS de tranh dung cong. Cong trong container luon 8080.
+      - "127.0.0.1:${KIRO_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
+      # Tinh nang tao key hang loat (file tu viet, mount de-only vao thu muc web).
+      # entrypoint.sh se chen the <script> tro toi file nay moi lan container khoi dong.
+      - ./web-custom/custom-bulk-keys.js:/app/web/custom-bulk-keys.js:ro
+      # Card "Import bang text" chen vao popup Add Account (self-healing qua entrypoint).
+      - ./web-custom/custom-import-account.js:/app/web/custom-import-account.js:ro
+      # Card "Import Grok CLI" trong popup Add Account (self-healing qua entrypoint).
+      - ./web-custom/custom-import-grok.js:/app/web/custom-import-grok.js:ro
+      # Danh sach Grok CLI tren tab Accounts.
+      - ./web-custom/custom-grok-accounts.js:/app/web/custom-grok-accounts.js:ro
+      # Hien thi ngay het han duoi moi API key (doc marker #exp trong ten key).
+      - ./web-custom/custom-key-expiry-display.js:/app/web/custom-key-expiry-display.js:ro
+      # Nut tam dung/tiep tuc dem gio + cong them gio cho tung key (dong bo voi keyadmin).
+      - ./web-custom/custom-key-controls.js:/app/web/custom-key-controls.js:ro
+      # Thanh bo dem + filter cho tab API Keys (loc client-side).
+      - ./web-custom/custom-key-dashboard.js:/app/web/custom-key-dashboard.js:ro
+      # Trang check-key cho khach (phuc vu tai /admin/check-key.html;
+      # Nginx map URL dep /check-key -> trang nay, xem nginx-reverse-proxy.conf.example).
+      - ./web-custom/check-key.html:/app/web/check-key.html:ro
+      # Wrapper tu dong chen tinh nang bulk-keys moi lan khoi dong (self-healing,
+      # khong phu thuoc deploy-hook -> tinh nang khong mat du container recreate).
+      - ./web-custom/entrypoint.sh:/app/entrypoint.sh:ro
+      # import-account.html / import-grok.html da thay bang card trong popup Add Account
+      # (custom-import-account.js + custom-import-grok.js). Khong mount standalone nua.
+    # Override entrypoint: chay wrapper (wrapper se exec ./kiro-go o cuoi).
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    environment:
+      - CONFIG_PATH=/app/data/config.json
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong file .env}
+    restart: unless-stopped
+
+  # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).
+  # Doc config.json read-only -> xac thuc key constant-time, KHONG ton token,
+  # KHONG cham pool. Kem rate limit + ban chong do key. Xem keycheck/main.go.
+  keycheck:
+    build: ./keycheck
+    image: kiro-keycheck:local
+    container_name: ${SITE_NAME:-kiro}-keycheck
+    # Chi bind localhost; Nginx FlashPanel se reverse proxy /check-key + /api/check-key vao day.
+    ports:
+      # Cong host lay tu .env (mac dinh 8081). Doi KEYCHECK_PORT neu chay nhieu site.
+      - "127.0.0.1:${KEYCHECK_PORT:-8081}:8081"
+    volumes:
+      # Mount CA THU MUC data (read-only) thay vi rieng file config.json.
+      # Ly do: kiro-go ghi config kieu atomic (temp file + rename) -> doi inode.
+      # Neu mount rieng 1 file, keycheck se ket dinh inode cu -> usage bi cu (stale).
+      # Mount thu muc thi moi lan doc se resolve lai duong dan -> luon thay du lieu moi.
+      - ./data:/data:ro
+      - ./web-custom/check-key.html:/app/check-key.html:ro
+    environment:
+      - KEYCHECK_CONFIG_PATH=/data/config.json
+      - KEYCHECK_HTML_PATH=/app/check-key.html
+      - KEYCHECK_LISTEN=:8081
+      # Cloudflare Turnstile: dat secret -> BAT BUOC captcha o trang check-key.
+      # De trong -> khong yeu cau captcha (tuong thich nguoc).
+      - TURNSTILE_SECRET=${TURNSTILE_SECRET:-}
+    restart: unless-stopped
+
+  # Sidecar co QUYEN cho bot Telegram: tao key, dat token/credit/han, tam dung &
+  # cong them gio. Khac keycheck (chi doc, cong khai) - keyadmin giu ADMIN_PASSWORD,
+  # xac thuc bang bearer token (KEYADMIN_TOKEN), goi admin API cua kiro-go. Xem keyadmin/main.go.
+  keyadmin:
+    build: ./keyadmin
+    image: kiro-keyadmin:local
+    container_name: ${SITE_NAME:-kiro}-keyadmin
+    # Chi bind localhost; bot goi qua 127.0.0.1:PORT hoac qua reverse proxy kem token.
+    ports:
+      - "127.0.0.1:${KEYADMIN_PORT:-8082}:8082"
+    environment:
+      - KEYADMIN_LISTEN=:8082
+      # Ten service kiro-go trong mang compose (khong phu thuoc SITE_NAME/container_name).
+      - KEYADMIN_KIRO_BASE=http://kiro-go:8080
+      - KEYADMIN_TOKEN=${KEYADMIN_TOKEN:?Phai dat KEYADMIN_TOKEN trong file .env}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong file .env}
+    depends_on:
+      - kiro-go
+    restart: unless-stopped
+
+  # Web ban API cho khach: landing page + tai khoan khach + admin (Shopify-style).
+  # Khi don duoc admin duyet -> goi keyadmin tao API key (creditLimit = credit goi)
+  # -> luu & tra khach. Du lieu (users/orders/keys) trong SQLite rieng o ./storefront-data.
+  storefront:
+    build: ./storefront
+    image: kiro-storefront:local
+    container_name: ${SITE_NAME:-kiro}-storefront
+    ports:
+      - "127.0.0.1:${STOREFRONT_PORT:-8083}:8083"
+    volumes:
+      # Du lieu web (SQLite) tach rieng khoi config.json cua kiro-go.
+      - ./storefront-data:/app/data
+    environment:
+      - STOREFRONT_LISTEN=:8083
+      - STOREFRONT_DATA_DIR=/app/data
+      # Ket noi keyadmin trong mang compose de tao key.
+      - KEYADMIN_BASE=http://keyadmin:8082
+      - KEYADMIN_TOKEN=${KEYADMIN_TOKEN:?Phai dat KEYADMIN_TOKEN trong file .env}
+      # Mat khau dang nhap trang /admin cua storefront (dung chung ADMIN_PASSWORD).
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong file .env}
+      # Cookie Secure: dat false neu test HTTP local, true khi chay HTTPS that.
+      - SECURE_COOKIE=${STOREFRONT_SECURE_COOKIE:-true}
+      - SITE_TITLE=${STOREFRONT_TITLE:-Kiro API Store}
+      - USD_TO_VND=${USD_TO_VND:-25000}
+      # Thong tin thanh toan (co the sua sau trong trang Admin > Cai dat).
+      - BANK_NAME=${BANK_NAME:-Vietcombank}
+      - BANK_ACCOUNT=${BANK_ACCOUNT:-0123456789}
+      - BANK_HOLDER=${BANK_HOLDER:-NGUYEN VAN A}
+      - BANK_CONTENT_PREFIX=${BANK_CONTENT_PREFIX:-KIRO}
+      - BANK_QR_URL=${BANK_QR_URL:-}
+      # URL cong khai (OAuth callback + PayPal return).
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:8083}
+      # SePay (tu dong xac nhan CK VND). De trong -> an cong.
+      - SEPAY_API_KEY=${SEPAY_API_KEY:-}
+      # BEP20 USDT (Binance Smart Chain). De trong -> an cong.
+      - USDT_WALLET_ADDRESS=${USDT_WALLET_ADDRESS:-}
+      - BSCSCAN_API_KEY=${BSCSCAN_API_KEY:-}
+      # PayPal (USD). De trong -> an cong.
+      - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID:-}
+      - PAYPAL_SECRET=${PAYPAL_SECRET:-}
+      - PAYPAL_LIVE=${PAYPAL_LIVE:-false}
+      # Google OAuth (dang nhap nhanh). De trong -> an nut.
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+    depends_on:
+      - keyadmin
+    restart: unless-stopped

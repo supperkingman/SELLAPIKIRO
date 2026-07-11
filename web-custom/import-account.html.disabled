@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Import tài khoản · MMO Diary API</title>
+  <meta name="description" content="Nhập tài khoản Kiro vào hệ thống bằng cách dán nội dung xuất từ máy." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet" />
+  <style>
+    :root {
+      --bg-0: #0a0e1a;
+      --bg-1: #111627;
+      --card: rgba(255, 255, 255, 0.04);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text: #e8ebf5;
+      --text-dim: #8b93a9;
+      --accent: #6366f1;
+      --accent-2: #22d3ee;
+      --ok: #34d399;
+      --ok-bg: rgba(52, 211, 153, 0.12);
+      --err: #f87171;
+      --err-bg: rgba(248, 113, 113, 0.12);
+      --warn: #fbbf24;
+      --warn-bg: rgba(251, 191, 36, 0.12);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Outfit', system-ui, sans-serif;
+      color: var(--text);
+      min-height: 100vh;
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(99, 102, 241, 0.22), transparent 60%),
+        radial-gradient(900px 500px at 110% 10%, rgba(34, 211, 238, 0.16), transparent 55%),
+        linear-gradient(180deg, var(--bg-0), var(--bg-1));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      overflow-x: hidden;
+    }
+
+    .glow { position: fixed; border-radius: 50%; filter: blur(90px); opacity: 0.5; pointer-events: none; z-index: 0; }
+    .glow.a { width: 380px; height: 380px; background: #4f46e5; top: -120px; left: -80px; }
+    .glow.b { width: 320px; height: 320px; background: #0891b2; bottom: -120px; right: -60px; }
+
+    .card {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      max-width: 640px;
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      padding: 36px;
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
+    .brand .logo {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: grid; place-items: center; font-weight: 700; font-size: 20px; color: #fff;
+    }
+    .brand h1 { font-size: 19px; font-weight: 600; }
+    .brand p { font-size: 13px; color: var(--text-dim); }
+
+    label { display: block; font-size: 13px; color: var(--text-dim); margin: 16px 0 7px; font-weight: 500; }
+
+    input, textarea {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      padding: 13px 15px;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    input:focus, textarea:focus {
+      outline: none; border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+    }
+    textarea { resize: vertical; min-height: 140px; line-height: 1.5; }
+
+    button {
+      width: 100%; margin-top: 20px; padding: 14px;
+      border: none; border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff; font-family: 'Outfit', sans-serif; font-size: 15px; font-weight: 600;
+      cursor: pointer; transition: transform .15s, box-shadow .2s;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 10px 30px rgba(99, 102, 241, 0.4); }
+    button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+    .result { margin-top: 20px; padding: 16px; border-radius: 12px; font-size: 14px; display: none; }
+    .result.show { display: block; }
+    .result.ok { background: var(--ok-bg); border: 1px solid rgba(52,211,153,.3); color: var(--ok); }
+    .result.err { background: var(--err-bg); border: 1px solid rgba(248,113,113,.3); color: var(--err); }
+    .result b { display: block; margin-bottom: 4px; font-size: 15px; }
+
+    .hint { font-size: 12px; color: var(--text-dim); margin-top: 8px; line-height: 1.6; }
+    .hint code { background: rgba(255,255,255,.06); padding: 2px 6px; border-radius: 5px; font-family: 'JetBrains Mono', monospace; }
+    .foot { margin-top: 22px; text-align: center; font-size: 12px; color: var(--text-dim); }
+    .foot a { color: var(--accent-2); text-decoration: none; }
+  </style>
+</head>
+
+<body>
+  <div class="glow a"></div>
+  <div class="glow b"></div>
+
+  <main class="card">
+    <div class="brand">
+      <div class="logo">↑</div>
+      <div>
+        <h1>Import tài khoản Kiro</h1>
+        <p>Dán nội dung xuất từ <code style="font-size:11px">export-account.ps1</code></p>
+      </div>
+    </div>
+
+    <label for="pw">Mật khẩu quản trị</label>
+    <input id="pw" type="password" placeholder="Mật khẩu admin" autocomplete="current-password" />
+
+    <label for="data">Nội dung tài khoản (JSON)</label>
+    <textarea id="data" placeholder='Dán vào đây, ví dụ: {"nickname":"...","refreshToken":"...","authMethod":"external_idp",...}'></textarea>
+    <p class="hint">
+      Trên máy đã đăng nhập Kiro IDE, chạy:
+      <code>powershell -ExecutionPolicy Bypass -File .\scripts\export-account.ps1</code>
+      rồi dán (Ctrl+V) vào ô trên. Hỗ trợ dán <b>nhiều tài khoản</b> (mỗi dòng 1 JSON, hoặc 1 mảng JSON).
+    </p>
+
+    <button id="btn" type="button">Import tài khoản</button>
+
+    <div id="result" class="result"></div>
+
+    <div class="foot">MMO Diary API · <a href="/admin">Trang quản trị</a></div>
+  </main>
+
+  <script>
+    (function () {
+      var $ = function (id) { return document.getElementById(id); };
+      var btn = $('btn'), pwEl = $('pw'), dataEl = $('data'), resEl = $('result');
+
+      function show(kind, title, msg) {
+        resEl.className = 'result show ' + kind;
+        resEl.innerHTML = '<b>' + title + '</b>' + (msg || '');
+      }
+
+      // Tach input thanh mang cac account object.
+      // Ho tro: 1 JSON object, 1 mang [], hoac nhieu dong moi dong 1 JSON.
+      function parseAccounts(raw) {
+        raw = raw.trim();
+        if (!raw) return [];
+        // Thu parse ca khoi truoc.
+        try {
+          var j = JSON.parse(raw);
+          if (Array.isArray(j)) return j;
+          if (j && typeof j === 'object') return [j];
+        } catch (e) { /* thu tach theo dong */ }
+        var out = [];
+        raw.split(/\r?\n/).forEach(function (line) {
+          line = line.trim();
+          if (!line) return;
+          try { out.push(JSON.parse(line)); } catch (e) { /* bo qua dong hong */ }
+        });
+        return out;
+      }
+
+      btn.addEventListener('click', async function () {
+        var pw = pwEl.value.trim();
+        var accounts = parseAccounts(dataEl.value);
+
+        if (!pw) { show('err', 'Thiếu mật khẩu', 'Nhập mật khẩu quản trị.'); return; }
+        if (accounts.length === 0) { show('err', 'Không đọc được dữ liệu', 'Kiểm tra lại nội dung JSON đã dán.'); return; }
+
+        btn.disabled = true;
+        btn.textContent = 'Đang import...';
+
+        var ok = 0, fail = 0, msgs = [];
+        for (var i = 0; i < accounts.length; i++) {
+          var acc = accounts[i];
+          if (!acc.refreshToken) { fail++; msgs.push('• Bỏ qua 1 mục: thiếu refreshToken'); continue; }
+          try {
+            var res = await fetch('/admin/api/accounts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Admin-Password': pw },
+              body: JSON.stringify(acc)
+            });
+            var d = {};
+            try { d = await res.json(); } catch (e) {}
+            if (res.status === 401) {
+              show('err', 'Sai mật khẩu', 'Mật khẩu quản trị không đúng.');
+              btn.disabled = false; btn.textContent = 'Import tài khoản';
+              return;
+            }
+            if (res.ok && d.success) { ok++; msgs.push('• ' + (acc.nickname || d.id || 'account') + ' — OK'); }
+            else { fail++; msgs.push('• ' + (acc.nickname || 'account') + ' — lỗi: ' + (d.error || res.status)); }
+          } catch (e) {
+            fail++; msgs.push('• ' + (acc.nickname || 'account') + ' — lỗi mạng');
+          }
+        }
+
+        btn.disabled = false;
+        btn.textContent = 'Import tài khoản';
+        if (fail === 0) {
+          show('ok', 'Đã import ' + ok + ' tài khoản', msgs.join('<br>'));
+          dataEl.value = '';
+        } else {
+          show(ok > 0 ? 'ok' : 'err', 'Import xong: ' + ok + ' thành công, ' + fail + ' lỗi', msgs.join('<br>'));
+        }
+      });
+
+      // Enter trong o mat khau -> focus textarea
+      pwEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') dataEl.focus(); });
+    })();
+  </script>
+</body>
+
+</html>

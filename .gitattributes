@@ -1,0 +1,5 @@
+# Bao dam shell script luon dung LF (chay tren Linux/VPS), tranh loi CRLF
+*.sh text eol=lf
+docker-compose.yml text eol=lf
+*.conf.example text eol=lf
+.env.example text eol=lf

@@ -1,0 +1,96 @@
+{{define "admin_docs.html"}}
+{{template "admin_head" (dict "Title" "Tài liệu")}}
+{{template "admin_shell_open" .}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+  <div>
+    <h2 style="font-size:1.3rem;">Tài liệu (/docs)</h2>
+    <p style="color:#6d7175;font-size:.9rem;">Soạn nội dung tài liệu bằng Markdown. Bài đã xuất bản sẽ hiện tại trang /docs.</p>
+  </div>
+  <a href="/frontadmin/docs/edit" class="pb pb-primary">+ Bài mới</a>
+</div>
+
+<div class="p-card" style="overflow:hidden;">
+  {{if .Docs}}
+  <table style="width:100%;border-collapse:collapse;font-size:.92rem;">
+    <thead><tr style="background:#f6f6f7;text-align:left;">
+      <th style="padding:12px 16px;">#</th>
+      <th style="padding:12px 16px;">Tiêu đề</th>
+      <th style="padding:12px 16px;">Slug</th>
+      <th style="padding:12px 16px;">Nhóm</th>
+      <th style="padding:12px 16px;">Trạng thái</th>
+      <th style="padding:12px 16px;">Cập nhật</th>
+      <th style="padding:12px 16px;"></th>
+    </tr></thead>
+    <tbody>
+    {{range .Docs}}
+      <tr style="border-top:1px solid #e1e3e5;">
+        <td style="padding:12px 16px;color:#8c9196;">{{.SortOrder}}</td>
+        <td style="padding:12px 16px;font-weight:600;">{{.Title}}</td>
+        <td style="padding:12px 16px;color:#6d7175;font-family:monospace;">/docs/{{.Slug}}</td>
+        <td style="padding:12px 16px;">{{if .Category}}{{.Category}}{{else}}—{{end}}</td>
+        <td style="padding:12px 16px;">{{if .IsPublished}}<span class="badge" style="background:#e3f1ea;color:#008060;">Xuất bản</span>{{else}}<span class="badge" style="background:#f1f2f3;color:#6d7175;">Nháp</span>{{end}}</td>
+        <td style="padding:12px 16px;color:#6d7175;">{{.UpdatedTime}}</td>
+        <td style="padding:12px 16px;text-align:right;white-space:nowrap;">
+          <a href="/frontadmin/docs/edit?id={{.ID}}" class="pb" style="padding:5px 12px;">Sửa</a>
+          <form method="POST" action="/frontadmin/docs/delete" style="display:inline;" onsubmit="return confirm('Xóa bài này?')">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button type="submit" class="pb" style="padding:5px 12px;color:#d72c0d;border-color:#f2c4bb;">Xóa</button>
+          </form>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div style="padding:44px;text-align:center;color:#6d7175;">Chưa có bài tài liệu nào. Bấm "+ Bài mới" để tạo.</div>
+  {{end}}
+</div>
+{{template "admin_shell_close" .}}
+{{end}}
+
+{{define "admin_doc_edit.html"}}
+{{$d := .Doc}}
+{{template "admin_head" (dict "Title" "Soạn tài liệu")}}
+{{template "admin_shell_open" .}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+  <h2 style="font-size:1.3rem;">{{if $d.ID}}Sửa bài{{else}}Bài mới{{end}}</h2>
+  <a href="/frontadmin/docs" class="pb">← Danh sách</a>
+</div>
+
+<form method="POST" action="/frontadmin/docs/save" class="p-card p-card-pad" style="display:flex;flex-direction:column;gap:16px;">
+  <input type="hidden" name="id" value="{{$d.ID}}">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div class="field">
+      <label>Tiêu đề</label>
+      <input type="text" name="title" value="{{$d.Title}}" required placeholder="Ví dụ: Authentication">
+    </div>
+    <div class="field">
+      <label>Slug (để trống sẽ tự tạo từ tiêu đề)</label>
+      <input type="text" name="slug" value="{{$d.Slug}}" placeholder="authentication">
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 160px 160px;gap:16px;align-items:end;">
+    <div class="field">
+      <label>Nhóm (category)</label>
+      <input type="text" name="category" value="{{$d.Category}}" placeholder="Getting Started">
+    </div>
+    <div class="field">
+      <label>Thứ tự</label>
+      <input type="number" name="sort_order" value="{{$d.SortOrder}}">
+    </div>
+    <div class="field" style="display:flex;align-items:center;gap:8px;padding-bottom:10px;">
+      <input type="checkbox" id="pub" name="is_published" {{if $d.IsPublished}}checked{{end}} style="width:auto;">
+      <label for="pub" style="margin:0;">Xuất bản</label>
+    </div>
+  </div>
+  <div class="field">
+    <label>Nội dung (Markdown) — hỗ trợ # tiêu đề, **đậm**, *nghiêng*, `code`, ```khối code```, - danh sách, > trích dẫn, [link](url)</label>
+    <textarea name="body" rows="22" required style="width:100%;font-family:'JetBrains Mono',monospace;font-size:.9rem;line-height:1.6;padding:14px;border:1.5px solid #e1e3e5;border-radius:10px;resize:vertical;" placeholder="# Tiêu đề&#10;&#10;Nội dung...">{{$d.Body}}</textarea>
+  </div>
+  <div style="display:flex;gap:12px;">
+    <button type="submit" class="pb pb-primary">Lưu bài</button>
+    <a href="/frontadmin/docs" class="pb">Hủy</a>
+  </div>
+</form>
+{{template "admin_shell_close" .}}
+{{end}}

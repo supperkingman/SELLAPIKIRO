@@ -1,0 +1,90 @@
+{{define "admin_packages.html"}}
+{{template "admin_head" (dict "Title" "Gói bán")}}
+{{template "admin_shell_open" .}}
+<div class="page-head"><h2>Gói bán</h2></div>
+<p style="color:var(--p-ink-sub);margin-bottom:16px;font-size:.9rem;">Chỉnh giá, số credit và bật/tắt gói. Số credit sẽ được dùng làm <code>creditLimit</code> khi tạo key.</p>
+<div class="grid" style="display:grid;gap:16px;">
+{{range .Packages}}
+  <div class="p-card p-card-pad">
+    <form method="POST" action="/frontadmin/packages/save" style="display:grid;grid-template-columns:1.4fr .8fr .9fr .9fr .7fr .7fr auto auto;gap:12px;align-items:end;">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <div class="field" style="margin:0;">
+        <label>Tên gói ({{.Slug}})</label>
+        <input type="text" name="name" value="{{.Name}}">
+      </div>
+      <div class="field" style="margin:0;">
+        <label>Credit</label>
+        <input type="number" name="credits" value="{{.Credits}}">
+      </div>
+      <div class="field" style="margin:0;">
+        <label>Giá gốc ($)</label>
+        <input type="number" step="0.01" name="original_price" value="{{money .OrigPrice}}">
+      </div>
+      <div class="field" style="margin:0;">
+        <label>Giá bán ($)</label>
+        <input type="number" step="0.01" name="price" value="{{money .Price}}">
+      </div>
+      <div class="field" style="margin:0;">
+        <label title="0 = vĩnh viễn">Hạn (ngày)</label>
+        <input type="number" name="duration_days" value="{{.DurationDays}}" min="0">
+      </div>
+      <div class="field" style="margin:0;">
+        <label>Hạn (giờ)</label>
+        <input type="number" name="duration_hours" value="{{.DurationHours}}" min="0">
+      </div>
+      <div class="field" style="margin:0;display:flex;flex-direction:column;align-items:center;">
+        <label>Bật</label>
+        <input type="checkbox" name="is_active" {{if .IsActive}}checked{{end}} style="width:20px;height:20px;">
+      </div>
+      <button type="submit" class="pb pb-primary">Lưu</button>
+    </form>
+  </div>
+{{end}}
+</div>
+{{template "admin_shell_close" .}}
+{{end}}
+
+{{define "admin_settings.html"}}
+{{template "admin_head" (dict "Title" "Cài đặt")}}
+{{template "admin_shell_open" .}}
+<div class="page-head"><h2>Cài đặt thanh toán</h2></div>
+<form method="POST" action="/frontadmin/settings" style="display:flex;flex-direction:column;gap:20px;max-width:640px;">
+
+  <!-- Ngan hang / SePay -->
+  <div class="p-card p-card-pad">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h3 style="font-size:1.05rem;">🏦 Chuyển khoản ngân hàng (SePay)</h3>
+      <label class="pay-switch"><input type="checkbox" name="pay_sepay_on" {{if .Pay.SepayOn}}checked{{end}}> <span>Bật</span></label>
+    </div>
+    <div class="field"><label>Tên ngân hàng</label><input type="text" name="bank_name" value="{{.Bank.Bank}}"></div>
+    <div class="field"><label>Số tài khoản</label><input type="text" name="bank_account" value="{{.Bank.Account}}"></div>
+    <div class="field"><label>Chủ tài khoản</label><input type="text" name="bank_holder" value="{{.Bank.Holder}}"></div>
+    <div class="field"><label>SePay API Key {{if .Pay.SepayAPIKey}}<span style="color:#008060;">(đã cấu hình)</span>{{end}}</label><input type="password" name="sepay_api_key" placeholder="{{if .Pay.SepayAPIKey}}••••••• (để trống nếu giữ nguyên){{else}}Nhập API key để bật webhook tự động{{end}}"></div>
+  </div>
+
+  <!-- Crypto USDT -->
+  <div class="p-card p-card-pad">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h3 style="font-size:1.05rem;">₮ USDT (BEP20)</h3>
+      <label class="pay-switch"><input type="checkbox" name="pay_crypto_on" {{if .Pay.CryptoOn}}checked{{end}}> <span>Bật</span></label>
+    </div>
+    <div class="field"><label>Địa chí ví nhận USDT (BEP20)</label><input type="text" name="usdt_wallet" value="{{.Pay.USDTWallet}}" placeholder="0x..."></div>
+    <div class="field"><label>BscScan API Key {{if .Pay.BscScanAPIKey}}<span style="color:#008060;">(đã cấu hình)</span>{{end}}</label><input type="password" name="bscscan_api_key" placeholder="{{if .Pay.BscScanAPIKey}}••••••• (để trống nếu giữ nguyên){{else}}Nhập để tự động kiểm tra giao dịch{{end}}"></div>
+  </div>
+
+  <!-- PayPal -->
+  <div class="p-card p-card-pad">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h3 style="font-size:1.05rem;">🅿 PayPal</h3>
+      <label class="pay-switch"><input type="checkbox" name="pay_paypal_on" {{if .Pay.PaypalOn}}checked{{end}}> <span>Bật</span></label>
+    </div>
+    <div class="field"><label>PayPal Client ID {{if .Pay.PaypalClientID}}<span style="color:#008060;">(đã cấu hình)</span>{{end}}</label><input type="text" name="paypal_client_id" value="{{.Pay.PaypalClientID}}" placeholder="Client ID"></div>
+    <div class="field"><label>PayPal Secret {{if .Pay.PaypalSecret}}<span style="color:#008060;">(đã cấu hình)</span>{{end}}</label><input type="password" name="paypal_secret" placeholder="{{if .Pay.PaypalSecret}}••••••• (để trống nếu giữ nguyên){{else}}Nhập secret{{end}}"></div>
+    <label class="pay-switch" style="margin-top:6px;"><input type="checkbox" name="paypal_live" {{if .Pay.PaypalLive}}checked{{end}}> <span>Chế độ Live (bỏ chọn = Sandbox)</span></label>
+  </div>
+
+  <div><button type="submit" class="pb pb-primary">Lưu cài đặt</button></div>
+  <p style="color:var(--p-ink-faint);font-size:.82rem;">Cổng chỉ hiển thị cho khách khi <b>Bật</b> và đã nhập đủ API/credential. Ảnh QR và tỉ giá USD→VND cấu hình qua biến môi trường (<code>BANK_QR_URL</code>, <code>USD_TO_VND</code>).</p>
+</form>
+{{template "admin_shell_close" .}}
+{{end}}

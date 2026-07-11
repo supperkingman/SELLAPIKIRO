@@ -1,0 +1,33 @@
+# fail2ban jail cho Kiro-Go API (chong hack admin + do key)
+#
+# Dat file nay tai: /etc/fail2ban/jail.d/kiro.local
+#
+# LUU Y: sua "logpath" cho dung duong dan access log cua OpenLiteSpeed tren VPS.
+#        Xem huong dan trong security/README-SECURITY.md.
+
+[DEFAULT]
+# Whitelist: KHONG BAO GIO ban cac IP nay (tranh tu khoa minh).
+# 91.98.134.129 = IP quan tri hien tai. Doi/them IP cua ban neu can.
+ignoreip = 127.0.0.1/8 ::1 91.98.134.129
+
+[kiro-admin]
+enabled  = true
+filter   = kiro-admin
+# Doi logpath cho dung access log OLS cua site api.mmodiary.com:
+logpath  = /usr/local/lsws/logs/access.log
+port     = http,https
+maxretry = 5
+findtime = 600
+bantime  = 3600
+# Chan bang iptables (fail2ban mac dinh)
+banaction = iptables-multiport
+
+[kiro-checkkey]
+enabled  = true
+filter   = kiro-checkkey
+logpath  = /usr/local/lsws/logs/access.log
+port     = http,https
+maxretry = 40
+findtime = 600
+bantime  = 1800
+banaction = iptables-multiport

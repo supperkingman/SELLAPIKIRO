@@ -1,0 +1,49 @@
+{{define "checkout.html"}}
+{{template "head" (dict "Title" "Thanh toán" "SiteName" .SiteName "Desc" "Xác nhận đơn hàng")}}
+{{template "nav" .}}
+{{$p := .Pkg}}
+<section style="padding:var(--space-8) 0;">
+  <div class="container" style="max-width:900px;display:grid;grid-template-columns:1.3fr .9fr;gap:var(--space-6);align-items:start;">
+    <div>
+      <h1 style="font-size:2rem;margin-bottom:8px;">{{t .Lang "co_title"}}</h1>
+      <p class="muted" style="margin-bottom:24px;">{{t .Lang "co_sub"}}</p>
+      <div class="card" style="padding:24px;margin-bottom:20px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:16px;border-bottom:1px solid var(--ink-200);">
+          <div>
+            <div style="font-weight:700;font-size:1.15rem;">{{t .Lang "co_plan"}} {{$p.Name}}</div>
+            <div class="muted" style="font-size:.9rem;">{{$p.Credits}} {{t .Lang "price_credits"}}</div>
+          </div>
+          <div style="text-align:right;">
+            {{if eq .Lang "vi"}}
+            <div style="font-size:1.5rem;font-weight:800;">{{vnd $p.Price}}₫</div>
+            <div class="muted" style="font-size:.82rem;text-decoration:line-through;">{{vnd $p.OrigPrice}}₫</div>
+            {{else}}
+            <div style="font-size:1.5rem;font-weight:800;">${{money $p.Price}}</div>
+            <div class="muted" style="font-size:.82rem;text-decoration:line-through;">${{money $p.OrigPrice}}</div>
+            {{end}}
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding-top:16px;font-size:1.05rem;">
+          <span style="font-weight:600;">{{t .Lang "co_total"}}</span>
+          <span style="font-weight:800;color:var(--brand-600);">{{if eq .Lang "vi"}}{{vndInt .PriceVND}}₫{{else}}${{money $p.Price}}{{end}}</span>
+        </div>
+      </div>
+      <form method="POST" action="/checkout">
+        <input type="hidden" name="package_id" value="{{$p.ID}}">
+        <button type="submit" class="btn btn-primary btn-block btn-lg">{{t .Lang "co_create"}}</button>
+      </form>
+    </div>
+    <div class="card" style="padding:22px;background:var(--ink-50);">
+      <h3 style="font-size:1rem;margin-bottom:14px;">{{t .Lang "co_steps"}}</h3>
+      <ol style="list-style:none;display:flex;flex-direction:column;gap:14px;font-size:.9rem;">
+        <li style="display:flex;gap:10px;"><span style="width:24px;height:24px;border-radius:50%;background:var(--brand-600);color:#fff;display:grid;place-items:center;font-size:.8rem;font-weight:700;flex-shrink:0;">1</span> {{t .Lang "co_step1"}}</li>
+        <li style="display:flex;gap:10px;"><span style="width:24px;height:24px;border-radius:50%;background:var(--ink-300);color:#fff;display:grid;place-items:center;font-size:.8rem;font-weight:700;flex-shrink:0;">2</span> {{t .Lang "co_step2"}}</li>
+        <li style="display:flex;gap:10px;"><span style="width:24px;height:24px;border-radius:50%;background:var(--ink-300);color:#fff;display:grid;place-items:center;font-size:.8rem;font-weight:700;flex-shrink:0;">3</span> {{t .Lang "co_step3"}}</li>
+        <li style="display:flex;gap:10px;"><span style="width:24px;height:24px;border-radius:50%;background:var(--ink-300);color:#fff;display:grid;place-items:center;font-size:.8rem;font-weight:700;flex-shrink:0;">4</span> {{t .Lang "co_step4"}}</li>
+      </ol>
+    </div>
+  </div>
+</section>
+{{template "footer" .}}
+{{template "foot" .}}
+{{end}}

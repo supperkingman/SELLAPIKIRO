@@ -1,0 +1,79 @@
+{{define "admin_head"}}
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Title}} · Admin</title>
+<link rel="stylesheet" href="/static/css/admin.css">
+</head>
+<body>
+{{end}}
+
+{{define "admin_shell_open"}}
+<div class="admin-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="mk">K</span> Kiro Admin</div>
+    <a href="/frontadmin" class="nav-item {{if eq .Active "dashboard"}}active{{end}}"><span class="ic">▤</span> Tổng quan</a>
+    <a href="/frontadmin/orders" class="nav-item {{if eq .Active "orders"}}active{{end}}"><span class="ic">🧾</span> Đơn hàng</a>
+    <a href="/frontadmin/customers" class="nav-item {{if eq .Active "customers"}}active{{end}}"><span class="ic">👥</span> Khách hàng</a>
+    <a href="/frontadmin/keys" class="nav-item {{if eq .Active "keys"}}active{{end}}"><span class="ic">🔑</span> API Keys</a>
+    <div class="nav-section">Cấu hình</div>
+    <a href="/frontadmin/packages" class="nav-item {{if eq .Active "packages"}}active{{end}}"><span class="ic">📦</span> Gói bán</a>
+    <a href="/frontadmin/docs" class="nav-item {{if eq .Active "docs"}}active{{end}}"><span class="ic">📄</span> Tài liệu</a>
+    <a href="/frontadmin/settings" class="nav-item {{if eq .Active "settings"}}active{{end}}"><span class="ic">⚙</span> Cài đặt</a>
+    <div class="nav-section">Khác</div>
+    <a href="/" class="nav-item"><span class="ic">🏬</span> Xem storefront</a>
+    <a href="/logout" class="nav-item"><span class="ic">⏻</span> Đăng xuất</a>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <h1>{{.Title}}</h1>
+      <div class="user"><span>Administrator</span><span class="avatar">A</span></div>
+    </div>
+    <div class="content">
+{{end}}
+
+{{define "admin_shell_close"}}
+    </div>
+  </div>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "admin_login.html"}}
+<!DOCTYPE html>
+<html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Đăng nhập Admin</title><link rel="stylesheet" href="/static/css/admin.css"></head>
+<body>
+<div class="admin-login-wrap">
+  <div class="admin-login-card">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+      <span style="width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#008060,#4bc79a);display:grid;place-items:center;color:#fff;font-weight:800;">K</span>
+      <h2 style="font-size:1.3rem;">Kiro Admin</h2>
+    </div>
+    <p style="color:#6d7175;font-size:.9rem;margin-bottom:22px;">Đăng nhập bằng mật khẩu quản trị.</p>
+    {{if .Error}}<div style="background:#fbeae5;color:#d72c0d;padding:10px 13px;border-radius:8px;font-size:.88rem;margin-bottom:16px;">{{.Error}}</div>{{end}}
+    <form method="POST" action="/frontadmin/login">
+      <div class="field">
+        <label>Mật khẩu admin</label>
+        <input type="password" name="password" required autofocus>
+      </div>
+      <button type="submit" class="pb pb-primary" style="width:100%;justify-content:center;padding:11px;">Đăng nhập</button>
+    </form>
+  </div>
+</div>
+</body></html>
+{{end}}
+
+{{define "admin_error.html"}}
+{{template "admin_head" (dict "Title" "Lỗi")}}
+{{template "admin_shell_open" .}}
+<div class="p-card p-card-pad" style="border-left:4px solid #d72c0d;">
+  <h2 style="color:#d72c0d;margin-bottom:8px;">Đã xảy ra lỗi</h2>
+  <p style="color:#6d7175;">{{.Message}}</p>
+  <a href="/frontadmin/orders" class="pb" style="margin-top:16px;">← Quay lại đơn hàng</a>
+</div>
+{{template "admin_shell_close" .}}
+{{end}}
