@@ -2287,8 +2287,10 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 					delete(excluded, acc.ID)
 					logger.Infof("[Grok] token refreshed after 401, will retry account=%s", acc.Email)
 				} else {
-					gp.Disable(acc.ID, "auth failed")
-					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access", -1, 0)
+					// Soft cooldown — do NOT permanently disable (empties pool for all customers).
+					gp.Cooldown(acc.ID, "auth failed", 15*time.Minute)
+					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access (cooldown 15m)", -1, 0)
+					logger.Warnf("[Grok] cooldown 15m after auth fail account=%s", acc.Email)
 				}
 			}
 			continue
@@ -2301,11 +2303,11 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				msg += " " + truncateStr(s, 200)
 			}
 			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
-			gp.Disable(acc.ID, "quota exhausted")
+			gp.Cooldown(acc.ID, "quota exhausted", 30*time.Minute)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			lastErr = fmt.Errorf("%s", msg)
-			logger.Warnf("[Grok] quota exhausted account=%s — try next", acc.Email)
+			logger.Warnf("[Grok] cooldown 30m quota exhausted account=%s — try next", acc.Email)
 			// Do not return raw 402 body to client yet; try other accounts first.
 			continue
 		}

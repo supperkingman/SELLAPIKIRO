@@ -15,6 +15,8 @@ type GrokPool struct {
 	index    uint64
 	// in-memory stats (flushed occasionally via UpdateStats)
 	stats map[string]*grokRuntimeStats
+	// temporary soft-ban: account id -> unix expiry (not persisted; survives until process restart)
+	cooldownUntil map[string]int64
 	// sticky maps customer (API key id) → Grok account id.
 	// Same customer keeps the same upstream account across turns so multi-turn /
 	// tool-loop context stays coherent (less "dumber" mid-session rotation).
@@ -38,7 +40,7 @@ var (
 // GetGrokPool returns the singleton Grok pool.
 func GetGrokPool() *GrokPool {
 	grokPoolOnce.Do(func() {
-		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), sticky: make(map[string]string)}
+		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), sticky: make(map[string]string), cooldownUntil: make(map[string]int64)}
 		grokPool.Reload()
 	})
 	return grokPool
@@ -160,6 +162,9 @@ func (p *GrokPool) pickRoundRobinLocked(excluded map[string]bool) *config.GrokAc
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
+		if p.isCoolingDownLocked(acc.ID) {
+			continue
+		}
 		if !acc.Enabled {
 			continue
 		}
@@ -171,7 +176,7 @@ func (p *GrokPool) pickRoundRobinLocked(excluded map[string]bool) *config.GrokAc
 
 func (p *GrokPool) findEnabledLocked(id string) *config.GrokAccount {
 	for i := range p.accounts {
-		if p.accounts[i].ID == id && p.accounts[i].Enabled {
+		if p.accounts[i].ID == id && p.accounts[i].Enabled && !p.isCoolingDownLocked(id) {
 			return &p.accounts[i]
 		}
 	}
@@ -211,10 +216,46 @@ func (p *GrokPool) UpdateToken(id, access, refresh string, expiresAt int64) {
 }
 
 // Disable marks account disabled in config and reloads.
+// Prefer Cooldown for transient 401/402 so the pool is not permanently emptied.
 func (p *GrokPool) Disable(id, reason string) {
 	_ = config.SetGrokAccountEnabled(id, false, reason)
 	p.ClearStickyForAccount(id)
 	p.Reload()
+}
+
+// Cooldown soft-bans an account in-memory for duration (default 10m). Does NOT set Enabled=false.
+func (p *GrokPool) Cooldown(id, reason string, d time.Duration) {
+	if id == "" {
+		return
+	}
+	if d <= 0 {
+		d = 10 * time.Minute
+	}
+	until := time.Now().Add(d).Unix()
+	p.mu.Lock()
+	if p.cooldownUntil == nil {
+		p.cooldownUntil = make(map[string]int64)
+	}
+	p.cooldownUntil[id] = until
+	p.mu.Unlock()
+	p.ClearStickyForAccount(id)
+	// log via reason only if non-empty - config package not used
+	_ = reason
+}
+
+func (p *GrokPool) isCoolingDownLocked(id string) bool {
+	if p.cooldownUntil == nil {
+		return false
+	}
+	until, ok := p.cooldownUntil[id]
+	if !ok {
+		return false
+	}
+	if time.Now().Unix() >= until {
+		delete(p.cooldownUntil, id)
+		return false
+	}
+	return true
 }
 
 // RecordSuccess increments success stats in memory.
