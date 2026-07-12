@@ -52,7 +52,7 @@ var grokHTTPClient = &http.Client{
 	Timeout: 20 * time.Minute,
 	Transport: &http.Transport{
 		ResponseHeaderTimeout: 5 * time.Minute,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       10 * time.Minute,
 	},
 }
 
@@ -1320,41 +1320,47 @@ func (h *Handler) writeClaudeStreamComplete(w http.ResponseWriter, model, text s
 }
 
 func (h *Handler) startGrokKeepalive(w http.ResponseWriter, format string) (stop func()) {
+	return h.startGrokKeepaliveLocked(w, format, nil)
+}
+
+// startGrokKeepaliveLocked pings the client while waiting on slow upstream (Grok reasoning).
+// Claude CLI / reverse proxies often idle-timeout around 60-120s without bytes on the wire.
+func (h *Handler) startGrokKeepaliveLocked(w http.ResponseWriter, format string, writeMu *sync.Mutex) (stop func()) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return func() {}
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	if format == "claude" {
-		h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
-	} else {
-		fmt.Fprintf(w, ": keepalive\n\n")
-		flusher.Flush()
+	ping := func() {
+		if writeMu != nil {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+		}
+		fmt.Fprintf(w, ": keepalive %d\n\n", time.Now().Unix())
+		if format == "claude" {
+			h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
+		} else {
+			flusher.Flush()
+		}
 	}
+	ping()
 	done := make(chan struct{})
 	var once sync.Once
 	stop = func() { once.Do(func() { close(done) }) }
 	go func() {
-		t := time.NewTicker(6 * time.Second)
+		t := time.NewTicker(12 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				if format == "claude" {
-					h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
-				} else {
-					fmt.Fprintf(w, ": keepalive\n\n")
-					flusher.Flush()
-				}
+				ping()
 			}
 		}
 	}()
 	return stop
 }
+
 
 func claudeRequestToOpenAI(req *ClaudeRequest) *OpenAIRequest {
 	out := &OpenAIRequest{Model: req.Model, Stream: req.Stream, ToolChoice: req.ToolChoice}
@@ -1548,15 +1554,20 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 	if !ok {
 		return res, fmt.Errorf("streaming unsupported")
 	}
+	var writeMu sync.Mutex
 	setAgentSSEHeaders(w)
 	rid := "req_" + randomHex(24)
 	w.Header().Set("x-request-id", rid)
 	w.Header().Set("openai-processing-ms", "1")
 	w.WriteHeader(200)
+	stopKA := h.startGrokKeepaliveLocked(w, "openai", &writeMu)
+	defer stopKA()
 
 	id := openaiChatID()
 	created := time.Now().Unix()
 	writeChunk := func(delta map[string]interface{}, finish interface{}) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
 		ch := map[string]interface{}{
 			"index": 0, "delta": delta, "finish_reason": finish,
 		}
@@ -1836,18 +1847,27 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	if !ok {
 		return res, fmt.Errorf("streaming unsupported")
 	}
+	var writeMu sync.Mutex
 	setAgentSSEHeaders(w)
 	setAnthropicResponseHeaders(w, "")
 	w.WriteHeader(200)
+	stopKA := h.startGrokKeepaliveLocked(w, "claude", &writeMu)
+	defer stopKA()
+
+	lockedSend := func(event string, data interface{}) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		h.sendSSE(w, flusher, event, data)
+	}
 
 	msgID := anthropicMsgID()
 	// Non-zero-looking usage keeps some Claude clients happier while streaming.
-	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+	lockedSend( "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
 			"id": msgID, "type": "message", "role": "assistant", "model": model,
 			"content": []interface{}{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]int{"input_tokens": 1, "output_tokens": 0},
+			"usage": map[string]int{"input_tokens": 1, "output_tokens": 1},
 		},
 	})
 
@@ -1876,7 +1896,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		}
 		thinkingIndex = nextIndex
 		nextIndex++
-		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+		lockedSend( "content_block_start", map[string]interface{}{
 			"type": "content_block_start", "index": thinkingIndex,
 			"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
 		})
@@ -1886,7 +1906,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		if !thinkingOpen {
 			return
 		}
-		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": thinkingIndex})
+		lockedSend( "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": thinkingIndex})
 		thinkingOpen = false
 	}
 	emitThinking := func(d string) {
@@ -1895,7 +1915,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		}
 		openThinking()
 		thinkingAssembled.WriteString(d)
-		h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+		lockedSend( "content_block_delta", map[string]interface{}{
 			"type": "content_block_delta", "index": thinkingIndex,
 			"delta": map[string]string{"type": "thinking_delta", "thinking": d},
 		})
@@ -1907,7 +1927,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		closeThinking()
 		textIndex = nextIndex
 		nextIndex++
-		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+		lockedSend( "content_block_start", map[string]interface{}{
 			"type": "content_block_start", "index": textIndex,
 			"content_block": map[string]interface{}{"type": "text", "text": ""},
 		})
@@ -1917,7 +1937,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		if !textBlockOpen {
 			return
 		}
-		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": textIndex})
+		lockedSend( "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": textIndex})
 		textBlockOpen = false
 	}
 	emitText := func(d string) {
@@ -1926,7 +1946,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		}
 		openText()
 		assembled.WriteString(d)
-		h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+		lockedSend( "content_block_delta", map[string]interface{}{
 			"type": "content_block_delta", "index": textIndex,
 			"delta": map[string]string{"type": "text_delta", "text": d},
 		})
@@ -1935,7 +1955,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		if cur == nil {
 			return
 		}
-		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": cur.index})
+		lockedSend( "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": cur.index})
 		toolCalls = append(toolCalls, grokToolCall{ID: cur.id, Name: cur.name, Arguments: cur.args.String()})
 		cur = nil
 	}
@@ -1947,7 +1967,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if time.Since(lastPing) > 8*time.Second {
-			h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
+			lockedSend( "ping", map[string]interface{}{"type": "ping"})
 			lastPing = time.Now()
 		}
 		if !strings.HasPrefix(line, "data:") {
@@ -2003,14 +2023,14 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 					if args, ok := item["arguments"].(string); ok && args != "" {
 						cur.args.WriteString(args)
 					}
-					h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					lockedSend( "content_block_start", map[string]interface{}{
 						"type": "content_block_start", "index": idx,
 						"content_block": map[string]interface{}{
 							"type": "tool_use", "id": callID, "name": name, "input": map[string]interface{}{},
 						},
 					})
 					if cur.args.Len() > 0 {
-						h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+						lockedSend( "content_block_delta", map[string]interface{}{
 							"type": "content_block_delta", "index": idx,
 							"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": cur.args.String()},
 						})
@@ -2026,7 +2046,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 				d, _ := ev["delta"].(string)
 				if d != "" {
 					cur.args.WriteString(d)
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					lockedSend( "content_block_delta", map[string]interface{}{
 						"type": "content_block_delta", "index": cur.index,
 						"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": d},
 					})
@@ -2043,7 +2063,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 					if cur != nil {
 						if args, ok := item["arguments"].(string); ok && args != "" && cur.args.Len() == 0 {
 							cur.args.WriteString(args)
-							h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+							lockedSend( "content_block_delta", map[string]interface{}{
 								"type": "content_block_delta", "index": cur.index,
 								"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": args},
 							})
@@ -2116,12 +2136,12 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	} else if res.Incomplete {
 		stop = "max_tokens"
 	}
-	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+	lockedSend( "message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": nil},
-		"usage": map[string]int{"output_tokens": res.OutTok},
+		"usage": map[string]int{"input_tokens": maxInt(1, res.InTok), "output_tokens": maxInt(1, res.OutTok)},
 	})
-	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{"type": "message_stop"})
+	lockedSend( "message_stop", map[string]interface{}{"type": "message_stop"})
 	if len(toolCalls) > 0 {
 		logger.Infof("[Grok] claude tool_use count=%d stop=%s", len(toolCalls), stop)
 	}
