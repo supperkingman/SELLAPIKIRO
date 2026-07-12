@@ -2273,12 +2273,12 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 
 	excluded := map[string]bool{}
 	var lastErr error
-	// Try every enabled account (not capped at 8). Sticky is dropped when excluded.
+	// Try every enabled account (not capped at 8). Least-in-flight pick each attempt.
 	maxTry := gp.Count()
 	if maxTry < 1 {
 		maxTry = 1
 	}
-	// Extra attempts beyond Count to allow refresh-retry of sticky after token refresh.
+	// Extra attempts beyond Count to allow refresh-retry after token refresh.
 	if maxTry < gp.Count()+2 {
 		maxTry = gp.Count() + 2
 	}
@@ -2289,7 +2289,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	for attempt := 0; attempt < maxTry; attempt++ {
 		acc := gp.GetNextForCustomer(apiKeyID, excluded)
 		if acc == nil {
-			// Sticky may have pinned a cooling account; clear and try pure RR.
+			// No account from least-in-flight; try pure excluding again after clear (compat).
 			gp.ClearStickyCustomer(apiKeyID)
 			acc = gp.GetNextExcluding(excluded)
 		}

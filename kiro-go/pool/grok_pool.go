@@ -3,7 +3,6 @@ package pool
 import (
 	"kiro-go/config"
 	"sync"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -19,11 +18,6 @@ type GrokPool struct {
 	cooldownUntil map[string]int64
 	// inFlight counts concurrent live requests per account (spread load across pool).
 	inFlight map[string]int
-	// sticky maps customer (API key id) → Grok account id.
-	// Same customer keeps the same upstream account across turns so multi-turn /
-	// tool-loop context stays coherent (less "dumber" mid-session rotation).
-	// New customers are still load-balanced via round-robin assignment.
-	sticky map[string]string // customerKey → accountID
 }
 
 type grokRuntimeStats struct {
@@ -42,7 +36,7 @@ var (
 // GetGrokPool returns the singleton Grok pool.
 func GetGrokPool() *GrokPool {
 	grokPoolOnce.Do(func() {
-		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), sticky: make(map[string]string), cooldownUntil: make(map[string]int64), inFlight: make(map[string]int)}
+		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), cooldownUntil: make(map[string]int64), inFlight: make(map[string]int)}
 		grokPool.Reload()
 	})
 	return grokPool
@@ -89,80 +83,28 @@ func (p *GrokPool) GetNextExcluding(excluded map[string]bool) *config.GrokAccoun
 	return p.pickRoundRobin(excluded)
 }
 
-// GetNextForCustomer returns a sticky Grok account for this customer (API key id).
+// GetNextForCustomer selects the next Grok account for a request.
 //
-// Policy:
-//  1. If customer already pinned to an enabled account not in excluded → reuse it
-//     (no mid-session rotation → better multi-turn / tool quality).
-//  2. Otherwise round-robin pick a free account and pin the customer to it.
-//  3. Empty customerKey → pure round-robin (no pin).
-//
-// Failover: caller excludes the failed id and calls again; sticky is cleared for
-// that customer when the pinned account is excluded/disabled.
+// Policy (no sticky): every request picks the enabled account with the least
+// in-flight load (scan starts at a rotating index for fairness). customerKey is
+// accepted for API compatibility but is not used for pinning.
+// Failover: caller excludes failed ids and calls again.
 func (p *GrokPool) GetNextForCustomer(customerKey string, excluded map[string]bool) *config.GrokAccount {
-	customerKey = strings.TrimSpace(customerKey)
-	if customerKey == "" {
-		return p.pickRoundRobin(excluded)
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.sticky == nil {
-		p.sticky = make(map[string]string)
-	}
-
-	// 1) Prefer sticky pin when that account is free or lightly loaded.
-	// If sticky account already has concurrent in-flight work, fan out to a freer
-	// account so Claude CLI multi-request / multi-customer does not queue on one nick.
-	if accID, ok := p.sticky[customerKey]; ok && accID != "" {
-		if excluded == nil || !excluded[accID] {
-			if acc := p.findEnabledLocked(accID); acc != nil {
-				load := p.inFlightLocked(accID)
-				if load <= 1 {
-					cp := *acc
-					return &cp
-				}
-				// heavily loaded: fall through to least-in-flight pick (keep sticky for later)
-			}
-		} else {
-			delete(p.sticky, customerKey)
-		}
-	}
-
-	// 2) Assign new via RR (must hold lock carefully: pick needs atomic index)
-	// Release pattern: do RR under same lock using local index advance
-	acc := p.pickRoundRobinLocked(excluded)
-	if acc == nil {
-		return nil
-	}
-	p.sticky[customerKey] = acc.ID
-	return acc
+	_ = customerKey
+	return p.pickRoundRobin(excluded)
 }
 
-// ClearStickyForAccount removes pins pointing at a disabled/dead account.
+
+// ClearStickyForAccount is a no-op (sticky pinning removed; least-in-flight only).
 func (p *GrokPool) ClearStickyForAccount(accountID string) {
-	if accountID == "" {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for k, v := range p.sticky {
-		if v == accountID {
-			delete(p.sticky, k)
-		}
-	}
+	_ = accountID
 }
 
-// ClearStickyCustomer drops pin for one customer (e.g. after hard fail).
+// ClearStickyCustomer is a no-op (sticky pinning removed; least-in-flight only).
 func (p *GrokPool) ClearStickyCustomer(customerKey string) {
-	customerKey = strings.TrimSpace(customerKey)
-	if customerKey == "" {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.sticky, customerKey)
+	_ = customerKey
 }
+
 
 func (p *GrokPool) pickRoundRobin(excluded map[string]bool) *config.GrokAccount {
 	p.mu.RLock()
@@ -172,7 +114,7 @@ func (p *GrokPool) pickRoundRobin(excluded map[string]bool) *config.GrokAccount 
 
 // pickRoundRobinLocked requires p.mu held (R or W).
 // Prefers accounts with fewer in-flight requests so concurrent customers
-// fan out across the pool instead of serializing on one sticky/hot account.
+// fan out across the pool (no per-customer sticky pin).
 func (p *GrokPool) pickRoundRobinLocked(excluded map[string]bool) *config.GrokAccount {
 	n := len(p.accounts)
 	if n == 0 {
