@@ -256,6 +256,38 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 	}
 }
 
+// isNotAuthorizedError reports whether an upstream error is AWS's identity-level
+// "not authorized" rejection. This is what a stale/wrong cached profileArn (belonging
+// to a different AWS account or region) triggers — distinct from an expired token.
+func isNotAuthorizedError(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "not authorized to make this call") ||
+		strings.Contains(m, "not authorized to perform")
+}
+
+// reresolveAccountProfileArn clears an account's cached profileArn and re-probes it
+// across candidate regions (us-east-1 + eu-central-1 for external_idp), persisting the
+// corrected ARN. It fixes accounts imported with a wrong/placeholder ARN whose real
+// Kiro profile lives in another region (e.g. an Azure account whose profile is in
+// eu-central-1 but was stored with a us-east-1 ARN). Returns the new ARN or "".
+func reresolveAccountProfileArn(account *config.Account) string {
+	if account == nil {
+		return ""
+	}
+	// Clear so resolveProfileArnAcrossRegions probes fresh rather than trusting the stale value.
+	account.ProfileArn = ""
+	arn, err := resolveProfileArnAcrossRegions(account)
+	if err != nil || strings.TrimSpace(arn) == "" {
+		logger.Warnf("[ProfileArn] re-resolve failed for %s: %v", accountEmailForLog(account), err)
+		return ""
+	}
+	account.ProfileArn = arn
+	if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
+		logger.Warnf("[ProfileArn] failed to persist re-resolved ARN for %s: %v", accountEmailForLog(account), updateErr)
+	}
+	return arn
+}
+
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
@@ -336,6 +368,8 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
+	reresolvedProfile := false
+retryEndpoints:
 	for _, ep := range endpoints {
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
@@ -385,6 +419,18 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			// A cached/pasted profileArn can belong to the wrong AWS account or region
+			// (e.g. an external_idp/Azure account whose real profile lives in eu-central-1
+			// but was stored with a us-east-1 ARN). AWS then answers 403 "not authorized".
+			// Clear the bad ARN, re-resolve across regions, and retry the endpoints once.
+			if resp.StatusCode == 403 && !reresolvedProfile && isNotAuthorizedError(lastErr.Error()) {
+				reresolvedProfile = true
+				if newArn := reresolveAccountProfileArn(account); newArn != "" && newArn != payload.ProfileArn {
+					logger.Warnf("[KiroAPI] 403 not-authorized for %s; re-resolved profileArn -> %s, retrying", accountEmailForLog(account), newArn)
+					payload.ProfileArn = newArn
+					goto retryEndpoints
+				}
+			}
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
