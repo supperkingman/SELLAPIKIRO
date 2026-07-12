@@ -36,13 +36,17 @@
     var rem = a && a.quotaRemaining;
     var color = 'var(--muted-foreground,#525252)';
     var label = 'quota: —';
-    if (st === 'ok') {
+    if (st === 'ok' || st === 'active') {
       color = 'var(--success,#0f766e)';
       if (rem != null && rem >= 0) label = 'còn ~' + rem + (a.quotaLimit ? ('/' + a.quotaLimit) : '');
-      else label = 'quota OK';
+      else label = st === 'active' ? 'sẵn sàng' : 'quota OK';
     } else if (st === 'exhausted') {
       color = 'var(--destructive,#e54b4f)';
       label = 'HẾT quota';
+    } else if (st === 'no_access') {
+      // Transient chat-access denial (xAI). Health-checker auto-retries.
+      color = 'var(--warning,#d97706)';
+      label = 'tạm khoá · tự thử lại';
     } else if (st === 'error') {
       color = 'var(--destructive,#e54b4f)';
       label = 'quota lỗi';
@@ -343,6 +347,7 @@
         '</div></div></div>' +
         '<div class="grok-actions" style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button type="button" class="btn btn-outline btn-xs" data-grok-act="detail" data-id="' + esc(a.id) + '">Chi tiết</button>' +
+        '<button type="button" class="btn btn-outline btn-xs" data-grok-act="test" data-id="' + esc(a.id) + '">Test</button>' +
         '<button type="button" class="btn btn-outline btn-xs" data-grok-act="quota" data-id="' + esc(a.id) + '">Check quota</button>' +
         '<button type="button" class="btn btn-secondary btn-xs" data-grok-act="toggle" data-id="' + esc(a.id) + '" data-enabled="' + (a.enabled ? '1' : '0') + '">' +
         (a.enabled ? 'Disable' : 'Enable') + '</button>' +
@@ -351,6 +356,28 @@
       );
     }).join('');
     el.innerHTML = html;
+  }
+
+  async function testOneGrok(id) {
+    var pw = getPassword();
+    if (!pw || !id) return;
+    toast('Đang test tài khoản…', true);
+    try {
+      var res = await fetch('/admin/api/grok-accounts/' + encodeURIComponent(id) + '/test', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': pw }
+      });
+      var d = {};
+      try { d = await res.json(); } catch (e) {}
+      var ok = d && d.ok === true;
+      var msg = ok
+        ? ('OK · ' + (d.reply || 'hello') + (d.ms ? (' · ' + d.ms + 'ms') : ''))
+        : (d.error || d.status || ('HTTP ' + res.status));
+      toast(msg, ok);
+      loadGrokAccounts();
+    } catch (e) {
+      toast('Test lỗi: ' + (e && e.message || e), false);
+    }
   }
 
   async function checkOneQuota(id) {
@@ -499,6 +526,7 @@
         return;
       }
       if (act === 'detail') { openDetail(id); return; }
+      if (act === 'test') { testOneGrok(id); return; }
       if (act === 'quota') { checkOneQuota(id); return; }
       return;
     }
