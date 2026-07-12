@@ -109,9 +109,12 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		// Sized to match the Grok client: under multi-customer concurrency a low
+		// per-host cap forces new TLS handshakes (adds latency to first byte).
+		// A larger idle pool lets warm keep-alive connections be reused instead.
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     10 * time.Minute,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 	}
