@@ -1357,7 +1357,9 @@ func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 		}
 		text = bestFull
 	}
-	res.Text = text
+	// Non-stream path: strip stray think tags before they reach the client
+	// (the streaming path filters per-delta; this covers the collected result).
+	res.Text = stripThinkTags(text)
 	thinking := thinkDelta.String()
 	if bestThink != "" && len([]rune(bestThink)) >= len([]rune(thinking)) {
 		thinking = bestThink
