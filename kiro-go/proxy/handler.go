@@ -512,9 +512,10 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4o", "kiro-proxy", true),
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
-	// Grok CLI models (static; shown when any grokAccounts may be configured)
-	models = append(models, GrokModelsForList()...)
-
+	// Grok CLI models are intentionally NOT listed here: they must stay hidden so
+	// the public /v1/models never exposes Grok/xAI identity. Explicit Grok routing
+	// still works because it keys off IsGrokModel(req.Model) at request time, not
+	// off this discovery list.
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
