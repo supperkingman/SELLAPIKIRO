@@ -606,12 +606,21 @@ func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interfac
 }
 
 func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[string]interface{} {
+	maxOut := grokMaxOutputTokens
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		maxOut = 8192
+	case "medium", "":
+		maxOut = 16384
+	case "high":
+		maxOut = 32768
+	}
 	body := map[string]interface{}{
 		"model":             upstreamModel,
 		"input":             openaiMessagesToGrokInput(req.Messages),
 		"stream":            true,
 		"store":             false,
-		"max_output_tokens": grokMaxOutputTokens,
+		"max_output_tokens": maxOut,
 				"reasoning": map[string]interface{}{
 			"effort":  effort,
 			// concise for low/medium = much faster TTFB; detailed only for high/xhigh thinking.
