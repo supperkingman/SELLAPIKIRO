@@ -2455,6 +2455,18 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			acc = gp.GetNextExcluding(excluded)
 		}
 		if acc == nil {
+			// Last resort: every account is cooling down (soft-banned by an earlier
+			// request after transient proxy/auth errors) but none was tried in THIS
+			// request. Ignore cooldown so we don't 503 the whole window. Only when
+			// nothing has been excluded yet this request.
+			if len(excluded) == 0 {
+				acc = gp.PickIgnoringCooldown(excluded)
+				if acc != nil {
+					logger.Warnf("[Grok] all accounts cooling down; retrying account=%s ignoring cooldown", acc.Email)
+				}
+			}
+		}
+		if acc == nil {
 			logger.Warnf("[Grok] no account left attempt=%d excluded=%d count=%d available=%d last=%v",
 				attempt, len(excluded), gp.Count(), gp.AvailableCount(), lastErr)
 			break

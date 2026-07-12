@@ -83,6 +83,56 @@ func (p *GrokPool) GetNextExcluding(excluded map[string]bool) *config.GrokAccoun
 	return p.pickRoundRobin(excluded)
 }
 
+// PickIgnoringCooldown is a LAST-RESORT pick that ignores temporary cooldowns.
+// Used when a fresh request finds every account cooling down (e.g. a previous
+// request soft-banned the whole pool after transient proxy/auth errors). Without
+// this, the proxy returns 503 for the entire cooldown window even though the
+// accounts may work again. Still honors Enabled and the caller's excluded set.
+func (p *GrokPool) PickIgnoringCooldown(excluded map[string]bool) *config.GrokAccount {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := len(p.accounts)
+	if n == 0 {
+		return nil
+	}
+	var best *config.GrokAccount
+	bestLoad := int(^uint(0) >> 1)
+	start := int(atomic.AddUint64(&p.index, 1)-1) % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		acc := p.accounts[idx]
+		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		if !acc.Enabled {
+			continue
+		}
+		load := p.inFlightLocked(acc.ID)
+		if load < bestLoad {
+			bestLoad = load
+			cp := acc
+			best = &cp
+			if load == 0 {
+				break
+			}
+		}
+	}
+	return best
+}
+
+// ClearCooldown removes a temporary cooldown (used when an account succeeds again
+// or when we want to force a retry after the cooldown window looks stale).
+func (p *GrokPool) ClearCooldown(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.cooldownUntil != nil {
+		delete(p.cooldownUntil, id)
+	}
+	p.mu.Unlock()
+}
+
 // GetNextForCustomer selects the next Grok account for a request.
 //
 // Policy (no sticky): every request picks the enabled account with the least
