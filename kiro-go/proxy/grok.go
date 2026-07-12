@@ -54,6 +54,15 @@ const (
 	grokMaxSingleMsgTokens  = 120000
 )
 
+// Grok cooldown durations. Kept short so a transiently-denied account returns to
+// rotation quickly; the background health-checker re-tests and clears cooldown as
+// soon as the account works again (xAI permission-denied is usually transient).
+const (
+	grokPermissionDeniedCooldown = 90 * time.Second
+	grokAuthForbiddenCooldown    = 90 * time.Second
+	grokHealthCheckInterval      = 60 * time.Second
+)
+
 var grokHTTPClient = &http.Client{
 	Timeout: 20 * time.Minute,
 	// Explicit pool: default transport caps concurrent dials/idle poorly under multi-customer load.
@@ -2554,15 +2563,18 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 					logger.Warnf("[Grok] cooldown 5m after auth fail account=%s", acc.Email)
 				}
 			} else if isGrokPermissionDeniedBody(string(b)) {
-				// xAI revoked chat-endpoint access for this token (console.x.ai
-				// permissions). This is NOT transient — retrying every 5m just spams
-				// the provider. Apply a long cooldown and a distinct status so the
-				// admin UI shows it needs manual re-authorization at console.x.ai.
-				gp.Cooldown(acc.ID, "chat access revoked (console.x.ai)", 6*time.Hour)
-				_ = config.SetGrokAccountQuota(acc.ID, "no_access", "chat endpoint access denied — re-grant at console.x.ai (cooldown 6h)", -1, 0)
-				logger.Warnf("[Grok] NO_ACCESS (permission-denied) account=%s — cooldown 6h, needs re-grant at console.x.ai", acc.Email)
+				// xAI intermittently revokes chat-endpoint access for a token
+				// (console.x.ai). This is usually TRANSIENT — access returns within
+				// ~30m-1h (often sooner). So instead of a long ban, refresh the token
+				// (mimics "clear cache / re-auth") and apply only a SHORT cooldown; the
+				// background health-checker re-tests and clears it as soon as access
+				// returns, keeping the account in rotation.
+				_ = h.refreshGrokToken(acc)
+				gp.Cooldown(acc.ID, "chat access temporarily denied (console.x.ai)", grokPermissionDeniedCooldown)
+				_ = config.SetGrokAccountQuota(acc.ID, "no_access", "chat endpoint temporarily denied — auto-retrying", -1, 0)
+				logger.Warnf("[Grok] permission-denied account=%s — refreshed token, short cooldown %s, health-checker will re-test", acc.Email, grokPermissionDeniedCooldown)
 			} else {
-				gp.Cooldown(acc.ID, "auth forbidden", 5*time.Minute)
+				gp.Cooldown(acc.ID, "auth forbidden", grokAuthForbiddenCooldown)
 			}
 			gp.Release(acc.ID)
 			continue
@@ -3268,6 +3280,40 @@ func (h *Handler) testGrokAccountHello(acc *config.GrokAccount) map[string]inter
 	logger.Infof("[GrokTest] hello done email=%s ok=%v status=%v http=%d proxy=%q ms=%d",
 		acc.Email, out["ok"], out["status"], resp.StatusCode, proxyURL, elapsed)
 	return out
+}
+
+// StartGrokHealthChecker launches a background goroutine that periodically re-tests
+// Grok accounts currently in cooldown and clears the cooldown as soon as they work
+// again. xAI's permission-denied is usually transient (access returns within
+// ~30m-1h, often sooner), so this keeps recovered accounts in rotation without
+// waiting out the full cooldown or requiring manual intervention. Safe to call once
+// at startup; it runs for the process lifetime.
+func (h *Handler) StartGrokHealthChecker() {
+	go func() {
+		ticker := time.NewTicker(grokHealthCheckInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			gp := pool.GetGrokPool()
+			cooling := gp.CoolingDownAccounts()
+			if len(cooling) == 0 {
+				continue
+			}
+			for i := range cooling {
+				acc := cooling[i]
+				// Refresh token first (mimics "clear cache / re-auth") then probe.
+				_ = h.refreshGrokToken(&acc)
+				res := h.testGrokAccountHello(&acc)
+				if ok, _ := res["ok"].(bool); ok {
+					gp.ClearCooldown(acc.ID)
+					_ = config.SetGrokAccountQuota(acc.ID, "active", "", -1, 0)
+					logger.Infof("[GrokHealth] account=%s recovered — cooldown cleared, back in rotation", acc.Email)
+				} else {
+					logger.Debugf("[GrokHealth] account=%s still unavailable status=%v", acc.Email, res["status"])
+				}
+			}
+		}
+	}()
+	logger.Infof("[GrokHealth] background health-checker started (interval=%s)", grokHealthCheckInterval)
 }
 
 func (h *Handler) apiTestGrokAccount(w http.ResponseWriter, r *http.Request, id string) {

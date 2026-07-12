@@ -57,6 +57,10 @@ func main() {
 	// 创建 HTTP 处理器（包含后台刷新任务）
 	handler := proxy.NewHandler()
 
+	// Background health-checker: re-tests Grok accounts in cooldown and returns
+	// recovered ones to rotation (xAI permission-denied is transient).
+	handler.StartGrokHealthChecker()
+
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
 	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))

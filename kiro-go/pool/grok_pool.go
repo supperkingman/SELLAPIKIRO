@@ -319,6 +319,24 @@ func (p *GrokPool) isCoolingDownLocked(id string) bool {
 	return true
 }
 
+// CoolingDownAccounts returns copies of enabled accounts currently in cooldown.
+// Used by the background health-checker to re-test them and clear the cooldown
+// early once the account works again (xAI permission-denied is transient).
+func (p *GrokPool) CoolingDownAccounts() []config.GrokAccount {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var out []config.GrokAccount
+	for i := range p.accounts {
+		if !p.accounts[i].Enabled {
+			continue
+		}
+		if p.isCoolingDownLocked(p.accounts[i].ID) {
+			out = append(out, p.accounts[i])
+		}
+	}
+	return out
+}
+
 // RecordSuccess increments success stats in memory and persists counters.
 func (p *GrokPool) RecordSuccess(id string) {
 	if id == "" {
