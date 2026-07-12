@@ -2527,6 +2527,15 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
 	}
+	// profileArn / region are required for external_idp (Azure/Entra) accounts, whose
+	// profile cannot be auto-discovered (ListAvailableProfiles rejects the IdP token).
+	// Allow setting them manually with the IDE-cached ARN.
+	if v, ok := updates["profileArn"].(string); ok {
+		existing.ProfileArn = strings.TrimSpace(v)
+	}
+	if v, ok := updates["region"].(string); ok {
+		existing.Region = strings.TrimSpace(v)
+	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
 		w.WriteHeader(500)

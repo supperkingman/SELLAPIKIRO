@@ -313,7 +313,13 @@ func reresolveAccountProfileArn(account *config.Account) string {
 		}
 		logger.Warnf("[ProfileArn] probe %s region=%s failed: %v", accountEmailForLog(account), region, probeErr)
 	}
-	logger.Warnf("[ProfileArn] re-resolve failed for %s across regions %v", accountEmailForLog(account), regions)
+	// Every region rejected the probe. For external_idp (Azure/Entra) accounts this
+	// is expected: the chat token only carries codewhisperer:conversations/completions
+	// scopes, NOT the management scope ListAvailableProfiles requires, so discovery is
+	// impossible. Restore the original ARN instead of leaving the account with none —
+	// a manually-supplied (IDE-cached) ARN is the only workable source for these accounts.
+	account.ProfileArn = staleArn
+	logger.Warnf("[ProfileArn] re-resolve failed for %s across regions %v; kept existing ARN=%q", accountEmailForLog(account), regions, staleArn)
 	return ""
 }
 

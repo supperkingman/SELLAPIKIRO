@@ -63,7 +63,45 @@ func regionalizeURL(rawURL string, account *config.Account) string {
 // cached ARN, then account.Region). account.Region is the auth/OIDC region and can
 // differ from the profile's region, so the profile ARN is preferred.
 func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn string) string {
-	return regionalizeURLForRegion(rawURL, kiroRegionForProfile(account, profileArn))
+	return regionalizeEndpointForAccount(rawURL, account, kiroRegionForProfile(account, profileArn))
+}
+
+// regionalizeEndpointForAccount points a hardcoded us-east-1 Kiro endpoint at the
+// correct host for the account. Standard (idc/social/Builder ID) accounts hold AWS
+// credentials and talk to the AWS data plane (*.amazonaws.com) directly. external_idp
+// (enterprise SSO / Azure AD / Entra) accounts carry a raw IdP token that AWS rejects
+// with 403 "not authorized" — they MUST go through the Kiro gateway (kiro.dev), which
+// performs the IdP->AWS federation. This mirrors what the Kiro IDE / 9Router do.
+func regionalizeEndpointForAccount(rawURL string, account *config.Account, region string) string {
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		return gatewayizeURLForExternalIdp(rawURL, region)
+	}
+	return regionalizeURLForRegion(rawURL, region)
+}
+
+// gatewayizeURLForExternalIdp rewrites a Kiro endpoint URL to target the Kiro gateway
+// for external-IdP accounts. generateAssistantResponse (the streaming data-plane call)
+// goes to runtime.{region}.kiro.dev; every other (management / REST) call goes to
+// management.{region}.kiro.dev. The path and query string are preserved. An empty
+// region defaults to us-east-1.
+func gatewayizeURLForExternalIdp(rawURL, region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	host := "management." + region + ".kiro.dev"
+	if strings.Contains(strings.ToLower(rawURL), "generateassistantresponse") {
+		host = "runtime." + region + ".kiro.dev"
+	}
+	idx := strings.Index(rawURL, "://")
+	if idx == -1 {
+		return rawURL
+	}
+	rest := rawURL[idx+3:]
+	if slash := strings.Index(rest, "/"); slash != -1 {
+		return "https://" + host + rest[slash:]
+	}
+	return "https://" + host
 }
 
 // regionalizeURLForRegion rewrites a hardcoded us-east-1 Kiro endpoint to target
@@ -462,7 +500,7 @@ func isTransientProfileFetchError(err error) bool {
 // stored one — is what makes cross-region detection possible: the same credential is
 // probed against each candidate region until one returns a profile.
 func listAvailableProfilesInRegion(account *config.Account, region string) (string, error) {
-	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
+	endpoint := regionalizeEndpointForAccount(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), account, region)
 	req, err := http.NewRequest("POST", endpoint, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
@@ -472,13 +510,17 @@ func listAvailableProfilesInRegion(account *config.Account, region string) (stri
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
+		logger.Debugf("[ListProfiles] %s region=%s transport error: %v", accountEmailForLog(account), region, err)
 		return "", err
 	}
 	defer resp.Body.Close()
 
+	rawBody, _ := io.ReadAll(resp.Body)
+	logger.Debugf("[ListProfiles] %s region=%s endpoint=%s status=%d body=%s tokenType=%s",
+		accountEmailForLog(account), region, endpoint, resp.StatusCode, string(rawBody), req.Header.Get("TokenType"))
+
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(rawBody))
 	}
 
 	var result struct {
@@ -486,7 +528,7 @@ func listAvailableProfilesInRegion(account *config.Account, region string) (stri
 			Arn string `json:"arn"`
 		} `json:"profiles"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(rawBody, &result); err != nil {
 		return "", err
 	}
 	for _, profile := range result.Profiles {
