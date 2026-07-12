@@ -2207,7 +2207,18 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		responseModel = displayModel
 	}
 
+	logEndpoint := "openai-grok"
+	if format == "claude" {
+		logEndpoint = "claude-grok"
+	}
+	if silent {
+		logEndpoint += "-silent"
+	}
+	lastTriedAccountID := ""
+
 	sendErr := func(status int, errType, msg string) {
+		// Admin request log table previously only recorded successes for Grok.
+		h.recordFailureWithDetails(logEndpoint, clientModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		// Re-map through Kiro-style classifier (status/type may be overridden).
 		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
@@ -2299,6 +2310,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			break
 		}
 		logger.Infof("[Grok] try account=%s attempt=%d/%d customer=%s", acc.Email, attempt+1, maxTry, apiKeyID)
+		lastTriedAccountID = acc.ID
 		gp.Acquire(acc.ID)
 		if err := h.ensureValidGrokToken(acc); err != nil {
 			lastErr = err
@@ -2414,7 +2426,9 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			resp.Body.Close()
 			if cErr != nil {
 				logger.Warnf("[Grok] live stream error after start: %v", cErr)
-				// headers already sent â€” cannot retry accounts
+				// headers already sent — cannot retry accounts
+				h.recordFailureWithDetails(logEndpoint, clientModel, acc.ID, cErr)
+				gp.RecordError(acc.ID)
 				gp.Release(acc.ID)
 				return
 			}
@@ -2425,6 +2439,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 				lastErr = cErr
 				excluded[acc.ID] = true
 				gp.RecordError(acc.ID)
+				gp.Release(acc.ID)
 				continue
 			}
 		}
@@ -2461,13 +2476,6 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
 		gp.RecordSuccess(acc.ID)
 		gp.UpdateStats(acc.ID, result.InTok+result.OutTok, credits)
-		logEndpoint := "openai-grok"
-		if format == "claude" {
-			logEndpoint = "claude-grok"
-		}
-		if silent {
-			logEndpoint += "-silent"
-		}
 		h.recordSuccessLog(logEndpoint, clientModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
 		logger.Infof("[Grok] done display=%s outTok=%d textLen=%d incomplete=%v stream=%v ms=%d",
 			responseModel, result.OutTok, len([]rune(result.Text)), result.Incomplete, stream, time.Since(reqStart).Milliseconds())
@@ -2578,16 +2586,21 @@ func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
 		QuotaRemaining float64 `json:"quotaRemaining,omitempty"`
 		QuotaLimit     float64 `json:"quotaLimit,omitempty"`
 	}
+	gpStats := pool.GetGrokPool()
 	out := make([]view, 0, len(accs))
 	for _, a := range accs {
+		req, errc, tok, cred, last := a.RequestCount, a.ErrorCount, a.TotalTokens, a.TotalCredits, a.LastUsed
+		if r, e, t, c, l, ok := gpStats.SnapshotStats(a.ID); ok {
+			req, errc, tok, cred, last = r, e, t, c, l
+		}
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, Nickname: a.Nickname, DisplayName: a.DisplayName,
 			Enabled: a.Enabled, ExpiresAt: a.ExpiresAt, AuthMethod: a.AuthMethod,
-			RequestCount: a.RequestCount, ErrorCount: a.ErrorCount,
-			TotalTokens: a.TotalTokens, TotalCredits: a.TotalCredits,
+			RequestCount: req, ErrorCount: errc,
+			TotalTokens: tok, TotalCredits: cred,
 			BanStatus: a.BanStatus, BanReason: a.BanReason,
 			HasRefresh: a.RefreshToken != "",
-			MachineId: a.MachineId, ProxyURL: a.ProxyURL, LastUsed: a.LastUsed, UserID: a.UserID,
+			MachineId: a.MachineId, ProxyURL: a.ProxyURL, LastUsed: last, UserID: a.UserID,
 			QuotaStatus: a.QuotaStatus, QuotaMessage: a.QuotaMessage, QuotaCheckedAt: a.QuotaCheckedAt,
 			QuotaRemaining: a.QuotaRemaining, QuotaLimit: a.QuotaLimit,
 		})
@@ -2681,15 +2694,19 @@ func (h *Handler) apiGetGrokAccount(w http.ResponseWriter, r *http.Request, id s
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 		return
 	}
+	req, errc, tok, cred, last := acc.RequestCount, acc.ErrorCount, acc.TotalTokens, acc.TotalCredits, acc.LastUsed
+	if r, e, t, c, l, ok := pool.GetGrokPool().SnapshotStats(acc.ID); ok {
+		req, errc, tok, cred, last = r, e, t, c, l
+	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"id": acc.ID, "email": acc.Email, "nickname": acc.Nickname, "displayName": acc.DisplayName,
 		"enabled": acc.Enabled, "expiresAt": acc.ExpiresAt, "authMethod": acc.AuthMethod,
-		"requestCount": acc.RequestCount, "errorCount": acc.ErrorCount,
-		"totalTokens": acc.TotalTokens, "totalCredits": acc.TotalCredits,
+		"requestCount": req, "errorCount": errc,
+		"totalTokens": tok, "totalCredits": cred,
 		"banStatus": acc.BanStatus, "banReason": acc.BanReason,
 		"hasRefreshToken": acc.RefreshToken != "",
 		"machineId": acc.MachineId, "proxyURL": acc.ProxyURL,
-		"lastUsed": acc.LastUsed, "userId": acc.UserID, "clientId": acc.ClientID,
+		"lastUsed": last, "userId": acc.UserID, "clientId": acc.ClientID,
 		"quotaStatus": acc.QuotaStatus, "quotaMessage": acc.QuotaMessage,
 		"quotaCheckedAt": acc.QuotaCheckedAt, "quotaRemaining": acc.QuotaRemaining, "quotaLimit": acc.QuotaLimit,
 	})

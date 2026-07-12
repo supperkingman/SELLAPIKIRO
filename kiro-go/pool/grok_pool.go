@@ -269,39 +269,63 @@ func (p *GrokPool) isCoolingDownLocked(id string) bool {
 	return true
 }
 
-// RecordSuccess increments success stats in memory.
+// RecordSuccess increments success stats in memory and persists counters.
 func (p *GrokPool) RecordSuccess(id string) {
+	if id == "" {
+		return
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	s := p.ensureStats(id)
 	s.requestCount++
 	s.lastUsed = time.Now().Unix()
+	req, errc, tok, cred, last := s.requestCount, s.errorCount, s.totalTokens, s.totalCredits, s.lastUsed
+	p.mu.Unlock()
+	_ = config.UpdateGrokAccountStats(id, req, errc, tok, cred, last)
 }
 
-// RecordError increments error stats.
+// RecordError increments error stats in memory and persists counters.
 func (p *GrokPool) RecordError(id string) {
+	if id == "" {
+		return
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	s := p.ensureStats(id)
 	s.errorCount++
 	s.requestCount++
 	s.lastUsed = time.Now().Unix()
+	req, errc, tok, cred, last := s.requestCount, s.errorCount, s.totalTokens, s.totalCredits, s.lastUsed
+	p.mu.Unlock()
+	_ = config.UpdateGrokAccountStats(id, req, errc, tok, cred, last)
+}
+
+// SnapshotStats returns runtime counters for an account if present.
+func (p *GrokPool) SnapshotStats(id string) (requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64, ok bool) {
+	if id == "" {
+		return 0, 0, 0, 0, 0, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.stats == nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	s, exists := p.stats[id]
+	if !exists || s == nil {
+		return 0, 0, 0, 0, 0, false
+	}
+	return s.requestCount, s.errorCount, s.totalTokens, s.totalCredits, s.lastUsed, true
 }
 
 // UpdateStats adds tokens/credits and persists snapshot.
 func (p *GrokPool) UpdateStats(id string, tokens int, credits float64) {
+	if id == "" {
+		return
+	}
 	p.mu.Lock()
 	s := p.ensureStats(id)
 	s.totalTokens += tokens
 	s.totalCredits += credits
 	s.lastUsed = time.Now().Unix()
-	// merge with any config baseline
-	acc := config.GetGrokAccountByID(id)
 	req, errc, tok, cred := s.requestCount, s.errorCount, s.totalTokens, s.totalCredits
-	if acc != nil {
-		// Prefer cumulative: runtime stats already absolute if we seed from config on first use.
-		_ = acc
-	}
 	last := s.lastUsed
 	p.mu.Unlock()
 	_ = config.UpdateGrokAccountStats(id, req, errc, tok, cred, last)
