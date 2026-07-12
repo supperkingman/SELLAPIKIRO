@@ -619,8 +619,14 @@ func (h *Handler) refreshModelsCache() {
 
 		models, err := ListAvailableModels(account)
 		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
+			// ListAvailableModels is a metadata call. Some account types (enterprise
+			// external_idp / AzureAD, restricted Builder ID) return 403 "not authorized"
+			// here yet can still serve chat. Do NOT ban the account on a metadata 403 —
+			// that empties the pool and forces everything onto Grok. Only genuine token
+			// failures (handled above by ensureValidToken) disable an account. The global
+			// fallback model list still covers routing; the chat path does its own
+			// per-request failure handling.
+			logger.Warnf("[ModelsCache] Failed to refresh models for %s (keeping enabled): %v", account.Email, err)
 			continue
 		}
 		// 缓存每账号可用模型，用于路由时过滤
