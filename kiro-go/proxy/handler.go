@@ -855,11 +855,15 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.handleGrokClaudeMessages(w, r, &req)
 		return
 	}
-	// Prefer Grok silent whenever Grok pool has accounts (not only when Kiro empty).
-	// Prevents Kiro from writing SSE headers then failing with no failover path.
+	// Grok is the FALLBACK for when there is no usable Kiro account (empty pool or
+	// all accounts quota-blocked). When a Kiro account is available, serve it first;
+	// the post-failure Grok fallback below still degrades gracefully if Kiro fails
+	// before any client body is written.
 	normalizeClaudeRequestForAgents(&req)
-	if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
-		return
+	if h.kiroPoolEmpty() {
+		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+			return
+		}
 	}
 
 	if msg := validateClaudeRequestShape(&req); msg != "" {
@@ -1655,9 +1659,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.handleGrokOpenAIChat(w, r, &req)
 		return
 	}
-	// Prefer Grok silent when pool has accounts (same as Claude path).
-	if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
-		return
+	// Grok is the FALLBACK for when no usable Kiro account exists (empty pool or
+	// all accounts quota-blocked). Serve Kiro first; the post-failure Grok fallback
+	// below still degrades gracefully if Kiro fails before any client body is written.
+	if h.kiroPoolEmpty() {
+		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+			return
+		}
 	}
 
 	// 解析模型和 thinking 模式
