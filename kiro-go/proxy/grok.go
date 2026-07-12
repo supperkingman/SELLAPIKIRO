@@ -47,6 +47,11 @@ const (
 	grokTokenAuth      = "xai-grok-cli"
 	grokSilentUpstream = "grok-4.5-high" // minimum effort high; thinking -> xhigh
 	grokMaxOutputTokens = 65536
+	// Grok Build rejects prompts over ~500k tokens (HTTP 400 invalid-argument).
+	// Keep a safety margin for tools/instructions and tokenizer variance.
+	grokMaxPromptTokens     = 500000
+	grokPromptSafetyTokens  = 8000
+	grokMaxSingleMsgTokens  = 120000
 )
 
 var grokHTTPClient = &http.Client{
@@ -613,6 +618,146 @@ func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interfac
 		out = append(out, item)
 	}
 	return out
+}
+
+// openAIMessageTokenEstimate approximates tokens for one chat message (content + tools).
+func openAIMessageTokenEstimate(m OpenAIMessage) int {
+	n := estimateOpenAIContentTokens(m.Content)
+	n += estimateApproxTokens(m.ToolCallID)
+	n += estimateApproxTokens(m.Role)
+	for _, tc := range m.ToolCalls {
+		n += estimateApproxTokens(tc.Function.Name)
+		n += estimateApproxTokens(tc.Function.Arguments)
+		n += 8
+	}
+	return n + 4
+}
+
+func truncateOpenAIMessageContent(m *OpenAIMessage, maxTokens int) {
+	if m == nil || maxTokens <= 0 {
+		return
+	}
+	// Prefer string content truncation by runes (~4 chars/token for ASCII-heavy dumps).
+	switch v := m.Content.(type) {
+	case string:
+		maxChars := maxTokens * 4
+		r := []rune(v)
+		if len(r) <= maxChars {
+			return
+		}
+		// Keep head + tail so tool IDs / latest errors remain.
+		keepHead := maxChars * 2 / 3
+		keepTail := maxChars - keepHead
+		if keepTail < 200 {
+			keepTail = 200
+			if keepHead+keepTail > maxChars {
+				keepHead = maxChars - keepTail
+			}
+		}
+		if keepHead < 100 {
+			keepHead = maxChars / 2
+			keepTail = maxChars - keepHead
+		}
+		m.Content = string(r[:keepHead]) + "\n\n...[truncated for Grok context limit]...\n\n" + string(r[len(r)-keepTail:])
+	default:
+		// Flatten oversized structured content to truncated text.
+		text := flattenOpenAIContent(v)
+		if text == "" {
+			text = fmt.Sprintf("%v", v)
+		}
+		tmp := OpenAIMessage{Content: text}
+		truncateOpenAIMessageContent(&tmp, maxTokens)
+		m.Content = tmp.Content
+	}
+	// Cap huge tool call argument dumps as well.
+	for i := range m.ToolCalls {
+		args := m.ToolCalls[i].Function.Arguments
+		if estimateApproxTokens(args) > maxTokens/2 {
+			r := []rune(args)
+			lim := (maxTokens / 2) * 4
+			if lim < 500 {
+				lim = 500
+			}
+			if len(r) > lim {
+				m.ToolCalls[i].Function.Arguments = string(r[:lim]) + "...[truncated]"
+			}
+		}
+	}
+}
+
+// trimOpenAIRequestForGrok shrinks conversation history so prompt stays under Grok's
+// ~500k token limit. Drops oldest non-system messages first; truncates giant tool dumps.
+// Returns estimated input tokens after trim.
+func trimOpenAIRequestForGrok(req *OpenAIRequest) int {
+	if req == nil {
+		return 0
+	}
+	budget := grokMaxPromptTokens - grokPromptSafetyTokens
+	if budget < 50000 {
+		budget = 50000
+	}
+
+	// Cap individual oversized messages (tool_result dumps from Claude Code).
+	for i := range req.Messages {
+		est := openAIMessageTokenEstimate(req.Messages[i])
+		if est > grokMaxSingleMsgTokens {
+			truncateOpenAIMessageContent(&req.Messages[i], grokMaxSingleMsgTokens)
+		}
+	}
+
+	// Drop oldest middle messages while over budget (keep system + most recent turns).
+	for {
+		est := estimateOpenAIRequestInputTokens(req)
+		if est <= budget {
+			return est
+		}
+		// Find oldest droppable message: not the last user/assistant turn, prefer early history.
+		dropIdx := -1
+		n := len(req.Messages)
+		// Keep last 4 messages (active tool loop) and all system messages.
+		for i := 0; i < n-4; i++ {
+			role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+			if role == "system" {
+				continue
+			}
+			dropIdx = i
+			break
+		}
+		if dropIdx < 0 {
+			// Still over: aggressively truncate remaining non-system from oldest.
+			for i := 0; i < n; i++ {
+				role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+				if role == "system" {
+					continue
+				}
+				estMsg := openAIMessageTokenEstimate(req.Messages[i])
+				if estMsg > 8000 {
+					truncateOpenAIMessageContent(&req.Messages[i], 8000)
+				}
+			}
+			est = estimateOpenAIRequestInputTokens(req)
+			if est > budget {
+				// Last resort: hard-trim last big messages.
+				for i := 0; i < n && estimateOpenAIRequestInputTokens(req) > budget; i++ {
+					role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+					if role == "system" {
+						continue
+					}
+					truncateOpenAIMessageContent(&req.Messages[i], 2000)
+				}
+			}
+			return estimateOpenAIRequestInputTokens(req)
+		}
+		req.Messages = append(req.Messages[:dropIdx], req.Messages[dropIdx+1:]...)
+	}
+}
+
+// isGrokPromptTooLongError is a non-retryable client context error (same for all accounts).
+func isGrokPromptTooLongError(msg string) bool {
+	low := strings.ToLower(msg)
+	return strings.Contains(low, "maximum prompt length") ||
+		strings.Contains(low, "prompt length") && strings.Contains(low, "tokens") ||
+		(strings.Contains(low, "invalid-argument") && strings.Contains(low, "500000"))
 }
 
 func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[string]interface{} {
@@ -2277,10 +2422,15 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	}
 
 	upstreamModel, effort := ResolveGrokModel(clientModel)
+	beforeTok := estimateOpenAIRequestInputTokens(req)
+	afterTok := trimOpenAIRequestForGrok(req)
+	if afterTok != beforeTok || beforeTok > grokMaxPromptTokens-grokPromptSafetyTokens {
+		logger.Warnf("[Grok] context trim est %d -> %d msgs=%d (limit=%d)", beforeTok, afterTok, len(req.Messages), grokMaxPromptTokens-grokPromptSafetyTokens)
+	}
 	bodyMap := buildGrokRequestBody(req, upstreamModel, effort)
 	rawBody, _ := json.Marshal(bodyMap)
-	logger.Infof("[Grok] start upstream=%s effort=%s max_out=%d silent=%v stream=%v display=%s",
-		upstreamModel, effort, grokMaxOutputTokens, silent, stream, responseModel)
+	logger.Infof("[Grok] start upstream=%s effort=%s max_out=%d silent=%v stream=%v display=%s est_in=%d body_bytes=%d",
+		upstreamModel, effort, grokMaxOutputTokens, silent, stream, responseModel, afterTok, len(rawBody))
 
 	excluded := map[string]bool{}
 	var lastErr error
@@ -2405,10 +2555,17 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		if resp.StatusCode >= 400 {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(string(b), 400))
+			bodyStr := string(b)
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(bodyStr, 400))
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			gp.Release(acc.ID)
+			// Prompt too long is identical for every account — do not burn the pool.
+			if isGrokPromptTooLongError(bodyStr) || isGrokPromptTooLongError(lastErr.Error()) {
+				logger.Warnf("[Grok] prompt too long account=%s — stop failover", acc.Email)
+				sendErr(400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
+				return
+			}
 			continue
 		}
 

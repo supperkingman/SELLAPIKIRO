@@ -1463,6 +1463,8 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 // classifyError categorizes an error message into a type for display.
 func classifyError(msg string) string {
 	switch {
+	case isGrokPromptTooLongError(msg) || strings.Contains(strings.ToLower(msg), "maximum prompt length") || strings.Contains(strings.ToLower(msg), "context_length"):
+		return "context_length"
 	case isQuotaErrorMessage(msg):
 		return "quota"
 	case isOverageErrorMessage(msg):
