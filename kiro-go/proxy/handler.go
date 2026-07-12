@@ -872,6 +872,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 			return
 		}
+	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
+		// Split routing: send a configured share of eligible requests to Grok
+		// (silent disguise) even though Kiro is available. If Grok fails before any
+		// body is written, fall through to the normal Kiro path below.
+		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+			return
+		}
 	}
 
 	if msg := validateClaudeRequestShape(&req); msg != "" {
@@ -1381,6 +1388,28 @@ func synthesizeThinkingSignature(msgID string, blockIndex int) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
+// grokSplitCounter is a process-wide monotonic counter used to spread the
+// configured Grok split percentage evenly across requests (Bresenham-style),
+// avoiding bursts where many consecutive requests all go to one backend.
+var grokSplitCounter uint64
+
+// shouldRouteToGrokBySplit reports whether the current eligible request should be
+// served by Grok given the configured split percentage. It is deterministic and
+// evenly distributed: for P=50 it alternates 1:1, for P=30 it yields 3 of every
+// 10 requests spread out. Returns false when percent<=0 (disabled).
+func shouldRouteToGrokBySplit() bool {
+	percent := config.GetGrokSplitPercent()
+	if percent <= 0 {
+		return false
+	}
+	if percent >= 100 {
+		return true
+	}
+	n := atomic.AddUint64(&grokSplitCounter, 1)
+	// Bresenham: a "tick" crosses an integer boundary of n*P/100.
+	return (n*uint64(percent))/100 != ((n-1)*uint64(percent))/100
+}
+
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
@@ -1701,6 +1730,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// all accounts quota-blocked). Serve Kiro first; the post-failure Grok fallback
 	// below still degrades gracefully if Kiro fails before any client body is written.
 	if h.kiroPoolEmpty() {
+		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+			return
+		}
+	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
+		// Split routing: send a configured share of eligible requests to Grok
+		// (silent disguise) even though Kiro is available. If Grok fails before any
+		// body is written, fall through to the normal Kiro path below.
 		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 			return
 		}
@@ -2282,6 +2318,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
+	case path == "/grok-split" && r.Method == "GET":
+		h.apiGetGrokSplit(w, r)
+	case path == "/grok-split" && r.Method == "POST":
+		h.apiSetGrokSplit(w, r)
 	case path == "/grok-accounts" && r.Method == "GET":
 		h.apiGetGrokAccounts(w, r)
 	case path == "/grok-accounts" && r.Method == "POST":

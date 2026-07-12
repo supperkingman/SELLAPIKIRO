@@ -168,6 +168,10 @@ type Config struct {
 	// Never mixed with Accounts (Kiro). See config/grok.go.
 	GrokAccounts []GrokAccount `json:"grokAccounts,omitempty"`
 
+	// GrokSplitPercent (0-100) routes this share of eligible requests to Grok while
+	// Kiro accounts are still available (0 = disabled, Kiro-first with Grok fallback).
+	GrokSplitPercent int `json:"grokSplitPercent,omitempty"`
+
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
@@ -804,6 +808,36 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	return Save()
+}
+
+// GetGrokSplitPercent returns the percentage (0-100) of eligible requests that
+// should be routed to Grok while Kiro accounts are still available. 0 = disabled
+// (Kiro-first, Grok only as fallback). Value is clamped defensively.
+func GetGrokSplitPercent() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	p := cfg.GrokSplitPercent
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
+// UpdateGrokSplitPercent sets the Grok split percentage (clamped to 0-100).
+func UpdateGrokSplitPercent(p int) error {
+	if p < 0 {
+		p = 0
+	}
+	if p > 100 {
+		p = 100
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.GrokSplitPercent = p
 	return Save()
 }
 

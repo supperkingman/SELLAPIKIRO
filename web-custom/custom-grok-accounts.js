@@ -90,7 +90,15 @@
     card.innerHTML =
       '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">' +
       '<span class="card-title"><i class="fa-solid fa-robot" style="color:var(--brand-purple,#9148ff);margin-right:8px"></i>Grok CLI (Grok Build)</span>' +
-      '<div class="card-actions" style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<div class="card-actions" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+      '<div style="display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--border,#e5e5e5);border-radius:8px" title="% request chuyển sang Grok trong khi Kiro vẫn còn tài khoản (0 = tắt)">' +
+      '<i class="fa-solid fa-code-branch" style="color:var(--brand-purple,#9148ff)"></i>' +
+      '<span style="font-size:12.5px;color:var(--muted-foreground,#525252)">Chia sang Grok</span>' +
+      '<input type="number" id="grokSplitInput" min="0" max="100" step="1" value="0" ' +
+      'style="width:58px;padding:3px 6px;border:1px solid var(--border,#e5e5e5);border-radius:6px;font-size:13px;text-align:right" />' +
+      '<span style="font-size:12.5px;color:var(--muted-foreground,#525252)">%</span>' +
+      '<button type="button" class="btn btn-outline btn-sm" id="grokSplitSaveBtn"><i class="fa-solid fa-check"></i></button>' +
+      '</div>' +
       '<button type="button" class="btn btn-outline btn-sm" id="grokRefreshBtn">' +
       '<i class="fa-solid fa-arrows-rotate"></i> <span class="btn-text">Refresh</span></button>' +
       '<button type="button" class="btn btn-outline btn-sm" id="grokQuotaAllBtn" title="Probe quota for all Grok accounts">' +
@@ -98,7 +106,8 @@
       '</div></div>' +
       '<p style="font-size:12.5px;color:var(--muted-foreground,#525252);margin:0 0 12px;line-height:1.5">' +
       'Pool <code>grokAccounts[]</code> riêng — không hiện trong danh sách Kiro. ' +
-      'Bấm <b>avatar / hàng tài khoản / Chi tiết</b> để mở popup (proxy, machineId…). Import: <b>Add Account → Import Grok CLI</b>.' +
+      'Bấm <b>avatar / hàng tài khoản / Chi tiết</b> để mở popup (proxy, machineId…). Import: <b>Add Account → Import Grok CLI</b>. ' +
+      '<b>Chia sang Grok</b>: ví dụ 50% thì cứ 100 request có ~50 sang Grok, 50 ở Kiro (chỉ áp dụng khi cả hai pool còn tài khoản).' +
       '</p>' +
       '<div id="' + LIST_ID + '"><div style="color:var(--muted-foreground,#525252);font-size:13px">Đang tải…</div></div>';
 
@@ -107,7 +116,47 @@
     if (btn) btn.addEventListener('click', loadGrokAccounts);
     var qb = document.getElementById('grokQuotaAllBtn');
     if (qb) qb.addEventListener('click', checkAllQuota);
+    var ssb = document.getElementById('grokSplitSaveBtn');
+    if (ssb) ssb.addEventListener('click', saveGrokSplit);
+    loadGrokSplit();
     return card;
+  }
+
+  async function loadGrokSplit() {
+    var pw = getPassword();
+    if (!pw) return;
+    try {
+      var res = await fetch('/admin/api/grok-split', { headers: { 'X-Admin-Password': pw } });
+      if (!res.ok) return;
+      var data = await res.json();
+      var inp = document.getElementById('grokSplitInput');
+      if (inp && typeof data.percent === 'number') inp.value = data.percent;
+    } catch (e) { /* non-fatal */ }
+  }
+
+  async function saveGrokSplit() {
+    var pw = getPassword();
+    if (!pw) { toast('Chưa nhập mật khẩu admin', false); return; }
+    var inp = document.getElementById('grokSplitInput');
+    if (!inp) return;
+    var p = parseInt(inp.value, 10);
+    if (isNaN(p) || p < 0 || p > 100) { toast('Giá trị phải từ 0 đến 100', false); return; }
+    try {
+      var res = await fetch('/admin/api/grok-split', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Password': pw },
+        body: JSON.stringify({ percent: p })
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        toast('Đã lưu: ' + data.percent + '% request sẽ chuyển sang Grok', true);
+        inp.value = data.percent;
+      } else {
+        toast(data.error || 'Lưu thất bại', false);
+      }
+    } catch (e) {
+      toast('Lỗi mạng khi lưu', false);
+    }
   }
 
   function ensureModal() {

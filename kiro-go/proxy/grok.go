@@ -2864,6 +2864,51 @@ func (h *Handler) kiroPoolEmpty() bool {
 	return h.pool.AvailableCount() == 0
 }
 
+// grokPoolReady reports whether at least one Grok account is available to serve
+// a request (used by the split-routing feature).
+func (h *Handler) grokPoolReady() bool {
+	gp := pool.GetGrokPool()
+	if gp == nil {
+		return false
+	}
+	if gp.Count() == 0 {
+		gp.Reload()
+	}
+	return gp.AvailableCount() > 0
+}
+
+// --- Admin Grok split-percentage API ---
+
+// apiGetGrokSplit returns the current Grok split percentage.
+func (h *Handler) apiGetGrokSplit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]int{"percent": config.GetGrokSplitPercent()})
+}
+
+// apiSetGrokSplit updates the Grok split percentage (0-100).
+func (h *Handler) apiSetGrokSplit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Percent int `json:"percent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if body.Percent < 0 || body.Percent > 100 {
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "percent must be between 0 and 100"})
+		return
+	}
+	if err := config.UpdateGrokSplitPercent(body.Percent); err != nil {
+		w.WriteHeader(500)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "percent": config.GetGrokSplitPercent()})
+}
+
 // --- Admin Grok accounts API ---
 
 func (h *Handler) apiGetGrokAccounts(w http.ResponseWriter, r *http.Request) {
