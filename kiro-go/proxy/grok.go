@@ -44,7 +44,7 @@ const (
 	grokClientVersion  = "0.2.93"
 	grokClientIDHeader = "grok-pager"
 	grokTokenAuth      = "xai-grok-cli"
-	grokSilentUpstream = "grok-4.5-high"
+	grokSilentUpstream = "grok-4.5-medium" // fast default; thinking models use high
 	grokMaxOutputTokens = 65536
 )
 
@@ -169,6 +169,29 @@ func ResolveGrokModel(clientModel string) (upstreamModel, effort string) {
 		m = "grok-4.5"
 	}
 	return m, effort
+}
+
+
+// grokReasoningSummary picks a cheap summary for fast replies.
+// detailed summaries make short chats (e.g. "hello") take 1-2 minutes on Grok high.
+func grokReasoningSummary(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "high", "xhigh", "max":
+		return "detailed"
+	case "none":
+		return "auto"
+	default:
+		return "concise"
+	}
+}
+
+// silentGrokUpstreamForDisplay picks upstream model/effort for Claude/OpenAI disguise.
+// Non-thinking models use medium (fast). *-thinking / reason models keep high.
+func silentGrokUpstreamForDisplay(displayModel string) string {
+	if modelWantsThinkingUI(displayModel) {
+		return "grok-4.5-high"
+	}
+	return grokSilentUpstream
 }
 
 func GrokModelsForList() []map[string]interface{} {
@@ -589,11 +612,10 @@ func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[
 		"stream":            true,
 		"store":             false,
 		"max_output_tokens": grokMaxOutputTokens,
-		"reasoning": map[string]interface{}{
+				"reasoning": map[string]interface{}{
 			"effort":  effort,
-			// "auto" | "concise" | "detailed" — Grok CLI accepts summary on reasoning object.
-			// Do NOT put "reasoning.summary" in include[] (upstream 400: Argument not supported).
-			"summary": "detailed",
+			// concise for low/medium = much faster TTFB; detailed only for high/xhigh thinking.
+			"summary": grokReasoningSummary(effort),
 		},
 	}
 	if instr := extractOpenAISystem(req.Messages); instr != "" {
@@ -2466,9 +2488,9 @@ func (h *Handler) trySilentGrokClaudeFallback(w http.ResponseWriter, r *http.Req
 		requestedModel = req.Model
 	}
 	oai := claudeRequestToOpenAI(req)
-	oai.Model = grokSilentUpstream
+	oai.Model = silentGrokUpstreamForDisplay(requestedModel)
 	oai.MaxTokens = 0
-	logger.Infof("[GrokSilent] claude %s -> %s", requestedModel, grokSilentUpstream)
+	logger.Infof("[GrokSilent] claude %s -> %s", requestedModel, oai.Model)
 	h.handleGrokWithFormat(w, r, oai, "claude", requestedModel)
 	return true
 }
@@ -2485,9 +2507,9 @@ func (h *Handler) trySilentGrokOpenAIFallback(w http.ResponseWriter, r *http.Req
 		requestedModel = req.Model
 	}
 	proxyReq := *req
-	proxyReq.Model = grokSilentUpstream
+	proxyReq.Model = silentGrokUpstreamForDisplay(requestedModel)
 	proxyReq.MaxTokens = 0
-	logger.Infof("[GrokSilent] openai %s -> %s", requestedModel, grokSilentUpstream)
+	logger.Infof("[GrokSilent] openai %s -> %s", requestedModel, proxyReq.Model)
 	h.handleGrokWithFormat(w, r, &proxyReq, "openai", requestedModel)
 	return true
 }
