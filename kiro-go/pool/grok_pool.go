@@ -17,6 +17,8 @@ type GrokPool struct {
 	stats map[string]*grokRuntimeStats
 	// temporary soft-ban: account id -> unix expiry (not persisted; survives until process restart)
 	cooldownUntil map[string]int64
+	// inFlight counts concurrent live requests per account (spread load across pool).
+	inFlight map[string]int
 	// sticky maps customer (API key id) → Grok account id.
 	// Same customer keeps the same upstream account across turns so multi-turn /
 	// tool-loop context stays coherent (less "dumber" mid-session rotation).
@@ -40,7 +42,7 @@ var (
 // GetGrokPool returns the singleton Grok pool.
 func GetGrokPool() *GrokPool {
 	grokPoolOnce.Do(func() {
-		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), sticky: make(map[string]string), cooldownUntil: make(map[string]int64)}
+		grokPool = &GrokPool{stats: make(map[string]*grokRuntimeStats), sticky: make(map[string]string), cooldownUntil: make(map[string]int64), inFlight: make(map[string]int)}
 		grokPool.Reload()
 	})
 	return grokPool
@@ -109,16 +111,22 @@ func (p *GrokPool) GetNextForCustomer(customerKey string, excluded map[string]bo
 		p.sticky = make(map[string]string)
 	}
 
-	// 1) Prefer sticky pin
+	// 1) Prefer sticky pin when that account is free or lightly loaded.
+	// If sticky account already has concurrent in-flight work, fan out to a freer
+	// account so Claude CLI multi-request / multi-customer does not queue on one nick.
 	if accID, ok := p.sticky[customerKey]; ok && accID != "" {
 		if excluded == nil || !excluded[accID] {
 			if acc := p.findEnabledLocked(accID); acc != nil {
-				cp := *acc
-				return &cp
+				load := p.inFlightLocked(accID)
+				if load <= 1 {
+					cp := *acc
+					return &cp
+				}
+				// heavily loaded: fall through to least-in-flight pick (keep sticky for later)
 			}
+		} else {
+			delete(p.sticky, customerKey)
 		}
-		// pinned account dead / excluded → drop pin
-		delete(p.sticky, customerKey)
 	}
 
 	// 2) Assign new via RR (must hold lock carefully: pick needs atomic index)
@@ -163,13 +171,19 @@ func (p *GrokPool) pickRoundRobin(excluded map[string]bool) *config.GrokAccount 
 }
 
 // pickRoundRobinLocked requires p.mu held (R or W).
+// Prefers accounts with fewer in-flight requests so concurrent customers
+// fan out across the pool instead of serializing on one sticky/hot account.
 func (p *GrokPool) pickRoundRobinLocked(excluded map[string]bool) *config.GrokAccount {
 	n := len(p.accounts)
 	if n == 0 {
 		return nil
 	}
+	var best *config.GrokAccount
+	bestLoad := int(^uint(0) >> 1)
+	// Scan all accounts starting from RR index for fairness.
+	start := int(atomic.AddUint64(&p.index, 1)-1) % n
 	for i := 0; i < n; i++ {
-		idx := int(atomic.AddUint64(&p.index, 1)-1) % n
+		idx := (start + i) % n
 		acc := p.accounts[idx]
 		if excluded != nil && excluded[acc.ID] {
 			continue
@@ -180,10 +194,17 @@ func (p *GrokPool) pickRoundRobinLocked(excluded map[string]bool) *config.GrokAc
 		if !acc.Enabled {
 			continue
 		}
-		cp := acc
-		return &cp
+		load := p.inFlightLocked(acc.ID)
+		if load < bestLoad {
+			bestLoad = load
+			cp := acc
+			best = &cp
+			if load == 0 {
+				break // perfect free account
+			}
+		}
 	}
-	return nil
+	return best
 }
 
 func (p *GrokPool) findEnabledLocked(id string) *config.GrokAccount {
@@ -225,6 +246,42 @@ func (p *GrokPool) UpdateToken(id, access, refresh string, expiresAt int64) {
 	}
 	p.mu.Unlock()
 	_ = config.UpdateGrokAccountToken(id, access, refresh, expiresAt)
+}
+
+// Acquire marks an account as in-use for concurrent load balancing.
+func (p *GrokPool) Acquire(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.inFlight == nil {
+		p.inFlight = make(map[string]int)
+	}
+	p.inFlight[id]++
+	p.mu.Unlock()
+}
+
+// Release decrements in-flight after a request finishes (success or fail).
+func (p *GrokPool) Release(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.inFlight != nil {
+		if n := p.inFlight[id]; n <= 1 {
+			delete(p.inFlight, id)
+		} else {
+			p.inFlight[id] = n - 1
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *GrokPool) inFlightLocked(id string) int {
+	if p.inFlight == nil {
+		return 0
+	}
+	return p.inFlight[id]
 }
 
 // Disable marks account disabled in config and reloads.

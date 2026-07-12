@@ -10,6 +10,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -44,15 +45,24 @@ const (
 	grokClientVersion  = "0.2.93"
 	grokClientIDHeader = "grok-pager"
 	grokTokenAuth      = "xai-grok-cli"
-	grokSilentUpstream = "grok-4.5-medium" // fast default; thinking models use high
+	grokSilentUpstream = "grok-4.5-high" // minimum effort high; thinking -> xhigh
 	grokMaxOutputTokens = 65536
 )
 
 var grokHTTPClient = &http.Client{
 	Timeout: 20 * time.Minute,
+	// Explicit pool: default transport caps concurrent dials/idle poorly under multi-customer load.
 	Transport: &http.Transport{
-		ResponseHeaderTimeout: 5 * time.Minute,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		MaxConnsPerHost:       0, // unlimited concurrent connections to Grok host
 		IdleConnTimeout:       10 * time.Minute,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Minute,
+		ExpectContinueTimeout: 1 * time.Second,
 	},
 }
 
@@ -186,12 +196,12 @@ func grokReasoningSummary(effort string) string {
 }
 
 // silentGrokUpstreamForDisplay picks upstream model/effort for Claude/OpenAI disguise.
-// Non-thinking models use medium (fast). *-thinking / reason models keep high.
+// Policy: minimum high; thinking/reason models use xhigh (never medium/low).
 func silentGrokUpstreamForDisplay(displayModel string) string {
 	if modelWantsThinkingUI(displayModel) {
-		return "grok-4.5-high"
+		return "grok-4.5-xhigh"
 	}
-	return grokSilentUpstream
+	return "grok-4.5-high"
 }
 
 func GrokModelsForList() []map[string]interface{} {
@@ -606,14 +616,13 @@ func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interfac
 }
 
 func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[string]interface{} {
-	maxOut := grokMaxOutputTokens
+	maxOut := grokMaxOutputTokens // full cap for high/xhigh agent turns
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "low":
-		maxOut = 8192
-	case "medium", "":
 		maxOut = 16384
-	case "high":
+	case "medium":
 		maxOut = 32768
+	// high/xhigh: keep grokMaxOutputTokens
 	}
 	body := map[string]interface{}{
 		"model":             upstreamModel,
@@ -2290,11 +2299,13 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			break
 		}
 		logger.Infof("[Grok] try account=%s attempt=%d/%d customer=%s", acc.Email, attempt+1, maxTry, apiKeyID)
+		gp.Acquire(acc.ID)
 		if err := h.ensureValidGrokToken(acc); err != nil {
 			lastErr = err
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			logger.Warnf("[Grok] token error %s: %v", acc.Email, err)
+			gp.Release(acc.ID)
 			continue
 		}
 
@@ -2331,6 +2342,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		if err != nil || resp == nil {
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
+			gp.Release(acc.ID)
 			continue
 		}
 
@@ -2358,6 +2370,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			} else {
 				gp.Cooldown(acc.ID, "auth forbidden", 5*time.Minute)
 			}
+			gp.Release(acc.ID)
 			continue
 		}
 		if resp.StatusCode == 402 {
@@ -2374,6 +2387,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			lastErr = fmt.Errorf("%s", msg)
 			logger.Warnf("[Grok] cooldown 30m quota exhausted account=%s — try next", acc.Email)
 			// Do not return raw 402 body to client yet; try other accounts first.
+			gp.Release(acc.ID)
 			continue
 		}
 		if resp.StatusCode >= 400 {
@@ -2382,6 +2396,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(string(b), 400))
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
+			gp.Release(acc.ID)
 			continue
 		}
 
@@ -2400,6 +2415,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if cErr != nil {
 				logger.Warnf("[Grok] live stream error after start: %v", cErr)
 				// headers already sent â€” cannot retry accounts
+				gp.Release(acc.ID)
 				return
 			}
 		} else {
@@ -2458,6 +2474,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 
 		if stream {
 			// live path already wrote SSE to completion
+			gp.Release(acc.ID)
 			return
 		}
 		if format == "claude" {
@@ -2471,6 +2488,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			}
 			writeOpenAIJSONWithToolsAndThinking(w, responseModel, result.Text, result.Thinking, result.InTok, result.OutTok, finish, result.ToolCalls)
 		}
+		gp.Release(acc.ID)
 		return
 	}
 
