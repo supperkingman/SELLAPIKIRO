@@ -530,6 +530,27 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	if err != nil {
 		// 检测封禁状态
 		errMsg := err.Error()
+		// FEATURE_NOT_SUPPORTED: some Kiro account types (e.g. certain Builder ID /
+		// free-tier or enterprise SSO accounts) do NOT expose getUsageLimits, yet the
+		// account still works for chat in the IDE. Do NOT ban — treat as usable with
+		// unknown usage so the account stays enabled.
+		if strings.Contains(errMsg, "FEATURE_NOT_SUPPORTED") {
+			logger.Warnf("[RefreshAccountInfo] getUsageLimits unsupported for %s; keeping account enabled (usage unknown)", account.Email)
+			info.SubscriptionType = "UNKNOWN"
+			info.SubscriptionTitle = "Usage API not supported"
+			// Clear any stale ban left from a prior misclassification.
+			if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
+				updatedAccount := *account
+				updatedAccount.Enabled = true
+				updatedAccount.BanStatus = "ACTIVE"
+				updatedAccount.BanReason = ""
+				updatedAccount.BanTime = 0
+				if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
+					logger.Errorf("[RefreshAccountInfo] Failed to clear ban after FEATURE_NOT_SUPPORTED: %v", updateErr)
+				}
+			}
+			return info, nil
+		}
 		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
 			// 账户被暂时封禁，自动禁用并标记封禁状态
 			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", account.Email, err)
