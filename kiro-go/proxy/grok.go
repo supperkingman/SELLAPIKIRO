@@ -2644,11 +2644,12 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		if resp.StatusCode == 402 {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			msg := "Build credits exhausted (spending limit)."
-			if s := strings.TrimSpace(string(b)); s != "" {
-				msg += " " + truncateStr(s, 200)
-			}
-			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", msg, 0, 0)
+			// Log the raw provider body server-side only for debugging; NEVER store it
+			// in QuotaMessage or lastErr — the xAI/grok body would then surface in the
+			// admin UI badge tooltip and could leak the provider identity to customers.
+			logger.Warnf("[Grok] 402 quota exhausted account=%s body=%s", acc.Email, truncateStr(string(b), 200))
+			msg := "Usage limit reached"
+			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", "Usage limit reached (cooldown 10m)", 0, 0)
 			gp.Cooldown(acc.ID, "quota exhausted", 10*time.Minute)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
