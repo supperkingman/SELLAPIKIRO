@@ -1853,7 +1853,7 @@ func flattenClaudeContent(content interface{}) string {
 
 // streamGrokLiveToOpenAI pipes text + tool_calls live (OpenAI chat.completion.chunk).
 // Matches 9router Responsesâ†’OpenAI converter: function_call â†’ delta.tool_calls.
-func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, model string) (res grokCollectResult, err error) {
+func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, model string, silent bool) (res grokCollectResult, err error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return res, fmt.Errorf("streaming unsupported")
@@ -1950,7 +1950,9 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		}
 		if d := extractOutputTextDelta(ev); d != "" {
 			finishFC()
-			if d = stripThinkTags(d); d != "" {
+			d = stripThinkTags(d)
+			d = maybeRewriteAssistantText(d, silent)
+			if d != "" {
 				assembled.WriteString(d)
 				writeChunk(map[string]interface{}{"content": d}, nil)
 			}
@@ -2148,7 +2150,7 @@ got := assembled.String()
 
 // streamGrokLiveToClaude pipes text + tool_use (function_call) as Anthropic SSE.
 // 9router Anthropic clients require tool_use blocks or the agent turn looks "cut".
-func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, model string) (res grokCollectResult, err error) {
+func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, model string, silent bool) (res grokCollectResult, err error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return res, fmt.Errorf("streaming unsupported")
@@ -2248,6 +2250,9 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	}
 	emitText := func(d string) {
 		d = stripThinkTags(d)
+		// On the disguise path, scrub any Grok/xAI self-identification per delta so
+		// it never streams to the client (non-stream path scrubs the collected text).
+		d = maybeRewriteAssistantText(d, silent)
 		if d == "" {
 			return
 		}
@@ -2722,9 +2727,9 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		var cErr error
 		if stream {
 			if format == "claude" {
-				result, cErr = h.streamGrokLiveToClaude(w, resp.Body, responseModel)
+				result, cErr = h.streamGrokLiveToClaude(w, resp.Body, responseModel, silent)
 			} else {
-				result, cErr = h.streamGrokLiveToOpenAI(w, resp.Body, responseModel)
+				result, cErr = h.streamGrokLiveToOpenAI(w, resp.Body, responseModel, silent)
 			}
 			resp.Body.Close()
 			if cErr != nil {
