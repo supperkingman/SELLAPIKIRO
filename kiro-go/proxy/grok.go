@@ -414,6 +414,18 @@ func withSupportHint(msg string) string {
 // kiroStylePublicError maps internal upstream failures to the same short phrases Kiro path uses.
 // Claude: sendClaudeError → {"type":"error","error":{"type":"api_error","message":"No available accounts"}}
 // OpenAI: sendOpenAIError → {"error":{"type":"server_error","message":"No available accounts"}}
+// isGrokPermissionDeniedBody reports whether an xAI 403 response body indicates the
+// account's chat-endpoint access was revoked (a console.x.ai permissions problem),
+// as opposed to a transient/expired credential. These require manual re-authorization,
+// so the caller applies a long cooldown instead of retrying every few minutes.
+func isGrokPermissionDeniedBody(body string) bool {
+	low := strings.ToLower(body)
+	return strings.Contains(low, "permission-denied") ||
+		strings.Contains(low, "permissiondenied") ||
+		strings.Contains(low, "access to the chat endpoint is denied") ||
+		(strings.Contains(low, "console.x.ai") && strings.Contains(low, "permission"))
+}
+
 func kiroStylePublicError(msg string, silent bool) (status int, errType, publicMsg string) {
 	msg = strings.TrimSpace(msg)
 	low := strings.ToLower(msg)
@@ -2541,6 +2553,14 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 					_ = config.SetGrokAccountQuota(acc.ID, "error", "auth failed / no access (cooldown 5m)", -1, 0)
 					logger.Warnf("[Grok] cooldown 5m after auth fail account=%s", acc.Email)
 				}
+			} else if isGrokPermissionDeniedBody(string(b)) {
+				// xAI revoked chat-endpoint access for this token (console.x.ai
+				// permissions). This is NOT transient — retrying every 5m just spams
+				// the provider. Apply a long cooldown and a distinct status so the
+				// admin UI shows it needs manual re-authorization at console.x.ai.
+				gp.Cooldown(acc.ID, "chat access revoked (console.x.ai)", 6*time.Hour)
+				_ = config.SetGrokAccountQuota(acc.ID, "no_access", "chat endpoint access denied — re-grant at console.x.ai (cooldown 6h)", -1, 0)
+				logger.Warnf("[Grok] NO_ACCESS (permission-denied) account=%s — cooldown 6h, needs re-grant at console.x.ai", acc.Email)
 			} else {
 				gp.Cooldown(acc.ID, "auth forbidden", 5*time.Minute)
 			}
