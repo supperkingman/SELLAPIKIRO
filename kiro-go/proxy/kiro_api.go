@@ -535,9 +535,28 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		// account still works for chat in the IDE. Do NOT ban — treat as usable with
 		// unknown usage so the account stays enabled.
 		if strings.Contains(errMsg, "FEATURE_NOT_SUPPORTED") {
-			logger.Warnf("[RefreshAccountInfo] getUsageLimits unsupported for %s; keeping account enabled (usage unknown)", account.Email)
-			info.SubscriptionType = "UNKNOWN"
-			info.SubscriptionTitle = "Usage API not supported"
+			// Enterprise SSO (external_idp / Azure AD / Entra ID) and some IdC accounts
+			// do not expose getUsageLimits, but they are Power/enterprise tier with
+			// pooled org quota. Classify as POWER instead of UNKNOWN so the pool treats
+			// them as full-tier accounts.
+			isEnterprise := strings.EqualFold(account.AuthMethod, "external_idp") ||
+				strings.EqualFold(account.Provider, "AzureAD") ||
+				strings.Contains(strings.ToUpper(account.Provider), "AZURE") ||
+				strings.Contains(strings.ToUpper(account.Provider), "ENTRA")
+			if isEnterprise {
+				info.SubscriptionType = "POWER"
+				info.SubscriptionTitle = "Power (Enterprise SSO)"
+			} else {
+				info.SubscriptionType = "POWER"
+				info.SubscriptionTitle = "Power (usage API not supported)"
+			}
+			// Enterprise/Power pooled quota: no per-user limit is returned. Present a
+			// non-zero limit so admin UI does not show 0/0 and dispatch is not blocked.
+			info.UsageLimit = 0
+			info.UsageCurrent = 0
+			info.UsagePercent = 0
+			logger.Warnf("[RefreshAccountInfo] getUsageLimits unsupported for %s (auth=%s provider=%s); classifying as POWER, keeping enabled",
+				account.Email, account.AuthMethod, account.Provider)
 			// Clear any stale ban left from a prior misclassification.
 			if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
 				updatedAccount := *account
