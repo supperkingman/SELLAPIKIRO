@@ -2240,6 +2240,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddGrokAccount(w, r)
 	case path == "/grok-accounts/quota/refresh" && r.Method == "POST":
 		h.apiRefreshAllGrokQuota(w, r)
+	case path == "/grok-accounts/test" && r.Method == "POST":
+		h.apiTestAllGrokAccounts(w, r)
+	case strings.HasPrefix(path, "/grok-accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/grok-accounts/"), "/test")
+		h.apiTestGrokAccount(w, r, id)
 	case strings.HasPrefix(path, "/grok-accounts/") && strings.HasSuffix(path, "/quota") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/grok-accounts/"), "/quota")
 		h.apiRefreshGrokQuota(w, r, id)

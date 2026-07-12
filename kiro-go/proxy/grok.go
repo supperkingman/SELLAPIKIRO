@@ -2959,6 +2959,161 @@ func (h *Handler) apiRefreshAllGrokQuota(w http.ResponseWriter, r *http.Request)
 // parseGrokAccountJSON accepts:
 // - native GrokAccount JSON
 // - 9router providerConnections row shape (data nested or flattened)
+// testGrokAccountHello sends a tiny completion through the same HTTP client/proxy
+// path as production traffic. Reports proxy usage, latency, and upstream status.
+func (h *Handler) testGrokAccountHello(acc *config.GrokAccount) map[string]interface{} {
+	out := map[string]interface{}{
+		"id":    "",
+		"email": "",
+		"ok":    false,
+	}
+	if acc == nil {
+		out["error"] = "nil account"
+		return out
+	}
+	out["id"] = acc.ID
+	out["email"] = acc.Email
+	out["enabled"] = acc.Enabled
+	proxyURL := strings.TrimSpace(acc.ProxyURL)
+	out["proxyURL"] = proxyURL
+	out["proxyConfigured"] = proxyURL != ""
+	// getGrokHTTPClient uses per-account proxy when ProxyURL is set; otherwise default client / env proxy.
+	out["proxyUsed"] = proxyURL != ""
+	out["machineId"] = strings.TrimSpace(acc.MachineId)
+
+	start := time.Now()
+	if err := h.ensureValidGrokToken(acc); err != nil {
+		out["ms"] = time.Since(start).Milliseconds()
+		out["stage"] = "token"
+		out["error"] = err.Error()
+		logger.Warnf("[GrokTest] token fail email=%s proxy=%q err=%v", acc.Email, proxyURL, err)
+		return out
+	}
+	out["tokenMs"] = time.Since(start).Milliseconds()
+
+	body := map[string]interface{}{
+		"model": "grok-4.5",
+		"input": []map[string]interface{}{
+			{"type": "message", "role": "user", "content": "Reply with exactly: hello"},
+		},
+		"stream":            false,
+		"store":             false,
+		"max_output_tokens": 32,
+		"reasoning":         map[string]interface{}{"effort": "low", "summary": "concise"},
+	}
+	raw, _ := json.Marshal(body)
+	httpReq, err := http.NewRequest(http.MethodPost, grokResponsesURL, bytes.NewReader(raw))
+	if err != nil {
+		out["ms"] = time.Since(start).Milliseconds()
+		out["stage"] = "request"
+		out["error"] = err.Error()
+		return out
+	}
+	httpReq.Header = buildGrokHeaders(acc, uuid.New().String(), uuid.New().String(), 1, "grok-4.5")
+	client := getGrokHTTPClient(acc)
+	logger.Infof("[GrokTest] hello start email=%s proxyConfigured=%v proxyURL=%q", acc.Email, proxyURL != "", proxyURL)
+
+	resp, err := client.Do(httpReq)
+	elapsed := time.Since(start).Milliseconds()
+	out["ms"] = elapsed
+	if err != nil {
+		out["stage"] = "upstream"
+		out["error"] = err.Error()
+		errS := strings.ToLower(err.Error())
+		if strings.Contains(errS, "proxy") || strings.Contains(errS, "connect") {
+			out["proxyError"] = true
+		}
+		logger.Warnf("[GrokTest] hello network fail email=%s proxy=%q ms=%d err=%v", acc.Email, proxyURL, elapsed, err)
+		return out
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	out["httpStatus"] = resp.StatusCode
+	out["stage"] = "done"
+	preview := truncateStr(string(b), 240)
+	out["bodyPreview"] = preview
+
+	switch {
+	case resp.StatusCode == 402:
+		out["ok"] = false
+		out["status"] = "exhausted"
+		out["error"] = "Build credits exhausted"
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		out["ok"] = false
+		out["status"] = "auth_error"
+		out["error"] = "auth failed: " + preview
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		out["ok"] = true
+		out["status"] = "ok"
+		var ev map[string]interface{}
+		if json.Unmarshal(b, &ev) == nil {
+			if t := extractCompletedOutputText(ev); t != "" {
+				out["reply"] = truncateStr(t, 120)
+			}
+		}
+		if _, has := out["reply"]; !has {
+			out["reply"] = preview
+		}
+	default:
+		out["ok"] = false
+		out["status"] = "http_error"
+		out["error"] = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, preview)
+	}
+	logger.Infof("[GrokTest] hello done email=%s ok=%v status=%v http=%d proxy=%q ms=%d",
+		acc.Email, out["ok"], out["status"], resp.StatusCode, proxyURL, elapsed)
+	return out
+}
+
+func (h *Handler) apiTestGrokAccount(w http.ResponseWriter, r *http.Request, id string) {
+	id = strings.Trim(strings.TrimSpace(id), "/")
+	acc := config.GetGrokAccountByID(id)
+	if acc == nil {
+		w.WriteHeader(404)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		return
+	}
+	res := h.testGrokAccountHello(acc)
+	if ok, _ := res["ok"].(bool); !ok {
+		w.WriteHeader(502)
+	}
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) apiTestAllGrokAccounts(w http.ResponseWriter, r *http.Request) {
+	// default: only enabled. ?all=1 includes disabled.
+	onlyEnabled := r.URL.Query().Get("all") != "1"
+	accs := config.GetGrokAccounts()
+	results := make([]map[string]interface{}, 0, len(accs))
+	okN, failN := 0, 0
+	for i := range accs {
+		a := accs[i]
+		if onlyEnabled && !a.Enabled {
+			results = append(results, map[string]interface{}{
+				"id": a.ID, "email": a.Email, "enabled": false, "ok": false,
+				"status": "skipped", "skipped": true,
+				"proxyURL": a.ProxyURL, "proxyConfigured": strings.TrimSpace(a.ProxyURL) != "",
+			})
+			continue
+		}
+		acc := a
+		res := h.testGrokAccountHello(&acc)
+		if ok, _ := res["ok"].(bool); ok {
+			okN++
+		} else {
+			failN++
+		}
+		results = append(results, res)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(results),
+		"ok":      okN,
+		"failed":  failN,
+		"results": results,
+	})
+}
+
+
 func parseGrokAccountJSON(raw []byte) (*config.GrokAccount, error) {
 	// flattened first
 	var flat struct {
