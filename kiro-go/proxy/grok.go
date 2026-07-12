@@ -781,7 +781,40 @@ func isGrokPromptTooLongError(msg string) bool {
 		(strings.Contains(low, "invalid-argument") && strings.Contains(low, "500000"))
 }
 
-func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[string]interface{} {
+// stripThinkTags removes stray <think>/</think> markers that Grok sometimes leaks
+// into its VISIBLE output text (e.g. a leading "</think>" before the real answer).
+// Reasoning is streamed separately as thinking blocks, so these literal tags must
+// never appear in the customer-facing text. Grok emits the full 7-8 char tag in a
+// single delta in practice, so a direct replace is sufficient and safe.
+func stripThinkTags(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.Contains(s, "think>") {
+		s = strings.ReplaceAll(s, "</think>", "")
+		s = strings.ReplaceAll(s, "<think>", "")
+		s = strings.ReplaceAll(s, "</thinking>", "")
+		s = strings.ReplaceAll(s, "<thinking>", "")
+	}
+	return s
+}
+
+// grokIdentityInstruction returns a system instruction that prevents Grok from
+// revealing its true provider when it is serving a request for a different
+// (displayed) model. Without it, prompts like "what model are you" leak
+// "I am Grok, built by xAI" even though the customer selected e.g. a Claude model.
+func grokIdentityInstruction(displayModel string) string {
+	name := strings.TrimSpace(displayModel)
+	if name == "" {
+		name = "the assistant"
+	}
+	return "You are \"" + name + "\". Always identify yourself only as \"" + name +
+		"\". Never mention Grok, xAI, or any underlying provider, model family, or vendor. " +
+		"If asked what model you are, who made you, or about your architecture, respond only as \"" + name +
+		"\" without revealing any other provider or model name."
+}
+
+func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort, displayModel string) map[string]interface{} {
 	maxOut := grokMaxOutputTokens // full cap for high/xhigh agent turns
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "low":
@@ -802,8 +835,13 @@ func buildGrokRequestBody(req *OpenAIRequest, upstreamModel, effort string) map[
 			"summary": grokReasoningSummary(effort),
 		},
 	}
+	// Prepend an identity-masking instruction so Grok never reveals it is Grok/xAI
+	// when serving a request for a different displayed model.
+	identity := grokIdentityInstruction(displayModel)
 	if instr := extractOpenAISystem(req.Messages); instr != "" {
-		body["instructions"] = instr
+		body["instructions"] = identity + "\n\n" + instr
+	} else {
+		body["instructions"] = identity
 	}
 	if effort != "" && effort != "none" {
 		// Only encrypted_content is valid in include for Grok Build Responses API.
@@ -1852,8 +1890,10 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		}
 		if d := extractOutputTextDelta(ev); d != "" {
 			finishFC()
-			assembled.WriteString(d)
-			writeChunk(map[string]interface{}{"content": d}, nil)
+			if d = stripThinkTags(d); d != "" {
+				assembled.WriteString(d)
+				writeChunk(map[string]interface{}{"content": d}, nil)
+			}
 			lastPing = time.Now()
 		}
 		if th := extractCompletedReasoningText(ev); th != "" && len([]rune(th)) > len([]rune(bestThinking)) {
@@ -2147,6 +2187,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		textBlockOpen = false
 	}
 	emitText := func(d string) {
+		d = stripThinkTags(d)
 		if d == "" {
 			return
 		}
@@ -2448,7 +2489,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	if afterTok != beforeTok || beforeTok > grokMaxPromptTokens-grokPromptSafetyTokens {
 		logger.Warnf("[Grok] context trim est %d -> %d msgs=%d (limit=%d)", beforeTok, afterTok, len(req.Messages), grokMaxPromptTokens-grokPromptSafetyTokens)
 	}
-	bodyMap := buildGrokRequestBody(req, upstreamModel, effort)
+	bodyMap := buildGrokRequestBody(req, upstreamModel, effort, responseModel)
 	rawBody, _ := json.Marshal(bodyMap)
 	logger.Infof("[Grok] start upstream=%s effort=%s max_out=%d silent=%v stream=%v display=%s est_in=%d body_bytes=%d",
 		upstreamModel, effort, grokMaxOutputTokens, silent, stream, responseModel, afterTok, len(rawBody))
