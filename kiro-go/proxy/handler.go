@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -978,6 +980,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if activeBlockIndex < 0 {
 				return
 			}
+			// Anthropic's extended-thinking streaming protocol requires every
+			// `thinking` block to emit a signature_delta before content_block_stop.
+			// Kiro does not return a signature, so we synthesize one. Without it,
+			// Claude Code treats the thinking block as invalid and discards the ENTIRE
+			// turn — including any tool_use that follows — so the agent "thinks" for a
+			// minute then stops without performing any action (e.g. writing a file).
+			// The signature is only echoed back to us on the next request, where the
+			// input path (ClaudeToKiro) reads thinking text and ignores the signature,
+			// so a synthetic value is safe for the round-trip.
+			if activeBlockType == "thinking" {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{
+						"type":      "signature_delta",
+						"signature": synthesizeThinkingSignature(msgID, activeBlockIndex),
+					},
+				})
+			}
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
@@ -1347,6 +1368,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordFailureWithDetails("claude", model, "", lastErr)
 	}
 	return false
+}
+
+// synthesizeThinkingSignature produces a deterministic, base64-looking signature for
+// a thinking block. Kiro/CodeWhisperer does not return Anthropic's cryptographic
+// thinking signature, but Claude Code only requires that the field be present and
+// non-empty to accept the block; the value is echoed back verbatim on the next
+// request, where our input path ignores it. Derived from the message id + block
+// index so it is stable within a response.
+func synthesizeThinkingSignature(msgID string, blockIndex int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", msgID, blockIndex)))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
