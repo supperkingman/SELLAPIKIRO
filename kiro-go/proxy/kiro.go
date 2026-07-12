@@ -11,6 +11,7 @@ import (
 	"kiro-go/logger"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -274,18 +275,76 @@ func reresolveAccountProfileArn(account *config.Account) string {
 	if account == nil {
 		return ""
 	}
-	// Clear so resolveProfileArnAcrossRegions probes fresh rather than trusting the stale value.
+	staleArn := strings.TrimSpace(account.ProfileArn)
+	failingRegion := regionFromProfileArn(staleArn)
+	// Clear the stale value so resolution probes fresh instead of trusting it.
 	account.ProfileArn = ""
-	arn, err := resolveProfileArnAcrossRegions(account)
-	if err != nil || strings.TrimSpace(arn) == "" {
-		logger.Warnf("[ProfileArn] re-resolve failed for %s: %v", accountEmailForLog(account), err)
-		return ""
+
+	// The region derived from the stale ARN is exactly the one returning 403
+	// "not authorized" (e.g. a us-east-1 ARN for an account whose real profile is
+	// in eu-central-1). Probe the OTHER candidate regions first; try the failing
+	// region last only as a fallback. account.Region is also cleared during the probe
+	// so it does not force the failing region to the front of the candidate list.
+	regions := profileProbeRegionsExcludingFirst(account, failingRegion)
+	logger.Warnf("[ProfileArn] re-resolving %s: stale=%q failingRegion=%q probeOrder=%v",
+		accountEmailForLog(account), staleArn, failingRegion, regions)
+
+	savedRegion := account.Region
+	account.Region = "" // avoid re-adding the failing region to the front
+	defer func() { account.Region = savedRegion }()
+
+	for _, region := range regions {
+		arn, probeErr := listAvailableProfilesWithRetryInRegion(account, region)
+		if probeErr == nil && strings.TrimSpace(arn) != "" {
+			account.ProfileArn = arn
+			if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
+				logger.Warnf("[ProfileArn] failed to persist re-resolved ARN for %s: %v", accountEmailForLog(account), updateErr)
+			}
+			// The corrected data-plane region is derived from the new ARN itself
+			// (kiroRegionForProfile prefers regionFromProfileArn over account.Region),
+			// so persisting the ARN is sufficient — no separate region write needed.
+			if newRegion := regionFromProfileArn(arn); newRegion != "" && newRegion != savedRegion {
+				account.Region = newRegion
+				savedRegion = newRegion // keep after defer restores
+				logger.Warnf("[ProfileArn] corrected region for %s: %s -> %s", accountEmailForLog(account), failingRegion, newRegion)
+			}
+			logger.Warnf("[ProfileArn] re-resolved %s in region %s -> %s", accountEmailForLog(account), region, arn)
+			return arn
+		}
+		logger.Warnf("[ProfileArn] probe %s region=%s failed: %v", accountEmailForLog(account), region, probeErr)
 	}
-	account.ProfileArn = arn
-	if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
-		logger.Warnf("[ProfileArn] failed to persist re-resolved ARN for %s: %v", accountEmailForLog(account), updateErr)
+	logger.Warnf("[ProfileArn] re-resolve failed for %s across regions %v", accountEmailForLog(account), regions)
+	return ""
+}
+
+// profileProbeRegionsExcludingFirst returns the candidate probe regions with the
+// given failing region de-prioritized to the end. This makes a 403-triggered
+// re-resolution try the alternative regions (e.g. eu-central-1) before retrying
+// the region that just rejected the account.
+func profileProbeRegionsExcludingFirst(account *config.Account, failingRegion string) []string {
+	seen := map[string]bool{}
+	var head, tail []string
+	push := func(r string) {
+		r = strings.TrimSpace(r)
+		if r == "" || seen[r] {
+			return
+		}
+		seen[r] = true
+		if r == failingRegion {
+			tail = append(tail, r)
+		} else {
+			head = append(head, r)
+		}
 	}
-	return arn
+	if env := strings.TrimSpace(os.Getenv("KIRO_PROFILE_REGIONS")); env != "" {
+		for _, r := range strings.Split(env, ",") {
+			push(r)
+		}
+	}
+	for _, r := range defaultKiroProfileRegions {
+		push(r)
+	}
+	return append(head, tail...)
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
