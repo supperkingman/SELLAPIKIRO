@@ -1,11 +1,10 @@
 package proxy
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"kiro-go/config"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -16,25 +15,38 @@ import (
 // machine id when the account had none, so every request looked like it came
 // from an unknown/mismatched device — a strong trigger for AWS's
 // "USER_REQUEST_RATE_EXCEEDED / suspicious activity" throttle even though the
-// account's quota is fine (9router works because it always presents a stable
-// machine id). We derive a deterministic id from the account identity so it is
-// stable across restarts and unique per account, without needing to persist it.
+// account's quota is fine.
+//
+// CRITICAL: the real Kiro IDE (and 9router) uses ONE machine id for the whole
+// installation and reuses it for EVERY account/request — a machine identifies a
+// device, not an account. AWS ties each account to the machine id it was first
+// seen on; presenting a DIFFERENT machine id for an already-known account looks
+// like the same credentials moving to a new device, which is exactly what
+// triggers the "suspicious activity" throttle. So we must NOT derive a per-account
+// id (an earlier version did, which caused throttling). Instead we use a single
+// shared machine id for the whole kiro-go instance, defaulting to the same value
+// 9router uses so accounts imported from 9router keep the device they were
+// authorized on. Overridable per-account (account.MachineId) or globally via the
+// KIRO_MACHINE_ID env var.
 func stableMachineID(account *config.Account) string {
-	if account == nil {
-		return ""
+	if account != nil {
+		if mid := strings.TrimSpace(account.MachineId); mid != "" {
+			return mid
+		}
 	}
-	if mid := strings.TrimSpace(account.MachineId); mid != "" {
-		return mid
+	return sharedKiroMachineID()
+}
+
+// defaultKiroMachineID matches the machine-id 9router persists at
+// %APPDATA%/9router/machine-id, so accounts imported from 9router present the
+// same device fingerprint they were authorized under (avoids AWS re-flagging).
+const defaultKiroMachineID = "20a2bb251df6a93d3682b73f36baf4fddfb3111f3e2a63064cf59799c4599faf"
+
+func sharedKiroMachineID() string {
+	if env := strings.TrimSpace(os.Getenv("KIRO_MACHINE_ID")); env != "" {
+		return env
 	}
-	seed := strings.TrimSpace(account.ID)
-	if seed == "" {
-		seed = strings.TrimSpace(account.Email)
-	}
-	if seed == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("kiro-machine:" + seed))
-	return hex.EncodeToString(sum[:])
+	return defaultKiroMachineID
 }
 
 const (
