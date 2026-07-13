@@ -65,7 +65,10 @@ const (
 )
 
 var grokHTTPClient = &http.Client{
-	Timeout: 20 * time.Minute,
+	// No total Client.Timeout: it caps the WHOLE request incl. body streaming and
+	// kills long xhigh/thinking or agentic streams mid-flight ("context deadline
+	// exceeded while reading body"). Streaming lifetime is bounded by
+	// ResponseHeaderTimeout (time-to-headers) + IdleConnTimeout + client disconnect.
 	// Explicit pool: default transport caps concurrent dials/idle poorly under multi-customer load.
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -92,7 +95,7 @@ func getGrokHTTPClient(acc *config.GrokAccount) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   20 * time.Minute,
+		// No total timeout — see grokHTTPClient note (long streams read body > 20m).
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(cacheKey, client)

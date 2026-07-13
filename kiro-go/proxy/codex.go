@@ -45,11 +45,15 @@ const (
 )
 
 var codexHTTPClient = &http.Client{
-	Timeout: 20 * time.Minute,
+	// No total Client.Timeout: it would cap the whole request incl. body streaming
+	// and kill long xhigh/thinking or agentic streams ("context deadline exceeded
+	// while reading body"). Bound time-to-headers via ResponseHeaderTimeout instead.
 	Transport: &http.Transport{
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     10 * time.Minute,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       10 * time.Minute,
+		ResponseHeaderTimeout: 5 * time.Minute,
+		TLSHandshakeTimeout:   15 * time.Second,
 	},
 }
 
@@ -63,12 +67,14 @@ func getCodexHTTPClient(acc *config.CodexAccount) *http.Client {
 		return codexHTTPClient
 	}
 	return &http.Client{
-		Timeout: 20 * time.Minute,
+		// No total timeout — see codexHTTPClient note (long streams read body > 20m).
 		Transport: &http.Transport{
-			Proxy:               http.ProxyURL(pu),
-			MaxIdleConns:        64,
-			MaxIdleConnsPerHost: 16,
-			IdleConnTimeout:     10 * time.Minute,
+			Proxy:                 http.ProxyURL(pu),
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   16,
+			IdleConnTimeout:       10 * time.Minute,
+			ResponseHeaderTimeout: 5 * time.Minute,
+			TLSHandshakeTimeout:   15 * time.Second,
 		},
 	}
 }
