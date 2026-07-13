@@ -25,6 +25,10 @@ services:
       - ./web-custom/custom-import-grok.js:/app/web/custom-import-grok.js:ro
       # Danh sach Grok CLI tren tab Accounts.
       - ./web-custom/custom-grok-accounts.js:/app/web/custom-grok-accounts.js:ro
+      # Card "Import Codex" trong popup Add Account (self-healing qua entrypoint).
+      - ./web-custom/custom-import-codex.js:/app/web/custom-import-codex.js:ro
+      # Danh sach Codex (OpenAI) tren tab Accounts + o "% chia sang Codex".
+      - ./web-custom/custom-codex-accounts.js:/app/web/custom-codex-accounts.js:ro
       # Hien thi ngay het han duoi moi API key (doc marker #exp trong ten key).
       - ./web-custom/custom-key-expiry-display.js:/app/web/custom-key-expiry-display.js:ro
       # Nut tam dung/tiep tuc dem gio + cong them gio cho tung key (dong bo voi keyadmin).
