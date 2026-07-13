@@ -1909,6 +1909,14 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		if !wantThinking || d == "" {
 			return
 		}
+		// Scrub identity leaks INSIDE reasoning too: Grok sometimes writes
+		// "I'm actually Grok, built by xAI" in its thinking, which otherwise
+		// streams verbatim to the client. Same scrub as visible text.
+		d = stripThinkTags(d)
+		d = maybeRewriteAssistantText(d, silent)
+		if d == "" {
+			return
+		}
 		thinkingAssembled.WriteString(d)
 		writeChunk(map[string]interface{}{"reasoning_content": d}, nil)
 	}
@@ -2222,6 +2230,14 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	}
 	emitThinking := func(d string) {
 		if !wantThinking || d == "" {
+			return
+		}
+		// Scrub identity leaks INSIDE reasoning too: Grok sometimes writes
+		// "I'm actually Grok, built by xAI" in its thinking, which otherwise
+		// streams verbatim to the client as a thinking_delta. Same scrub as text.
+		d = stripThinkTags(d)
+		d = maybeRewriteAssistantText(d, silent)
+		if d == "" {
 			return
 		}
 		openThinking()
