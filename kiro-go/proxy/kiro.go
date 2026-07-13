@@ -357,7 +357,13 @@ func profileProbeRegionsExcludingFirst(account *config.Account, failingRegion st
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
-func getSortedEndpoints(preferred string) []kiroEndpoint {
+//
+// account is used only in "auto" mode: external_idp (Azure/Entra) accounts carry a
+// codewhisperer-scoped profile ARN and only work on the CodeWhisperer data plane
+// (this is exactly what 9router uses for them). The AmazonQ Developer endpoint
+// returns 429 "quota exhausted" for these tokens even though the account is healthy,
+// so we must try CodeWhisperer FIRST for them instead of the Kiro-IDE/AmazonQ host.
+func getSortedEndpoints(preferred string, account *config.Account) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
 
 	var primary int
@@ -369,7 +375,10 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto": Kiro first, then fallback to others
+		// "auto": external_idp -> CodeWhisperer first (matches 9router); otherwise Kiro first.
+		if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+			return []kiroEndpoint{kiroEndpoints[1], kiroEndpoints[0], kiroEndpoints[2]}
+		}
 		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
 	}
 
@@ -432,8 +441,8 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// Build endpoint list ordered by configuration (account-aware in auto mode).
+	endpoints := getSortedEndpoints(config.GetPreferredEndpoint(), account)
 
 	var lastErr error
 	reresolvedProfile := false
