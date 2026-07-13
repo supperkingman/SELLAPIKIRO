@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -116,7 +117,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     10 * time.Minute,
 		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		// Force HTTP/1.1 (like 9router / Node). AWS occasionally sends a mid-stream
+		// HTTP/2 RST_STREAM ("stream ID N; INTERNAL_ERROR; received from peer") when
+		// a multiplexed h2 connection is reused after the server has quietly dropped
+		// it; the streaming generateAssistantResponse call then aborts. HTTP/1.1
+		// keep-alive has no stream-multiplexing layer, so this class of error cannot
+		// occur. Setting TLSNextProto to an empty non-nil map disables the automatic
+		// HTTP/2 upgrade without needing golang.org/x/net/http2.
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
