@@ -864,13 +864,21 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.handleGrokClaudeMessages(w, r, &req)
 		return
 	}
-	// Grok is the FALLBACK for when there is no usable Kiro account (empty pool or
-	// all accounts quota-blocked). When a Kiro account is available, serve it first;
-	// the post-failure Grok fallback below still degrades gracefully if Kiro fails
+	if IsCodexModel(req.Model) {
+		normalizeClaudeRequestForAgents(&req)
+		h.handleCodexClaudeMessages(w, r, &req)
+		return
+	}
+	// Grok/Codex are FALLBACKS for when there is no usable Kiro account (empty pool
+	// or all accounts quota-blocked). When a Kiro account is available, serve it
+	// first; the post-failure fallback below still degrades gracefully if Kiro fails
 	// before any client body is written.
 	normalizeClaudeRequestForAgents(&req)
 	if h.kiroPoolEmpty() {
 		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+			return
+		}
+		if h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
 			return
 		}
 	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
@@ -878,6 +886,11 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		// (silent disguise) even though Kiro is available. If Grok fails before any
 		// body is written, fall through to the normal Kiro path below.
 		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+			return
+		}
+	} else if h.codexPoolReady() && shouldRouteToCodexBySplit() {
+		// Split routing to Codex (silent disguise), same policy as Grok split.
+		if h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
 			return
 		}
 	}
@@ -1411,6 +1424,23 @@ func shouldRouteToGrokBySplit() bool {
 	return (n*uint64(percent))/100 != ((n-1)*uint64(percent))/100
 }
 
+// codexSplitCounter mirrors grokSplitCounter for the Codex split percentage.
+var codexSplitCounter uint64
+
+// shouldRouteToCodexBySplit reports whether the current eligible request should be
+// served by Codex given the configured split percentage (Bresenham-distributed).
+func shouldRouteToCodexBySplit() bool {
+	percent := config.GetCodexSplitPercent()
+	if percent <= 0 {
+		return false
+	}
+	if percent >= 100 {
+		return true
+	}
+	n := atomic.AddUint64(&codexSplitCounter, 1)
+	return (n*uint64(percent))/100 != ((n-1)*uint64(percent))/100
+}
+
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
@@ -1727,11 +1757,19 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.handleGrokOpenAIChat(w, r, &req)
 		return
 	}
-	// Grok is the FALLBACK for when no usable Kiro account exists (empty pool or
-	// all accounts quota-blocked). Serve Kiro first; the post-failure Grok fallback
+	// Codex (ChatGPT backend): route by model id — separate pool.
+	if IsCodexModel(req.Model) {
+		h.handleCodexOpenAIChat(w, r, &req)
+		return
+	}
+	// Grok/Codex are FALLBACKS for when no usable Kiro account exists (empty pool or
+	// all accounts quota-blocked). Serve Kiro first; the post-failure fallback
 	// below still degrades gracefully if Kiro fails before any client body is written.
 	if h.kiroPoolEmpty() {
 		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+			return
+		}
+		if h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
 			return
 		}
 	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
@@ -1739,6 +1777,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		// (silent disguise) even though Kiro is available. If Grok fails before any
 		// body is written, fall through to the normal Kiro path below.
 		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+			return
+		}
+	} else if h.codexPoolReady() && shouldRouteToCodexBySplit() {
+		// Split routing to Codex (silent disguise), same policy as Grok split.
+		if h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
 			return
 		}
 	}
@@ -2319,6 +2362,28 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
+	case path == "/codex-split" && r.Method == "GET":
+		h.apiGetCodexSplit(w, r)
+	case path == "/codex-split" && r.Method == "POST":
+		h.apiSetCodexSplit(w, r)
+	case path == "/codex-accounts" && r.Method == "GET":
+		h.apiGetCodexAccounts(w, r)
+	case path == "/codex-accounts" && r.Method == "POST":
+		h.apiAddCodexAccount(w, r)
+	case path == "/codex-accounts/test" && r.Method == "POST":
+		h.apiTestAllCodexAccounts(w, r)
+	case strings.HasPrefix(path, "/codex-accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/codex-accounts/"), "/test")
+		h.apiTestCodexAccount(w, r, id)
+	case strings.HasPrefix(path, "/codex-accounts/") && strings.HasSuffix(path, "/enabled") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/codex-accounts/"), "/enabled")
+		h.apiSetCodexAccountEnabled(w, r, id)
+	case strings.HasPrefix(path, "/codex-accounts/") && (r.Method == "PUT" || r.Method == "PATCH"):
+		h.apiPatchCodexAccount(w, r, strings.TrimPrefix(path, "/codex-accounts/"))
+	case strings.HasPrefix(path, "/codex-accounts/") && r.Method == "GET":
+		h.apiGetCodexAccount(w, r, strings.TrimPrefix(path, "/codex-accounts/"))
+	case strings.HasPrefix(path, "/codex-accounts/") && r.Method == "DELETE":
+		h.apiDeleteCodexAccount(w, r, strings.TrimPrefix(path, "/codex-accounts/"))
 	case path == "/grok-split" && r.Method == "GET":
 		h.apiGetGrokSplit(w, r)
 	case path == "/grok-split" && r.Method == "POST":

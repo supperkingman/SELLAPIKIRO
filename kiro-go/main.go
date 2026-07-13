@@ -60,6 +60,8 @@ func main() {
 	// Background health-checker: re-tests Grok accounts in cooldown and returns
 	// recovered ones to rotation (xAI permission-denied is transient).
 	handler.StartGrokHealthChecker()
+	// Same for the Codex (ChatGPT backend) pool.
+	handler.StartCodexHealthChecker()
 
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())

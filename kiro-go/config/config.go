@@ -172,6 +172,14 @@ type Config struct {
 	// Kiro accounts are still available (0 = disabled, Kiro-first with Grok fallback).
 	GrokSplitPercent int `json:"grokSplitPercent,omitempty"`
 
+	// CodexAccounts is a separate pool for OpenAI Codex (ChatGPT backend) OAuth credentials.
+	// Never mixed with Accounts (Kiro) or GrokAccounts. See config/codex.go.
+	CodexAccounts []CodexAccount `json:"codexAccounts,omitempty"`
+
+	// CodexSplitPercent (0-100) routes this share of eligible requests to Codex while
+	// Kiro accounts are still available (0 = disabled, Kiro-first with Codex fallback).
+	CodexSplitPercent int `json:"codexSplitPercent,omitempty"`
+
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
@@ -838,6 +846,35 @@ func UpdateGrokSplitPercent(p int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.GrokSplitPercent = p
+	return Save()
+}
+
+// GetCodexSplitPercent returns the percentage (0-100) of eligible requests routed
+// to Codex while Kiro accounts are still available. 0 = disabled.
+func GetCodexSplitPercent() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	p := cfg.CodexSplitPercent
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
+// UpdateCodexSplitPercent sets the Codex split percentage (clamped to 0-100).
+func UpdateCodexSplitPercent(p int) error {
+	if p < 0 {
+		p = 0
+	}
+	if p > 100 {
+		p = 100
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.CodexSplitPercent = p
 	return Save()
 }
 

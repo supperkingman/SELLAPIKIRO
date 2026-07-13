@@ -11,7 +11,7 @@ INDEX="/app/web/index.html"
 
 # Danh sach cac file JS custom can chen vao index.html (self-healing).
 # Them file moi chi can them ten vao day.
-CUSTOM_JS="custom-bulk-keys.js custom-import-account.js custom-import-grok.js custom-grok-accounts.js custom-key-expiry-display.js custom-key-controls.js custom-key-dashboard.js"
+CUSTOM_JS="custom-bulk-keys.js custom-import-account.js custom-import-grok.js custom-grok-accounts.js custom-import-codex.js custom-codex-accounts.js custom-key-expiry-display.js custom-key-controls.js custom-key-dashboard.js"
 
 if [ ! -f "$INDEX" ]; then
   echo "[entrypoint] Khong tim thay index.html - bo qua chen custom JS."
