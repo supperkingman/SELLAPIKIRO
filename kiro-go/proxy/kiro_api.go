@@ -67,14 +67,24 @@ func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn
 }
 
 // regionalizeEndpointForAccount points a hardcoded us-east-1 Kiro endpoint at the
-// correct host for the account. Standard (idc/social/Builder ID) accounts hold AWS
-// credentials and talk to the AWS data plane (*.amazonaws.com) directly. external_idp
-// (enterprise SSO / Azure AD / Entra) accounts carry a raw IdP token that AWS rejects
-// with 403 "not authorized" — they MUST go through the Kiro gateway (kiro.dev), which
-// performs the IdP->AWS federation. This mirrors what the Kiro IDE / 9Router do.
+// correct host for the account.
+//
+// IMPORTANT: external_idp (Azure/Entra) accounts talk to the SAME AWS data plane
+// host as everyone else — codewhisperer.us-east-1.amazonaws.com — as long as the
+// request carries the "TokenType: EXTERNAL_IDP" header (set in applyKiroBaseHeaders).
+// This was verified by direct A/B test against AWS with a live external_idp token:
+//   codewhisperer.us-east-1.amazonaws.com  -> HTTP 200
+//   runtime.us-east-1.kiro.dev (the gateway) -> HTTP 429 "suspicious activity"
+// 9router uses the amazonaws host directly and never gets throttled; routing
+// external_idp through the kiro.dev gateway is exactly what triggered the
+// USER_REQUEST_RATE_EXCEEDED throttle. So we now send external_idp to the AWS data
+// plane too. Set KIRO_USE_GATEWAY=1 to restore the old gateway behavior if needed.
 func regionalizeEndpointForAccount(rawURL string, account *config.Account, region string) string {
 	if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
-		return gatewayizeURLForExternalIdp(rawURL, region)
+		if strings.TrimSpace(os.Getenv("KIRO_USE_GATEWAY")) == "1" {
+			return gatewayizeURLForExternalIdp(rawURL, region)
+		}
+		// Fall through to the AWS data-plane host (proven working, matches 9router).
 	}
 	return regionalizeURLForRegion(rawURL, region)
 }

@@ -478,6 +478,18 @@ retryEndpoints:
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
+		{
+			var hb strings.Builder
+			for hk, hv := range req.Header {
+				val := strings.Join(hv, ",")
+				if hk == "Authorization" && len(val) > 20 {
+					val = val[:20] + "...(len=" + fmt.Sprintf("%d", len(val)) + ")"
+				}
+				hb.WriteString(hk + ": " + val + " | ")
+			}
+			logger.Debugf("[KiroAPI] OUTGOING %s url=%s proxy=%q headers={ %s}", ep.Name, epURL, ResolveAccountProxyURL(account), hb.String())
+		}
+
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
 			lastErr = err
