@@ -881,17 +881,20 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		if h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
 			return
 		}
-	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
-		// Split routing: send a configured share of eligible requests to Grok
-		// (silent disguise) even though Kiro is available. If Grok fails before any
-		// body is written, fall through to the normal Kiro path below.
-		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
-			return
-		}
-	} else if h.codexPoolReady() && shouldRouteToCodexBySplit() {
-		// Split routing to Codex (silent disguise), same policy as Grok split.
-		if h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
-			return
+	} else {
+		// Three-way split: distribute a configured share of eligible requests to
+		// Grok/Codex (silent disguise) even though Kiro is available. A request only
+		// leaves Kiro if the chosen provider's pool is ready; otherwise it falls
+		// through to the normal Kiro path below.
+		switch h.pickSplitProvider() {
+		case "grok":
+			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+				return
+			}
+		case "codex":
+			if h.codexPoolReady() && h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
+				return
+			}
 		}
 	}
 
@@ -1402,43 +1405,46 @@ func synthesizeThinkingSignature(msgID string, blockIndex int) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// grokSplitCounter is a process-wide monotonic counter used to spread the
-// configured Grok split percentage evenly across requests (Bresenham-style),
-// avoiding bursts where many consecutive requests all go to one backend.
-var grokSplitCounter uint64
+// splitCounter is a single process-wide monotonic counter used to distribute
+// eligible (Claude-family) requests across Kiro / Grok / Codex according to the
+// configured split percentages. Using ONE counter keeps the three-way split
+// exact: per 100 requests exactly G go to Grok, C to Codex, the rest to Kiro.
+var splitCounter uint64
 
-// shouldRouteToGrokBySplit reports whether the current eligible request should be
-// served by Grok given the configured split percentage. It is deterministic and
-// evenly distributed: for P=50 it alternates 1:1, for P=30 it yields 3 of every
-// 10 requests spread out. Returns false when percent<=0 (disabled).
-func shouldRouteToGrokBySplit() bool {
-	percent := config.GetGrokSplitPercent()
-	if percent <= 0 {
-		return false
+// pickSplitProvider decides which backend an eligible request should use, honoring
+// GrokSplitPercent + CodexSplitPercent together (three-way split). Returns "grok",
+// "codex", or "kiro". When both percentages are 0 it always returns "kiro" (default
+// = 100% Kiro). Grok keeps priority if the two shares would exceed 100%.
+//
+// Explicit grok-*/gpt-5.* model ids never reach here — they are routed directly
+// (no split) before this is called, so a customer asking for a real Grok/Codex
+// model always gets that exact model.
+func (h *Handler) pickSplitProvider() string {
+	g := config.GetGrokSplitPercent()
+	c := config.GetCodexSplitPercent()
+	if g < 0 {
+		g = 0
 	}
-	if percent >= 100 {
-		return true
+	if c < 0 {
+		c = 0
 	}
-	n := atomic.AddUint64(&grokSplitCounter, 1)
-	// Bresenham: a "tick" crosses an integer boundary of n*P/100.
-	return (n*uint64(percent))/100 != ((n-1)*uint64(percent))/100
-}
-
-// codexSplitCounter mirrors grokSplitCounter for the Codex split percentage.
-var codexSplitCounter uint64
-
-// shouldRouteToCodexBySplit reports whether the current eligible request should be
-// served by Codex given the configured split percentage (Bresenham-distributed).
-func shouldRouteToCodexBySplit() bool {
-	percent := config.GetCodexSplitPercent()
-	if percent <= 0 {
-		return false
+	if g == 0 && c == 0 {
+		return "kiro"
 	}
-	if percent >= 100 {
-		return true
+	if g > 100 {
+		g = 100
 	}
-	n := atomic.AddUint64(&codexSplitCounter, 1)
-	return (n*uint64(percent))/100 != ((n-1)*uint64(percent))/100
+	if g+c > 100 {
+		c = 100 - g // never exceed 100%; Grok priority, Codex takes the remainder
+	}
+	idx := (atomic.AddUint64(&splitCounter, 1) - 1) % 100 // 0..99
+	if idx < uint64(g) {
+		return "grok"
+	}
+	if idx < uint64(g+c) {
+		return "codex"
+	}
+	return "kiro"
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1772,17 +1778,20 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		if h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
 			return
 		}
-	} else if h.grokPoolReady() && shouldRouteToGrokBySplit() {
-		// Split routing: send a configured share of eligible requests to Grok
-		// (silent disguise) even though Kiro is available. If Grok fails before any
-		// body is written, fall through to the normal Kiro path below.
-		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
-			return
-		}
-	} else if h.codexPoolReady() && shouldRouteToCodexBySplit() {
-		// Split routing to Codex (silent disguise), same policy as Grok split.
-		if h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
-			return
+	} else {
+		// Three-way split: distribute a configured share of eligible requests to
+		// Grok/Codex (silent disguise) even though Kiro is available. A request only
+		// leaves Kiro if the chosen provider's pool is ready; otherwise it falls
+		// through to the normal Kiro path below.
+		switch h.pickSplitProvider() {
+		case "grok":
+			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+				return
+			}
+		case "codex":
+			if h.codexPoolReady() && h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
+				return
+			}
 		}
 	}
 
