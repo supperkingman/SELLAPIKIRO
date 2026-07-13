@@ -131,7 +131,10 @@ func GrokCreditsForRequest(effort string, totalTokens int) float64 {
 	tokensPerCredit := grokKiroTokensPerCredit / grokCreditMarkup // ≈ 51952
 	credits := float64(totalTokens) / tokensPerCredit
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "xhigh", "max":
+	case "max":
+		// Highest reasoning budget (Codex gpt-5.6-sol-max) — priced above xhigh.
+		credits *= 1.20
+	case "xhigh":
 		credits *= 1.10
 	case "high":
 		credits *= 1.05

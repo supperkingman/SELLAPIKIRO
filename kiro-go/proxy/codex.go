@@ -32,7 +32,7 @@ const (
 	codexOriginator   = "codex_cli_rs"
 	codexUserAgent    = "codex_cli_rs/0.20.0 (linux; x86_64)"
 	// Silent upstream model for disguise (min effort high; thinking -> xhigh).
-	codexSilentUpstream = "gpt-5.5"
+	codexSilentUpstream = "gpt-5.6-sol"
 	codexMaxOutputTokens = 65536
 )
 
@@ -96,9 +96,13 @@ func ResolveCodexModel(clientModel string) (upstreamModel, effort string) {
 	m = strings.TrimPrefix(m, "codex/")
 	effort = "high"
 	switch {
-	case strings.HasSuffix(m, "-xhigh") || strings.HasSuffix(m, "-max"):
+	case strings.HasSuffix(m, "-max"):
+		// "max" is its own tier (highest reasoning budget + credit multiplier).
+		effort = "max"
+		m = strings.TrimSuffix(m, "-max")
+	case strings.HasSuffix(m, "-xhigh"):
 		effort = "xhigh"
-		m = strings.TrimSuffix(strings.TrimSuffix(m, "-xhigh"), "-max")
+		m = strings.TrimSuffix(m, "-xhigh")
 	case strings.HasSuffix(m, "-high"):
 		effort = "high"
 		m = strings.TrimSuffix(m, "-high")
@@ -113,17 +117,19 @@ func ResolveCodexModel(clientModel string) (upstreamModel, effort string) {
 		m = strings.TrimSuffix(m, "-minimal")
 	}
 	if m == "" {
-		m = "gpt-5.5"
+		m = codexSilentUpstream
 	}
 	return m, effort
 }
 
 // silentCodexUpstreamForDisplay picks upstream model/effort for disguise.
+// Uses gpt-5.6-sol: thinking UI -> xhigh, otherwise high. (Explicit gpt-5.6-sol-max
+// requests keep max via ResolveCodexModel; silent disguise never downgrades below high.)
 func silentCodexUpstreamForDisplay(displayModel string) string {
 	if modelWantsThinkingUI(displayModel) {
-		return "gpt-5.5-xhigh"
+		return "gpt-5.6-sol-xhigh"
 	}
-	return "gpt-5.5-high"
+	return "gpt-5.6-sol-high"
 }
 
 func (h *Handler) ensureValidCodexToken(acc *config.CodexAccount) error {
