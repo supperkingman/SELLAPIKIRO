@@ -1819,11 +1819,21 @@ func firstOpenAIConversationAnchor(messages []OpenAIMessage) string {
 
 func buildConversationID(modelID, systemPrompt, anchor string) string {
 	anchor = strings.TrimSpace(anchor)
+	var base string
 	if isSyntheticConversationAnchor(anchor) {
-		return uuid.New().String()
+		base = uuid.New().String()
+	} else {
+		seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
+		base = uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
 	}
-	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
-	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+	// Append a per-request suffix so no two requests ever share a conversationId,
+	// exactly like the real Kiro client / 9router (which suffix a timestamp). AWS
+	// treats requests reusing the same conversationId at high frequency as a single
+	// conversation being hammered and returns 429 "imposing temporary limits on how
+	// frequently your account can send a request" — even though the account is
+	// healthy (9router keeps working because every request gets a fresh id). The
+	// deterministic base above is retained only as a prefix for readability/debug.
+	return base + fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {
