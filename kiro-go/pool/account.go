@@ -291,6 +291,16 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	}
 }
 
+// RecordThrottle applies a SHORT cooldown for AWS temporary rate throttling
+// (USER_REQUEST_RATE_EXCEEDED). Unlike a real quota error (1h), this clears
+// quickly so the account returns to rotation within ~90s. It does not increment
+// the error count, so it never contributes to auto-disable thresholds.
+func (p *AccountPool) RecordThrottle(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cooldowns[id] = time.Now().Add(90 * time.Second)
+}
+
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
 // have been revoked or invalidated upstream (401, 403 with auth markers, etc.).
 // These accounts cannot be recovered automatically and must be re-authenticated.

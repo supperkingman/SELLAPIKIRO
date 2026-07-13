@@ -1,10 +1,41 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 )
+
+// stableMachineID returns a stable per-account machine fingerprint.
+//
+// The real Kiro IDE client always sends a fixed 64-hex machine id in its
+// User-Agent (KiroIDE-<ver>-<machineId>). kiro-go previously sent an EMPTY
+// machine id when the account had none, so every request looked like it came
+// from an unknown/mismatched device — a strong trigger for AWS's
+// "USER_REQUEST_RATE_EXCEEDED / suspicious activity" throttle even though the
+// account's quota is fine (9router works because it always presents a stable
+// machine id). We derive a deterministic id from the account identity so it is
+// stable across restarts and unique per account, without needing to persist it.
+func stableMachineID(account *config.Account) string {
+	if account == nil {
+		return ""
+	}
+	if mid := strings.TrimSpace(account.MachineId); mid != "" {
+		return mid
+	}
+	seed := strings.TrimSpace(account.ID)
+	if seed == "" {
+		seed = strings.TrimSpace(account.Email)
+	}
+	if seed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("kiro-machine:" + seed))
+	return hex.EncodeToString(sum[:])
+}
 
 const (
 	kiroStreamingSDKVersion = "1.0.34"
@@ -27,10 +58,7 @@ func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderVa
 
 func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, mode string) kiroHeaderValues {
 	clientCfg := config.GetKiroClientConfig()
-	machineID := ""
-	if account != nil {
-		machineID = account.MachineId
-	}
+	machineID := stableMachineID(account)
 
 	userAgent := fmt.Sprintf(
 		"aws-sdk-js/%s ua/2.1 os/%s lang/js md/nodejs#%s api/%s#%s %s KiroIDE-%s",

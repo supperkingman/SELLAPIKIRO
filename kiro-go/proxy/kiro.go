@@ -486,8 +486,12 @@ retryEndpoints:
 		}
 
 		if resp.StatusCode == 429 {
+			b429, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+			// Log the real upstream reason (ThrottlingException vs monthly quota vs
+			// model-not-authorized) — previously discarded, hiding why 9router works
+			// but kiro-go 429s for the same token.
+			logger.Warnf("[KiroAPI] Endpoint %s HTTP 429 body=%s (region=%s arn=%s)", ep.Name, truncateStr(string(b429), 400), account.Region, payload.ProfileArn)
 			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 			continue
 		}

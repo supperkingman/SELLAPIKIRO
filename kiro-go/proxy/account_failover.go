@@ -14,6 +14,21 @@ func isQuotaErrorMessage(msg string) bool {
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
 }
 
+// isRateLimitThrottleMessage detects AWS's TEMPORARY rate throttle, distinct from
+// real monthly-quota exhaustion. AWS returns HTTP 429 with reason
+// "USER_REQUEST_RATE_EXCEEDED" and a "suspicious activity / temporary limits"
+// message when it briefly rate-limits an account (often triggered by an unstable
+// client fingerprint). This clears on its own in seconds-to-minutes, so it must
+// NOT trigger the long 1-hour quota cooldown — a short cooldown keeps the account
+// in rotation. (9router keeps working because it never gets flagged.)
+func isRateLimitThrottleMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "user_request_rate_exceeded") ||
+		strings.Contains(m, "suspicious activity") ||
+		strings.Contains(m, "temporary limits") ||
+		strings.Contains(m, "imposing temporary")
+}
+
 func isOverageErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
@@ -98,6 +113,11 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
+	case isRateLimitThrottleMessage(errMsg):
+		// Temporary AWS rate throttle (not real quota): short cooldown so the
+		// account rotates out briefly then comes back, instead of a 1h quota ban.
+		h.pool.RecordThrottle(account.ID)
+		logger.Warnf("[AccountFailover] %s temporarily rate-throttled by AWS (short cooldown, still healthy)", account.Email)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
 	case isSuspensionErrorMessage(errMsg):
