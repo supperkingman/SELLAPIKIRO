@@ -512,10 +512,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4o", "kiro-proxy", true),
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
-	// Grok CLI models are intentionally NOT listed here: they must stay hidden so
-	// the public /v1/models never exposes Grok/xAI identity. Explicit Grok routing
-	// still works because it keys off IsGrokModel(req.Model) at request time, not
-	// off this discovery list.
+	// Grok + Codex models are listed so customers can explicitly select them.
+	// These are separate from the silent-disguise fallback path: a customer who
+	// picks one of these IDs is knowingly routed to that provider (IsGrokModel /
+	// IsCodexModel key off req.Model at request time). Only advertised when at
+	// least one healthy account exists in that pool, so the list reflects what is
+	// actually usable.
+	models = append(models, buildGrokCodexModels()...)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -559,6 +562,36 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 		buildModelInfo("claude-opus-4.5", "anthropic", true),
 		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
 	}
+}
+
+// buildGrokCodexModels advertises the explicit Grok and Codex model IDs a
+// customer can select, but only for pools that currently have a healthy account
+// (so the list never offers a provider that would immediately fail). Effort
+// tiers mirror ResolveGrokModel / ResolveCodexModel suffix parsing.
+func buildGrokCodexModels() []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, 8)
+
+	if pool.GetGrokPool().Count() > 0 {
+		for _, id := range []string{
+			"grok-4.5-low",
+			"grok-4.5-high",
+			"grok-4.5-xhigh",
+		} {
+			out = append(out, buildModelInfo(id, "xai", false))
+		}
+	}
+
+	if pool.GetCodexPool().Count() > 0 {
+		for _, id := range []string{
+			"gpt-5.6-sol-high",
+			"gpt-5.6-sol-xhigh",
+			"gpt-5.6-sol-max",
+		} {
+			out = append(out, buildModelInfo(id, "openai", false))
+		}
+	}
+
+	return out
 }
 
 func modelSupportsImage(inputTypes []string) bool {
