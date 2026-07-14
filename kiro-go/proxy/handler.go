@@ -582,12 +582,12 @@ func buildGrokCodexModels() []map[string]interface{} {
 	}
 
 	if pool.GetCodexPool().Count() > 0 {
-		for _, id := range []string{
-			"gpt-5.6-sol-high",
-			"gpt-5.6-sol-xhigh",
-			"gpt-5.6-sol-max",
-		} {
-			out = append(out, buildModelInfo(id, "openai", false))
+		// Kiro ships three gpt-5.6 variants (sol/terra/luna); expose all with the
+		// high/xhigh/max effort tiers so customers can pick any of them explicitly.
+		for _, variant := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+			for _, tier := range []string{"-high", "-xhigh", "-max"} {
+				out = append(out, buildModelInfo(variant+tier, "openai", false))
+			}
 		}
 	}
 
