@@ -359,17 +359,6 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		if acc == nil {
 			break
 		}
-		// Warm-up pacing: if this (newly added) account still needs spacing before
-		// its next request, wait it out here. With multiple accounts the picker
-		// already spread load elsewhere; with a single/lone warming account this
-		// wait is what actually paces it so OpenAI does not lock it for bursting.
-		if wait := cp.CodexWarmupWaitFor(acc.ID); wait > 0 {
-			if wait > 30*time.Second {
-				wait = 30 * time.Second // safety cap so a client never hangs too long
-			}
-			logger.Infof("[Codex] warm-up pacing account=%s wait=%s", acc.Email, wait)
-			time.Sleep(wait)
-		}
 		lastTriedAccountID = acc.ID
 		cp.Acquire(acc.ID)
 		if err := h.ensureValidCodexToken(acc); err != nil {

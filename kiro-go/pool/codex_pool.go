@@ -146,8 +146,24 @@ func (p *CodexPool) pickRoundRobin(excluded map[string]bool) *config.CodexAccoun
 	return p.pickRoundRobinLocked(excluded)
 }
 
-// pickRoundRobinLocked requires p.mu held. Prefers accounts with fewer in-flight requests.
+// pickRoundRobinLocked requires p.mu held. Prefers accounts with fewer in-flight
+// requests. Two-pass warm-up model (compute, don't wait):
+//   pass 1 (respectWarmup=true): skip accounts that are over their warm-up limit,
+//     so when there ARE enough other accounts, load spreads to warmed ones and the
+//     new account ramps gently.
+//   pass 2 (respectWarmup=false): if pass 1 found nothing — i.e. the only usable
+//     account(s) are still warming (e.g. a single new account, or all warming) —
+//     serve anyway. With too few accounts there is nothing to spread onto, so
+//     warm-up is effectively skipped rather than making the customer wait.
 func (p *CodexPool) pickRoundRobinLocked(excluded map[string]bool) *config.CodexAccount {
+	if best := p.pickRoundRobinPassLocked(excluded, true); best != nil {
+		return best
+	}
+	return p.pickRoundRobinPassLocked(excluded, false)
+}
+
+// pickRoundRobinPassLocked is one selection pass. Requires p.mu held.
+func (p *CodexPool) pickRoundRobinPassLocked(excluded map[string]bool, respectWarmup bool) *config.CodexAccount {
 	n := len(p.accounts)
 	if n == 0 {
 		return nil
@@ -167,9 +183,10 @@ func (p *CodexPool) pickRoundRobinLocked(excluded map[string]bool) *config.Codex
 		if !acc.Enabled {
 			continue
 		}
-		// Warm-up: newly added accounts are throttled (concurrency + spacing) so
-		// they are not hammered the instant they are added and locked early.
-		if !p.codexWarmupAllowsLocked(&acc) {
+		// Warm-up (pass 1 only): skip an account that is over its warm-up limit so
+		// load spreads to already-warmed accounts. Pass 2 ignores this so a lone
+		// warming account is still served instead of failing.
+		if respectWarmup && !p.codexWarmupAllowsLocked(&acc) {
 			continue
 		}
 		load := p.inFlightLocked(acc.ID)

@@ -73,37 +73,6 @@ func (p *CodexPool) lastUsedLocked(id string) int64 {
 	return 0
 }
 
-// CodexWarmupWaitFor returns how long the caller should sleep before sending a
-// request on this account to respect warm-up spacing. Returns 0 if the account
-// is fully warmed / legacy, has never been used, or spacing is already satisfied.
-//
-// This is what makes warm-up work even with a SINGLE account: the round-robin
-// skip only helps when there are other accounts to spread onto. When there is
-// one account (or all are warming), the picker falls through to that account and
-// the handler waits this long instead of bursting — so a brand-new lone account
-// is still paced, not hammered.
-func (p *CodexPool) CodexWarmupWaitFor(id string) time.Duration {
-	acc := p.GetByID(id)
-	if acc == nil {
-		return 0
-	}
-	_, minSpacing, warming := codexWarmupStage(acc.AddedAt)
-	if !warming || minSpacing <= 0 {
-		return 0
-	}
-	p.mu.RLock()
-	last := p.lastUsedLocked(id)
-	p.mu.RUnlock()
-	if last <= 0 {
-		return 0 // never used yet: let the first request through immediately
-	}
-	remaining := int64(minSpacing.Seconds()) - (time.Now().Unix() - last)
-	if remaining <= 0 {
-		return 0
-	}
-	return time.Duration(remaining) * time.Second
-}
-
 // CodexWarmupInfo is a read-only view of an account's warm-up state for admin UI.
 type CodexWarmupInfo struct {
 	Warming       bool  `json:"warming"`
