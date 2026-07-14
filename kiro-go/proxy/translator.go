@@ -38,6 +38,13 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
+// claudeDatedSnapshotPattern strips a trailing "-YYYYMMDD" dated-snapshot suffix
+// from a Claude model id, e.g. claude-sonnet-4.5-20250929 -> claude-sonnet-4.5
+// (and claude-sonnet-4-20250514 -> claude-sonnet-4). Upstream (AmazonQ/Kiro)
+// rejects dated snapshots with HTTP 400 INVALID_MODEL_ID, so we normalize them to
+// the base version. Handles both dotted (4.5) and dashed (4-5) minor forms.
+var claudeDatedSnapshotPattern = regexp.MustCompile(`(claude-(?:opus|sonnet|haiku)-\d+(?:[.\-]\d+)?)-\d{8}\b`)
+
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
@@ -83,6 +90,13 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		if strings.Contains(lower, m.key) {
 			return m.value, thinking
 		}
+	}
+
+	// 1b) Strip a trailing "-YYYYMMDD" dated snapshot (claude-sonnet-4.5-20250929 ->
+	//     claude-sonnet-4.5) so upstream does not reject it with INVALID_MODEL_ID.
+	if claudeDatedSnapshotPattern.MatchString(lower) {
+		lower = claudeDatedSnapshotPattern.ReplaceAllString(lower, "$1")
+		model = lower
 	}
 
 	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
