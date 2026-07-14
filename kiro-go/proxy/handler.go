@@ -897,7 +897,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.handleGrokClaudeMessages(w, r, &req)
 		return
 	}
-	if IsCodexModel(req.Model) {
+	// Only an EXPLICIT Codex prefix (cx/, codex/, codex-) routes straight to Codex.
+	// A bare gpt-5.6-* falls through to Kiro first (Kiro also serves those models)
+	// and only reaches Codex via the post-failure fallback below.
+	if IsExplicitCodexModel(req.Model) {
 		normalizeClaudeRequestForAgents(&req)
 		h.handleCodexClaudeMessages(w, r, &req)
 		return
@@ -1796,8 +1799,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.handleGrokOpenAIChat(w, r, &req)
 		return
 	}
-	// Codex (ChatGPT backend): route by model id — separate pool.
-	if IsCodexModel(req.Model) {
+	// Codex (ChatGPT backend): only an EXPLICIT Codex prefix (cx/, codex/, codex-)
+	// routes straight to Codex. A bare gpt-5.6-* falls through to Kiro first (Kiro
+	// also serves those models) and only reaches Codex via the fallback below.
+	if IsExplicitCodexModel(req.Model) {
 		h.handleCodexOpenAIChat(w, r, &req)
 		return
 	}

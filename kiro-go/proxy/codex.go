@@ -79,11 +79,24 @@ func getCodexHTTPClient(acc *config.CodexAccount) *http.Client {
 	}
 }
 
-// IsCodexModel reports whether a model id targets the Codex path.
+// IsCodexModel reports whether a model id can be served by the Codex path.
+// Used for the silent fallback check (a bare gpt-5.x can be disguised via Codex).
 func IsCodexModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	return strings.HasPrefix(m, "gpt-5") ||
 		strings.HasPrefix(m, "cx/") ||
+		strings.HasPrefix(m, "codex/") ||
+		strings.HasPrefix(m, "codex-")
+}
+
+// IsExplicitCodexModel reports whether the client explicitly asked for the Codex
+// backend via a Codex-only prefix (cx/, codex/, codex-). Bare gpt-5.x ids are
+// intentionally NOT explicit: Kiro also serves gpt-5.6-sol/terra/luna, so a bare
+// gpt-5.x is tried on Kiro first and only falls back to Codex if Kiro fails.
+// To force Codex, prefix the model with "cx/" (e.g. cx/gpt-5.6-sol-high).
+func IsExplicitCodexModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "cx/") ||
 		strings.HasPrefix(m, "codex/") ||
 		strings.HasPrefix(m, "codex-")
 }
