@@ -42,6 +42,12 @@ type CodexAccount struct {
 	MachineId string `json:"machineId,omitempty"`
 	ProxyURL  string `json:"proxyURL,omitempty"`
 
+	// AddedAt (Unix seconds) is when the account was first added. Used to warm up
+	// newly added accounts slowly (ramp request frequency/concurrency) so OpenAI
+	// does not flag a brand-new session that immediately bursts. Existing accounts
+	// with AddedAt==0 are treated as fully warmed (back-compat).
+	AddedAt int64 `json:"addedAt,omitempty"`
+
 	// Upstream quota snapshot (best-effort).
 	// QuotaStatus: ok | exhausted | unknown | error
 	QuotaStatus    string  `json:"quotaStatus,omitempty"`
@@ -142,10 +148,18 @@ func AddCodexAccount(account CodexAccount) error {
 				if account.ProxyURL == "" {
 					account.ProxyURL = a.ProxyURL
 				}
+				// Preserve original AddedAt so re-import does not reset warm-up.
+				if account.AddedAt == 0 {
+					account.AddedAt = a.AddedAt
+				}
 				cfg.CodexAccounts[i] = account
 				return Save()
 			}
 		}
+	}
+	// Brand-new account: stamp AddedAt so the pool warms it up gradually.
+	if account.AddedAt == 0 {
+		account.AddedAt = time.Now().Unix()
 	}
 	cfg.CodexAccounts = append(cfg.CodexAccounts, account)
 	return Save()

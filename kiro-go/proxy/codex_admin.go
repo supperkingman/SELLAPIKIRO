@@ -73,6 +73,10 @@ func (h *Handler) apiGetCodexAccounts(w http.ResponseWriter, r *http.Request) {
 		QuotaStatus    string  `json:"quotaStatus,omitempty"`
 		QuotaMessage   string  `json:"quotaMessage,omitempty"`
 		QuotaCheckedAt int64   `json:"quotaCheckedAt,omitempty"`
+		AddedAt        int64   `json:"addedAt,omitempty"`
+		Warming        bool    `json:"warming,omitempty"`
+		WarmupMaxConc  int     `json:"warmupMaxConcurrent,omitempty"`
+		WarmupSpacing  int     `json:"warmupMinSpacingSec,omitempty"`
 	}
 	cpStats := pool.GetCodexPool()
 	out := make([]view, 0, len(accs))
@@ -81,6 +85,7 @@ func (h *Handler) apiGetCodexAccounts(w http.ResponseWriter, r *http.Request) {
 		if r, e, t, c, l, ok := cpStats.SnapshotStats(a.ID); ok {
 			req, errc, tok, cred, last = r, e, t, c, l
 		}
+		wi := cpStats.WarmupInfo(a.ID)
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, Nickname: a.Nickname, DisplayName: a.DisplayName,
 			Enabled: a.Enabled, ExpiresAt: a.ExpiresAt, AuthMethod: a.AuthMethod,
@@ -91,6 +96,8 @@ func (h *Handler) apiGetCodexAccounts(w http.ResponseWriter, r *http.Request) {
 			HasRefresh: a.RefreshToken != "",
 			MachineId:  a.MachineId, ProxyURL: a.ProxyURL, LastUsed: last,
 			QuotaStatus: a.QuotaStatus, QuotaMessage: a.QuotaMessage, QuotaCheckedAt: a.QuotaCheckedAt,
+			AddedAt: a.AddedAt, Warming: wi.Warming,
+			WarmupMaxConc: wi.MaxConcurrent, WarmupSpacing: wi.MinSpacingSec,
 		})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"accounts": out, "count": len(out)})

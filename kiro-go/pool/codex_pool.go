@@ -167,6 +167,11 @@ func (p *CodexPool) pickRoundRobinLocked(excluded map[string]bool) *config.Codex
 		if !acc.Enabled {
 			continue
 		}
+		// Warm-up: newly added accounts are throttled (concurrency + spacing) so
+		// they are not hammered the instant they are added and locked early.
+		if !p.codexWarmupAllowsLocked(&acc) {
+			continue
+		}
 		load := p.inFlightLocked(acc.ID)
 		if load < bestLoad {
 			bestLoad = load
