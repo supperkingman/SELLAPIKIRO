@@ -52,6 +52,22 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
+// defaultKiroCreditMultiplier scales the raw metering usage Kiro reports before it
+// reaches customer billing / account stats. 1.3 = charge 30% above Kiro's own number.
+const defaultKiroCreditMultiplier = 1.3
+
+// kiroCreditMultiplier returns the credit markup applied to Kiro usage. Defaults to
+// defaultKiroCreditMultiplier; override at runtime with KIRO_CREDIT_MULTIPLIER (a
+// positive float, e.g. "1.5"). An unset/invalid/non-positive value uses the default.
+func kiroCreditMultiplier() float64 {
+	if v := strings.TrimSpace(os.Getenv("KIRO_CREDIT_MULTIPLIER")); v != "" {
+		if m, err := strconv.ParseFloat(v, 64); err == nil && m > 0 {
+			return m
+		}
+	}
+	return defaultKiroCreditMultiplier
+}
+
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
@@ -662,7 +678,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	}
 
 	if callback.OnCredits != nil && totalCredits > 0 {
-		callback.OnCredits(totalCredits)
+		// Bill Kiro usage at kiroCreditMultiplier (default 1.3x). Kiro reports its raw
+		// metering usage; we scale it before it reaches customer billing / account
+		// stats so the charged credit reflects our markup. Override with the env var
+		// KIRO_CREDIT_MULTIPLIER (e.g. "1.5") without a code change.
+		callback.OnCredits(totalCredits * kiroCreditMultiplier())
 	}
 
 	if callback.OnComplete != nil {
