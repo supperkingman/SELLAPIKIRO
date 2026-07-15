@@ -453,6 +453,21 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	// Build endpoint list ordered by configuration (account-aware in auto mode).
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint(), account)
 
+	// TEST-ONLY: KIRO_FORCE_ENDPOINT pins the request to a single endpoint by name
+	// (e.g. "CodeWhisperer", "AmazonQ", "Kiro IDE") so latency/stability of each of
+	// the 3 upstream endpoints can be measured in isolation. No effect when unset.
+	if forced := strings.TrimSpace(os.Getenv("KIRO_FORCE_ENDPOINT")); forced != "" {
+		filtered := endpoints[:0:0]
+		for _, ep := range endpoints {
+			if strings.EqualFold(ep.Name, forced) {
+				filtered = append(filtered, ep)
+			}
+		}
+		if len(filtered) > 0 {
+			endpoints = filtered
+		}
+	}
+
 	var lastErr error
 	reresolvedProfile := false
 retryEndpoints:
@@ -503,13 +518,12 @@ retryEndpoints:
 			// TEMPORARY rate throttle (USER_REQUEST_RATE_EXCEEDED) apart from a real
 			// monthly-quota exhaustion — otherwise a throttle wrongly gets the 1h ban.
 			lastErr = fmt.Errorf("quota exhausted on %s: %s", ep.Name, truncateStr(bodyStr, 300))
-			// A 429 is an ACCOUNT-level limit that ALL THREE endpoints (Kiro IDE,
-			// CodeWhisperer, AmazonQ) share — they hit the same backend rate/quota
-			// bucket. Trying the other endpoints just triples our request rate at AWS
-			// and makes the throttle worse. The real Kiro client / 9router avoid this
-			// by using a single endpoint per request, so we stop here and let the
-			// account take a short cooldown instead of hammering all three.
-			break
+			// Per operator preference: on a 429, try the remaining endpoints for THIS
+			// account (1 -> 2 -> 3) before giving up and moving on to the next account.
+			// Note: the three endpoints largely share one backend rate/quota bucket, so
+			// this can add a couple of extra calls during a throttle; the tradeoff is
+			// that a per-endpoint (rather than account-wide) throttle still gets served.
+			continue
 		}
 
 		if resp.StatusCode != 200 {

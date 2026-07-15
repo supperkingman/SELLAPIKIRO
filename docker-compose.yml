@@ -48,6 +48,9 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong file .env}
+      # TEST-ONLY: pin all Kiro requests to a single upstream endpoint by name
+      # ("Kiro IDE" | "CodeWhisperer" | "AmazonQ"). Empty = normal multi-endpoint.
+      - KIRO_FORCE_ENDPOINT=${KIRO_FORCE_ENDPOINT:-}
     restart: unless-stopped
 
   # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).
