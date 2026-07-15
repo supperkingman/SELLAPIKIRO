@@ -1518,7 +1518,21 @@ func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 		res.InTok, res.OutTok = mergeUsage(ev, res.InTok, res.OutTok)
 	}
 	if err := scanner.Err(); err != nil {
-		return res, err
+		// Upstream (Grok) sometimes drops the connection mid-stream, surfacing as
+		// "unexpected EOF" / connection reset. If we already collected usable output
+		// (delta text, a completed snapshot, or tool calls), salvage it and mark the
+		// reply incomplete instead of failing the whole request. Only propagate the
+		// error when nothing usable was received (so the caller can retry another account).
+		if delta.Len() > 0 || bestFull != "" || len(res.ToolCalls) > 0 {
+			logger.Warnf("[Grok] stream ended early (%v); salvaging partial reply (deltaLen=%d snapLen=%d tools=%d)",
+				err, delta.Len(), len([]rune(bestFull)), len(res.ToolCalls))
+			res.Incomplete = true
+			if res.Reason == "" {
+				res.Reason = "upstream_eof"
+			}
+		} else {
+			return res, err
+		}
 	}
 
 	text := delta.String()
