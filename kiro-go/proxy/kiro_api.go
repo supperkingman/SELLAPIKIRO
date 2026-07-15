@@ -122,8 +122,52 @@ func gatewayizeURLForExternalIdp(rawURL, region string) string {
 // q.{region}.amazonaws.com; there is deliberately no codewhisperer.{region} host.
 // It is a no-op for us-east-1 or an empty region. This region-targeted primitive
 // also backs cross-region profile probing (listAvailableProfilesInRegion).
-func regionalizeURLForRegion(rawURL, region string) string {
+// qDataPlaneRegions lists the regions where the Amazon Q / CodeWhisperer streaming
+// data plane (q.{region}.amazonaws.com) actually exists. An account's SSO/home region
+// (e.g. an IdC portal in eu-north-1) is NOT necessarily a Q data-plane region: there is
+// no q.eu-north-1.amazonaws.com, so targeting it fails DNS with "no such host". Regions
+// outside this set fall back to us-east-1, the universal CodeWhisperer data plane.
+// Override/extend with KIRO_Q_REGIONS (comma-separated) if AWS adds more.
+var qDataPlaneRegions = map[string]bool{
+	"us-east-1":    true,
+	"eu-central-1": true,
+}
+
+// qDataPlaneRegion maps an account region to a region that actually serves the Q data
+// plane. Known Q regions pass through; anything else (e.g. eu-north-1) falls back to
+// us-east-1 so the request reaches a real host instead of an nonexistent one.
+func qDataPlaneRegion(region string) string {
 	region = strings.TrimSpace(region)
+	if region == "" {
+		return "us-east-1"
+	}
+	if envRegions := strings.TrimSpace(os.Getenv("KIRO_Q_REGIONS")); envRegions != "" {
+		for _, r := range strings.Split(envRegions, ",") {
+			if strings.EqualFold(strings.TrimSpace(r), region) {
+				return region
+			}
+		}
+		return "us-east-1"
+	}
+	if qDataPlaneRegions[strings.ToLower(region)] {
+		return region
+	}
+	return "us-east-1"
+}
+
+// regionalizeURLForRegion rewrites a hardcoded us-east-1 Kiro endpoint to target
+// the given region. Amazon Q is regional (q.{region}.amazonaws.com), but the
+// CodeWhisperer REST host only exists in us-east-1 — every other region is served
+// by the regional Amazon Q host instead. So for a non-us-east-1 region BOTH
+// us-east-1 hosts (q.us-east-1.* and codewhisperer.us-east-1.*) collapse onto
+// q.{region}.amazonaws.com; there is deliberately no codewhisperer.{region} host.
+// It is a no-op for us-east-1 or an empty region. This region-targeted primitive
+// also backs cross-region profile probing (listAvailableProfilesInRegion).
+func regionalizeURLForRegion(rawURL, region string) string {
+	// Only regionalize toward a region that actually hosts the Q data plane; an
+	// unsupported region (e.g. eu-north-1) is normalized to us-east-1 to avoid a
+	// "no such host" DNS failure.
+	region = qDataPlaneRegion(region)
 	if region == "" || region == "us-east-1" {
 		return rawURL
 	}
