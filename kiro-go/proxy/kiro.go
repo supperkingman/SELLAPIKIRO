@@ -68,6 +68,22 @@ func kiroCreditMultiplier() float64 {
 	return defaultKiroCreditMultiplier
 }
 
+// kiroStreamResponseHeaderTimeout bounds how long we wait for the FIRST response
+// header from the upstream (connect + time-to-first-byte). The streaming client
+// deliberately has no overall Timeout — a total deadline would kill a long but
+// healthy stream (large context + thinking on a slow model) mid-body, surfacing as
+// "context deadline exceeded ... while reading body". Bounding only the first-byte
+// phase catches a dead upstream without cutting a progressing stream. Override with
+// KIRO_STREAM_HEADER_TIMEOUT_SEC (seconds).
+func kiroStreamResponseHeaderTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("KIRO_STREAM_HEADER_TIMEOUT_SEC")); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			return time.Duration(s) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
@@ -89,7 +105,9 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// No overall Timeout: a total deadline kills long healthy streams mid-body.
+		// First-byte latency is bounded by Transport.ResponseHeaderTimeout instead.
+		Timeout:   0,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -142,6 +160,10 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		// HTTP/2 upgrade without needing golang.org/x/net/http2.
 		ForceAttemptHTTP2: false,
 		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+		// Bound only the wait for the first response header (connect + TTFB), not the
+		// whole stream. This is what catches a dead/hung upstream without cutting a
+		// long but progressing generateAssistantResponse stream.
+		ResponseHeaderTimeout: kiroStreamResponseHeaderTimeout(),
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -158,7 +180,9 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// No overall Timeout (see GetClientForProxy): first-byte latency is bounded by
+		// Transport.ResponseHeaderTimeout, but a long healthy stream is never cut.
+		Timeout:   0,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
