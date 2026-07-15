@@ -1369,10 +1369,30 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
+			// Stream broke AFTER we already sent part of the reply to the client. We
+			// cannot retry another account (would duplicate the already-sent text) and
+			// emitting an SSE "error" here makes agent clients (Claude Code / Cursor)
+			// treat the whole turn as failed — the user sees the answer cut off with an
+			// error ("ngắt quãng giữa chừng"). Instead, close the stream gracefully:
+			// finish any open block, then send message_delta(stop_reason) + message_stop
+			// so the client accepts the partial reply as a normal (truncated) turn.
 			h.recordFailureWithDetails("claude", model, account.ID, err)
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
-				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+			logger.Warnf("[Claude] stream interrupted mid-reply on account=%s (%v); closing gracefully", account.ID, err)
+			processClaudeText("", false, true)
+			if eventThinkingOpen {
+				sendText("", 3)
+			}
+			closeActiveBlock()
+			ensureMessageStart()
+			h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+				"type": "message_delta",
+				"delta": map[string]interface{}{
+					"stop_reason": "end_turn",
+				},
+				"usage": buildClaudeUsageMap(inputTokens, outputTokens, messageStartUsage, cacheProfile != nil),
+			})
+			h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+				"type": "message_stop",
 			})
 			return true
 		}
@@ -2181,7 +2201,32 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
+			// Stream broke AFTER partial output was sent. Retrying another account would
+			// duplicate text, and cutting the SSE off with no terminator makes OpenAI
+			// clients report a broken/incomplete stream ("ngắt quãng giữa chừng").
+			// Close gracefully: flush any buffered text, then emit a final chunk with
+			// finish_reason + [DONE] so the client accepts the partial (truncated) reply.
 			h.recordFailureWithDetails("openai", model, account.ID, err)
+			logger.Warnf("[OpenAI] stream interrupted mid-reply on account=%s (%v); closing gracefully", account.ID, err)
+			processText("", false, true)
+			if eventThinkingOpen {
+				sendChunk("", 3)
+			}
+			finalChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "stop",
+				}},
+			}
+			fb, _ := json.Marshal(finalChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(fb))
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return true
 		}
 
