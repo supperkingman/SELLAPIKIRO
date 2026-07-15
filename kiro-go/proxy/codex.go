@@ -266,16 +266,94 @@ func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayMod
 }
 
 func (h *Handler) handleCodexOpenAIChat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest) {
-	h.handleCodexWithFormat(w, r, req, "openai", "")
+	// Codex-family cascade: Codex -> Kiro (native gpt-5.6) -> Grok (disguised as gpt-5.6).
+	orig := *req
+	fallback := func() bool { return h.codexFallbackOpenAI(w, r, &orig) }
+	h.handleCodexWithFormat(w, r, req, "openai", "", fallback)
 }
 
 func (h *Handler) handleCodexClaudeMessages(w http.ResponseWriter, r *http.Request, req *ClaudeRequest) {
-	h.handleCodexWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "")
+	orig := *req
+	fallback := func() bool { return h.codexFallbackClaude(w, r, &orig) }
+	h.handleCodexWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "", fallback)
+}
+
+// codexFallbackClaude serves a Codex-family Claude request via Kiro (native
+// gpt-5.6) and, if Kiro fails, via Grok disguised as gpt-5.6. Returns true if it
+// produced the response. Only call when nothing has been written to the client.
+func (h *Handler) codexFallbackClaude(w http.ResponseWriter, r *http.Request, req *ClaudeRequest) bool {
+	// Normalize the Codex model id (strip cx//codex/ prefix + effort suffix) to the
+	// bare gpt-5.6 id that Kiro serves natively. displayModel echoes the client id.
+	kiroModel, _ := ResolveCodexModel(req.Model)
+	displayModel := req.Model
+
+	if !h.kiroPoolEmpty() {
+		kreq := *req
+		kreq.Model = kiroModel
+		thinkingCfg := config.GetThinkingConfig()
+		actualModel, thinking := resolveClaudeThinkingMode(kreq.Model, kreq.Thinking, thinkingCfg.Suffix)
+		kreq.Model = actualModel
+		effectiveReq := cloneClaudeRequestForThinking(&kreq, thinking)
+		thinkingResponseOpts := resolveClaudeThinkingResponseOptions(kreq.Thinking, thinkingCfg.ClaudeFormat)
+		estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+		cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+		kiroPayload := ClaudeToKiro(&kreq, thinking)
+		apiKeyID := apiKeyIDFromContext(r.Context())
+		logger.Infof("[Codex] fallback -> Kiro claude model=%s", kiroModel)
+		var handled bool
+		if kreq.Stream {
+			handled = h.handleClaudeStream(w, kiroPayload, displayModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		} else {
+			handled = h.handleClaudeNonStream(w, kiroPayload, displayModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		}
+		if handled {
+			return true
+		}
+	}
+
+	// Kiro empty or failed before writing: Grok disguised as gpt-5.6 (displayModel is
+	// a gpt-5.x id, so the scrub hides grok/xAI but keeps the gpt identity).
+	logger.Infof("[Codex] fallback -> Grok(disguised gpt) claude display=%s", displayModel)
+	return h.trySilentGrokClaudeFallback(w, r, req, displayModel)
+}
+
+// codexFallbackOpenAI is the OpenAI-format counterpart of codexFallbackClaude.
+func (h *Handler) codexFallbackOpenAI(w http.ResponseWriter, r *http.Request, req *OpenAIRequest) bool {
+	kiroModel, _ := ResolveCodexModel(req.Model)
+	displayModel := req.Model
+
+	if !h.kiroPoolEmpty() {
+		kreq := *req
+		kreq.Model = kiroModel
+		thinkingCfg := config.GetThinkingConfig()
+		actualModel, thinking := ParseModelAndThinking(kreq.Model, thinkingCfg.Suffix)
+		kreq.Model = actualModel
+		estimatedInputTokens := estimateOpenAIRequestInputTokens(&kreq)
+		kiroPayload := OpenAIToKiro(&kreq, thinking)
+		apiKeyID := apiKeyIDFromContext(r.Context())
+		logger.Infof("[Codex] fallback -> Kiro openai model=%s", kiroModel)
+		var handled bool
+		if kreq.Stream {
+			handled = h.handleOpenAIStream(w, kiroPayload, displayModel, thinking, estimatedInputTokens, apiKeyID)
+		} else {
+			handled = h.handleOpenAINonStream(w, kiroPayload, displayModel, thinking, estimatedInputTokens, apiKeyID)
+		}
+		if handled {
+			return true
+		}
+	}
+
+	logger.Infof("[Codex] fallback -> Grok(disguised gpt) openai display=%s", displayModel)
+	return h.trySilentGrokOpenAIFallback(w, r, req, displayModel)
 }
 
 // handleCodexWithFormat runs the Codex account loop and streams/collects the reply.
 // Mirrors handleGrokWithFormat; reuses the Grok stream collectors (Responses API).
-func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string) {
+// fallback (may be nil) is invoked when Codex cannot serve (pool empty or every
+// account failed) AND nothing has been written to the client yet; it returns true
+// if it produced the response (Kiro or Grok), letting the customer's gpt model stay
+// resilient without leaking the real backend.
+func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string, fallback func() bool) {
 	reqStart := time.Now()
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	stream := req.Stream
@@ -343,6 +421,10 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		cp.Reload()
 	}
 	if cp.Count() == 0 {
+		// No Codex account: cascade to Kiro -> Grok before erroring.
+		if fallback != nil && fallback() {
+			return
+		}
 		sendErr(503, "api_error", "No available accounts")
 		return
 	}
@@ -546,6 +628,11 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		msg = lastErr.Error()
 	}
 	logger.Warnf("[Codex] FAIL all accounts silent=%v display=%s available=%d last=%v", silent, responseModel, cp.AvailableCount(), lastErr)
+	// Every Codex account failed. If we have not written anything to the client yet
+	// (non-stream, or stream that never started), cascade to Kiro -> Grok.
+	if fallback != nil && fallback() {
+		return
+	}
 	sendErr(503, "api_error", msg)
 }
 
@@ -565,7 +652,7 @@ func (h *Handler) trySilentCodexClaudeFallback(w http.ResponseWriter, r *http.Re
 	oai.Model = silentCodexUpstreamForDisplay(requestedModel)
 	oai.MaxTokens = 0
 	logger.Infof("[CodexSilent] claude %s -> %s", requestedModel, oai.Model)
-	h.handleCodexWithFormat(w, r, oai, "claude", requestedModel)
+	h.handleCodexWithFormat(w, r, oai, "claude", requestedModel, nil)
 	return true
 }
 
@@ -585,7 +672,7 @@ func (h *Handler) trySilentCodexOpenAIFallback(w http.ResponseWriter, r *http.Re
 	proxyReq.Model = silentCodexUpstreamForDisplay(requestedModel)
 	proxyReq.MaxTokens = 0
 	logger.Infof("[CodexSilent] openai %s -> %s", requestedModel, proxyReq.Model)
-	h.handleCodexWithFormat(w, r, &proxyReq, "openai", requestedModel)
+	h.handleCodexWithFormat(w, r, &proxyReq, "openai", requestedModel, nil)
 	return true
 }
 

@@ -897,10 +897,11 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.handleGrokClaudeMessages(w, r, &req)
 		return
 	}
-	// Only an EXPLICIT Codex prefix (cx/, codex/, codex-) routes straight to Codex.
-	// A bare gpt-5.6-* falls through to Kiro first (Kiro also serves those models)
-	// and only reaches Codex via the post-failure fallback below.
-	if IsExplicitCodexModel(req.Model) {
+	// Codex-family models (bare gpt-5.6-* and explicit cx//codex/ prefixes) route to
+	// Codex FIRST. The Codex handler cascades internally: Codex account -> Kiro
+	// (native gpt-5.6) -> Grok disguised as gpt-5.6, so the customer's chosen gpt
+	// model stays resilient without ever leaking the real backend.
+	if IsCodexModel(req.Model) {
 		normalizeClaudeRequestForAgents(&req)
 		h.handleCodexClaudeMessages(w, r, &req)
 		return
@@ -1799,10 +1800,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.handleGrokOpenAIChat(w, r, &req)
 		return
 	}
-	// Codex (ChatGPT backend): only an EXPLICIT Codex prefix (cx/, codex/, codex-)
-	// routes straight to Codex. A bare gpt-5.6-* falls through to Kiro first (Kiro
-	// also serves those models) and only reaches Codex via the fallback below.
-	if IsExplicitCodexModel(req.Model) {
+	// Codex-family models (bare gpt-5.6-* and explicit cx//codex/ prefixes) route to
+	// Codex FIRST. The Codex handler cascades internally: Codex account -> Kiro
+	// (native gpt-5.6) -> Grok disguised as gpt-5.6, keeping the customer's chosen
+	// gpt model resilient without leaking the real backend.
+	if IsCodexModel(req.Model) {
 		h.handleCodexOpenAIChat(w, r, &req)
 		return
 	}
