@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +72,27 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
+
+// maxPayloadBytesForModel returns the serialized-body byte budget for a model.
+// The 900KB base (maxPayloadBytes) was calibrated for 200K-token models
+// (~4 chars/token + JSON overhead), so a 1M-token model (opus-4.8, sonnet-4.6+)
+// would otherwise be truncated around ~225K tokens — the "context ~250K then cut
+// off" the customer reported. 1M-window models get a proportionally larger budget
+// so their full context reaches the upstream. Override with KIRO_MAX_PAYLOAD_KB
+// (kilobytes, applies to the 1M tier) without a code change.
+func maxPayloadBytesForModel(model string) int {
+	if getContextWindowSize(model) >= 1_000_000 {
+		if v := strings.TrimSpace(os.Getenv("KIRO_MAX_PAYLOAD_KB")); v != "" {
+			if kb, err := strconv.Atoi(v); err == nil && kb > 0 {
+				return kb * 1024
+			}
+		}
+		// 1M window ≈ 5x the 200K window; 4x keeps a safety margin below the raw
+		// ratio for headers/serialization overhead vs the upstream length threshold.
+		return maxPayloadBytes * 4
+	}
+	return maxPayloadBytes
+}
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -1641,7 +1664,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	limit := maxPayloadBytesForModel(currentMessageModelID(payload))
+	if payloadByteSize(payload) <= limit {
 		return
 	}
 
@@ -1683,7 +1707,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > limit && kept > minRecentHistoryTurns {
 			break
 		}
 		keepFrom = i
@@ -1702,7 +1726,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
+	if payloadByteSize(payload) > limit {
 		truncateCurrentMessage(payload)
 	}
 }
