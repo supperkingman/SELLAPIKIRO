@@ -1733,8 +1733,12 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
+	// If still too large, first shrink oversized text INSIDE the retained history
+	// (the /compact case: a huge recent tool result / assistant turn alone exceeds
+	// the limit), then shrink the current message content as a final resort.
+	if payloadByteSize(payload) > limit {
+		truncateOversizedHistoryContent(payload, limit)
+	}
 	if payloadByteSize(payload) > limit {
 		truncateCurrentMessage(payload)
 	}
@@ -1788,6 +1792,60 @@ func truncateCurrentMessage(payload *KiroPayload) {
 			return
 		}
 		cur.Content = cur.Content[:budget]
+	}
+}
+
+// historyContentTruncatedNote marks a history text field that was hard-truncated to
+// fit the upstream input limit.
+const historyContentTruncatedNote = "\n\n...[truncated to fit input limit]..."
+
+// truncateOversizedHistoryContent shrinks large text fields INSIDE the retained
+// history entries when the payload is still over the limit after dropping older
+// turns. This is the case that broke Claude Code's /compact: the current message
+// (the "summarize this conversation" instruction) is tiny, but the retained recent
+// history — a single huge tool result or assistant turn — alone exceeds the limit,
+// so shrinking only the current message never helps. We repeatedly halve the single
+// largest trimmable text field (tool-result text, user content, or assistant
+// content) until the payload fits or nothing is left to trim.
+func truncateOversizedHistoryContent(payload *KiroPayload, limit int) {
+	const minFieldLen = 512 // don't shrink a field below this
+	for payloadByteSize(payload) > limit {
+		// Find the single largest trimmable text field across all history entries.
+		var target *string
+		best := minFieldLen
+		consider := func(s *string) {
+			if s != nil && len(*s) > best {
+				best = len(*s)
+				target = s
+			}
+		}
+		for i := range payload.ConversationState.History {
+			h := &payload.ConversationState.History[i]
+			if h.UserInputMessage != nil {
+				consider(&h.UserInputMessage.Content)
+				if ctx := h.UserInputMessage.UserInputMessageContext; ctx != nil {
+					for ti := range ctx.ToolResults {
+						for ci := range ctx.ToolResults[ti].Content {
+							consider(&ctx.ToolResults[ti].Content[ci].Text)
+						}
+					}
+				}
+			}
+			if h.AssistantResponseMessage != nil {
+				consider(&h.AssistantResponseMessage.Content)
+			}
+		}
+		if target == nil {
+			// Nothing left large enough to trim; fall through to current-message shrink.
+			return
+		}
+		// Halve the largest field (keep a floor), appending a truncation marker so the
+		// model knows content was elided.
+		keep := len(*target) / 2
+		if keep < minFieldLen {
+			keep = minFieldLen
+		}
+		*target = (*target)[:keep] + historyContentTruncatedNote
 	}
 }
 
