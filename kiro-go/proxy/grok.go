@@ -71,9 +71,14 @@ var grokHTTPClient = &http.Client{
 	// ResponseHeaderTimeout (time-to-headers) + IdleConnTimeout + client disconnect.
 	// Explicit pool: default transport caps concurrent dials/idle poorly under multi-customer load.
 	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		// Force HTTP/1.1 (like the Kiro path). A reused HTTP/2 connection that the
+		// peer has quietly dropped surfaces mid-stream as "stream ID N; INTERNAL_ERROR;
+		// received from peer" (an h2 RST_STREAM), aborting the Grok stream. Because a
+		// custom DialContext is set, ForceAttemptHTTP2:false makes Go disable the
+		// automatic HTTP/2 upgrade, so this class of error cannot occur.
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
 		MaxConnsPerHost:       0, // unlimited concurrent connections to Grok host
