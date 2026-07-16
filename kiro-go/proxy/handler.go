@@ -993,11 +993,28 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
+	// Keepalive: Kiro's upstream can take tens of seconds to process a large context
+	// (prefill) before emitting the first token. Without bytes on the wire, Claude CLI
+	// and intermediate proxies idle-timeout and drop the request ("phản hồi chậm /
+	// context dài bị ngắt"). Ping the client until the first real event is sent. All
+	// SSE writes go through sendSSELocked so the ping goroutine never interleaves.
+	var writeMu sync.Mutex
+	stopKA := h.startGrokKeepaliveLocked(w, "claude", &writeMu)
+	stopKAOnce := func() {
+		if stopKA != nil {
+			stopKA()
+			stopKA = nil
+		}
+	}
+	defer stopKAOnce()
+
 	ensureMessageStart := func() {
 		if messageStarted {
 			return
 		}
-		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		// First real event: stop the keepalive so pings no longer share the wire.
+		stopKAOnce()
+		h.sendSSELocked(&writeMu, w, flusher, "message_start", map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
 				"id":            msgID,
@@ -1051,7 +1068,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			// input path (ClaudeToKiro) reads thinking text and ignores the signature,
 			// so a synthetic value is safe for the round-trip.
 			if activeBlockType == "thinking" {
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{
@@ -1060,7 +1077,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 			}
-			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			h.sendSSELocked(&writeMu, w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
 			})
@@ -1079,7 +1096,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			nextContentIndex++
 
 			if blockType == "thinking" {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1088,7 +1105,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 			} else {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1115,7 +1132,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1142,7 +1159,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": outputText},
@@ -1152,7 +1169,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1179,7 +1196,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				if text != "" {
 					startContentBlock("thinking")
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
 						"index": activeBlockIndex,
 						"delta": map[string]string{"type": "thinking_delta", "thinking": text},
@@ -1323,7 +1340,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				idx := nextContentIndex
 				nextContentIndex++
 
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
@@ -1335,7 +1352,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				})
 
 				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": idx,
 					"delta": map[string]interface{}{
@@ -1344,7 +1361,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": idx,
 				})
@@ -1384,14 +1401,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}
 			closeActiveBlock()
 			ensureMessageStart()
-			h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+			h.sendSSELocked(&writeMu, w, flusher, "message_delta", map[string]interface{}{
 				"type": "message_delta",
 				"delta": map[string]interface{}{
 					"stop_reason": "end_turn",
 				},
 				"usage": buildClaudeUsageMap(inputTokens, outputTokens, messageStartUsage, cacheProfile != nil),
 			})
-			h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+			h.sendSSELocked(&writeMu, w, flusher, "message_stop", map[string]interface{}{
 				"type": "message_stop",
 			})
 			return true
@@ -1430,7 +1447,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		ensureMessageStart()
-		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		h.sendSSELocked(&writeMu, w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
@@ -1438,7 +1455,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
-				h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+				h.sendSSELocked(&writeMu, w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
 		return true
@@ -1508,6 +1525,16 @@ func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event str
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
 	flusher.Flush()
+}
+
+// sendSSELocked is sendSSE guarded by a write mutex, so a concurrent keepalive
+// ping goroutine cannot interleave its bytes with a content event on the wire.
+func (h *Handler) sendSSELocked(mu *sync.Mutex, w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	h.sendSSE(w, flusher, event, data)
 }
 
 // backgroundStatsSaver 后台定时保存统计数据
@@ -1900,6 +1927,20 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 	reqStart := time.Now()
 
+	// Keepalive during the upstream prefill gap (large context => long silence before
+	// the first token). Without bytes on the wire, clients idle-timeout and drop the
+	// request. The ping stops as soon as the first real chunk is sent; content writes
+	// are guarded by writeMu so the ping goroutine cannot interleave on the wire.
+	var writeMu sync.Mutex
+	stopKA := h.startGrokKeepaliveLocked(w, "openai", &writeMu)
+	stopKAOnce := func() {
+		if stopKA != nil {
+			stopKA()
+			stopKA = nil
+		}
+	}
+	defer stopKAOnce()
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
@@ -2020,8 +2061,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}
 			}
 			data, _ := json.Marshal(chunk)
+			stopKAOnce()
+			writeMu.Lock()
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
+			writeMu.Unlock()
 			responseStarted = true
 		}
 
@@ -2177,8 +2221,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				toolCallIndex++
 				data, _ := json.Marshal(chunk)
+				stopKAOnce()
+				writeMu.Lock()
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
+				writeMu.Unlock()
 				responseStarted = true
 			},
 			OnComplete: func(inTok, outTok int) {
@@ -2224,9 +2271,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}},
 			}
 			fb, _ := json.Marshal(finalChunk)
+			stopKAOnce()
+			writeMu.Lock()
 			fmt.Fprintf(w, "data: %s\n\n", string(fb))
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
+			writeMu.Unlock()
 			return true
 		}
 
@@ -2281,9 +2331,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 		data, _ := json.Marshal(chunk)
+		stopKAOnce()
+		writeMu.Lock()
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		writeMu.Unlock()
 		return true
 	}
 
