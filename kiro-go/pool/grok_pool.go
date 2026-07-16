@@ -18,6 +18,11 @@ type GrokPool struct {
 	cooldownUntil map[string]int64
 	// inFlight counts concurrent live requests per account (spread load across pool).
 	inFlight map[string]int
+	// quota402Streak counts CONSECUTIVE upstream 402 (quota exhausted) responses per
+	// account. Reset to 0 on any success. When it reaches the disable threshold the
+	// account is disabled (Enabled=false) so a genuinely exhausted account is pulled
+	// from rotation immediately, while a one-off transient 402 does not.
+	quota402Streak map[string]int
 }
 
 type grokRuntimeStats struct {
@@ -346,9 +351,42 @@ func (p *GrokPool) RecordSuccess(id string) {
 	s := p.ensureStats(id)
 	s.requestCount++
 	s.lastUsed = time.Now().Unix()
+	if p.quota402Streak != nil {
+		delete(p.quota402Streak, id) // a success clears any consecutive-402 streak
+	}
 	req, errc, tok, cred, last := s.requestCount, s.errorCount, s.totalTokens, s.totalCredits, s.lastUsed
 	p.mu.Unlock()
 	_ = config.UpdateGrokAccountStats(id, req, errc, tok, cred, last)
+}
+
+// RecordQuota402 increments the consecutive-402 streak for an account and returns
+// the new streak count. Callers compare it against the disable threshold to decide
+// whether to pull the account from rotation. The streak is reset by RecordSuccess.
+func (p *GrokPool) RecordQuota402(id string) int {
+	if id == "" {
+		return 0
+	}
+	p.mu.Lock()
+	if p.quota402Streak == nil {
+		p.quota402Streak = make(map[string]int)
+	}
+	p.quota402Streak[id]++
+	n := p.quota402Streak[id]
+	p.mu.Unlock()
+	return n
+}
+
+// ResetQuota402 clears the consecutive-402 streak for an account (e.g. after the
+// account recovers, or is disabled and no longer needs tracking).
+func (p *GrokPool) ResetQuota402(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.quota402Streak != nil {
+		delete(p.quota402Streak, id)
+	}
+	p.mu.Unlock()
 }
 
 // RecordError increments error stats in memory and persists counters.

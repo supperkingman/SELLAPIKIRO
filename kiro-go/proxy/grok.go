@@ -62,6 +62,12 @@ const (
 	grokPermissionDeniedCooldown = 90 * time.Second
 	grokAuthForbiddenCooldown    = 90 * time.Second
 	grokHealthCheckInterval      = 60 * time.Second
+	// grokQuota402DisableThreshold is the number of CONSECUTIVE upstream 402 (quota
+	// exhausted) responses that disables a Grok account outright. Below this, a 402
+	// only triggers a short cooldown (transient). Reaching it means the quota is truly
+	// exhausted, so the account is pulled from rotation (Enabled=false) and needs a
+	// manual admin re-enable.
+	grokQuota402DisableThreshold = 3
 )
 
 var grokHTTPClient = &http.Client{
@@ -2841,12 +2847,24 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			// admin UI badge tooltip and could leak the provider identity to customers.
 			logger.Warnf("[Grok] 402 quota exhausted account=%s body=%s", acc.Email, truncateStr(string(b), 200))
 			msg := "Usage limit reached"
-			_ = config.SetGrokAccountQuota(acc.ID, "exhausted", "Usage limit reached (cooldown 10m)", 0, 0)
-			gp.Cooldown(acc.ID, "quota exhausted", 10*time.Minute)
 			excluded[acc.ID] = true
 			gp.RecordError(acc.ID)
 			lastErr = fmt.Errorf("%s", msg)
-			logger.Warnf("[Grok] cooldown 30m quota exhausted account=%s — try next", acc.Email)
+			// Count CONSECUTIVE 402s. A single transient 402 only cools the account down
+			// (auto-recovers); repeated 402s mean the quota is genuinely exhausted, so we
+			// disable the account immediately and surface a red badge on the admin UI.
+			streak := gp.RecordQuota402(acc.ID)
+			if streak >= grokQuota402DisableThreshold {
+				reason := fmt.Sprintf("Quota exhausted (%d consecutive 402) — auto-disabled %s", streak, time.Now().Format("2006-01-02 15:04"))
+				_ = config.SetGrokAccountQuota(acc.ID, "exhausted", "Usage limit reached — auto-disabled", 0, 0)
+				gp.Disable(acc.ID, reason)
+				gp.ResetQuota402(acc.ID)
+				logger.Errorf("[Grok] account=%s DISABLED after %d consecutive 402 (quota exhausted) — admin must re-enable", acc.Email, streak)
+			} else {
+				_ = config.SetGrokAccountQuota(acc.ID, "exhausted", "Usage limit reached (cooldown 10m)", 0, 0)
+				gp.Cooldown(acc.ID, "quota exhausted", 10*time.Minute)
+				logger.Warnf("[Grok] cooldown 10m quota exhausted account=%s (402 streak=%d/%d) — try next", acc.Email, streak, grokQuota402DisableThreshold)
+			}
 			// Do not return raw 402 body to client yet; try other accounts first.
 			gp.Release(acc.ID)
 			continue
