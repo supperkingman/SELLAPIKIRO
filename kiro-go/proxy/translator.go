@@ -1809,10 +1809,17 @@ const historyContentTruncatedNote = "\n\n...[truncated to fit input limit]..."
 // content) until the payload fits or nothing is left to trim.
 func truncateOversizedHistoryContent(payload *KiroPayload, limit int) {
 	const minFieldLen = 512 // don't shrink a field below this
+	// noteLen is the marker we append after trimming; it must be accounted for so a
+	// shrink actually reduces the field (otherwise the loop can spin forever).
+	noteLen := len(historyContentTruncatedNote)
+	// The "considerable" threshold must exceed a fully-shrunk field (minFieldLen +
+	// noteLen); otherwise a field already at that size keeps getting re-picked and
+	// re-trimmed to the same size, producing a busy-loop that pins the CPU.
+	considerThreshold := minFieldLen + noteLen
 	for payloadByteSize(payload) > limit {
 		// Find the single largest trimmable text field across all history entries.
 		var target *string
-		best := minFieldLen
+		best := considerThreshold
 		consider := func(s *string) {
 			if s != nil && len(*s) > best {
 				best = len(*s)
@@ -1839,11 +1846,17 @@ func truncateOversizedHistoryContent(payload *KiroPayload, limit int) {
 			// Nothing left large enough to trim; fall through to current-message shrink.
 			return
 		}
-		// Halve the largest field (keep a floor), appending a truncation marker so the
-		// model knows content was elided.
+		// Halve the largest field (keep a floor). Guarantee real forward progress: the
+		// trimmed field (keep + note) MUST be strictly smaller than before, or we bail
+		// so the loop can never spin without shrinking the payload.
 		keep := len(*target) / 2
 		if keep < minFieldLen {
 			keep = minFieldLen
+		}
+		if keep+noteLen >= len(*target) {
+			// Can't meaningfully shrink even the largest field; stop and let the
+			// caller's current-message shrink handle any remaining overflow.
+			return
 		}
 		*target = (*target)[:keep] + historyContentTruncatedNote
 	}
