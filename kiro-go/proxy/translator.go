@@ -73,25 +73,34 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
 
-// maxPayloadBytesForModel returns the serialized-body byte budget for a model.
-// The 900KB base (maxPayloadBytes) was calibrated for 200K-token models
-// (~4 chars/token + JSON overhead), so a 1M-token model (opus-4.8, sonnet-4.6+)
-// would otherwise be truncated around ~225K tokens — the "context ~250K then cut
-// off" the customer reported. 1M-window models get a proportionally larger budget
-// so their full context reaches the upstream. Override with KIRO_MAX_PAYLOAD_KB
-// (kilobytes, applies to the 1M tier) without a code change.
-func maxPayloadBytesForModel(model string) int {
-	if getContextWindowSize(model) >= 1_000_000 {
-		if v := strings.TrimSpace(os.Getenv("KIRO_MAX_PAYLOAD_KB")); v != "" {
-			if kb, err := strconv.Atoi(v); err == nil && kb > 0 {
-				return kb * 1024
-			}
+// basePayloadBudget is the byte budget for standard (200K-window) models. The
+// upstream CodeWhisperer endpoint rejects oversized requests with HTTP 400
+// CONTENT_LENGTH_EXCEEDS_THRESHOLD, and its real threshold is stricter than the
+// original 900KB assumption — requests truncated to just under 900KB were still
+// rejected. We therefore default to a more conservative 640KB and allow tuning via
+// KIRO_MAX_PAYLOAD_KB (kilobytes) without a code change.
+func basePayloadBudget() int {
+	if v := strings.TrimSpace(os.Getenv("KIRO_MAX_PAYLOAD_KB")); v != "" {
+		if kb, err := strconv.Atoi(v); err == nil && kb > 0 {
+			return kb * 1024
 		}
+	}
+	return 640 * 1024
+}
+
+// maxPayloadBytesForModel returns the serialized-body byte budget for a model.
+// The base budget (basePayloadBudget) is calibrated for 200K-token models
+// (~4 chars/token + JSON overhead), so a 1M-token model (opus-4.8, sonnet-4.6+)
+// gets a proportionally larger budget so its full context reaches the upstream.
+// KIRO_MAX_PAYLOAD_KB overrides the base; the 1M tier scales from it.
+func maxPayloadBytesForModel(model string) int {
+	base := basePayloadBudget()
+	if getContextWindowSize(model) >= 1_000_000 {
 		// 1M window ≈ 5x the 200K window; 4x keeps a safety margin below the raw
 		// ratio for headers/serialization overhead vs the upstream length threshold.
-		return maxPayloadBytes * 4
+		return base * 4
 	}
-	return maxPayloadBytes
+	return base
 }
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
@@ -1769,7 +1778,7 @@ func currentMessageModelID(payload *KiroPayload) string {
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	budget := maxPayloadBytesForModel(currentMessageModelID(payload)) - overhead
 	if budget < 0 {
 		budget = 0
 	}
