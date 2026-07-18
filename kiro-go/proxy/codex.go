@@ -363,6 +363,12 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 	if displayModel != "" {
 		responseModel = displayModel
 	}
+	// Silent path rewrites req.Model to the upstream Codex id; log the customer's
+	// display model so request logs never show the real backend model.
+	logModel := clientModel
+	if silent {
+		logModel = responseModel
+	}
 
 	logEndpoint := "openai-codex"
 	if format == "claude" {
@@ -374,7 +380,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 	lastTriedAccountID := ""
 
 	sendErr := func(status int, errType, msg string) {
-		h.recordFailureWithDetails(logEndpoint, clientModel, lastTriedAccountID, fmt.Errorf("%s", msg))
+		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
 			status, errType, public = st, et, public
@@ -556,7 +562,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			resp.Body.Close()
 			if cErr != nil {
 				logger.Warnf("[Codex] live stream error after start: %v", cErr)
-				h.recordFailureWithDetails(logEndpoint, clientModel, acc.ID, cErr)
+				h.recordFailureWithDetails(logEndpoint, logModel, acc.ID, cErr)
 				cp.RecordError(acc.ID)
 				cp.Release(acc.ID)
 				return
@@ -576,8 +582,15 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		if result.InTok <= 0 {
 			result.InTok = estimateOpenAIRequestInputTokens(req)
 		}
+		// Silent disguise: scrub OpenAI/ChatGPT (and any residual Grok) self-ID in
+		// BOTH text and thinking for BOTH claude and openai formats. Stream path
+		// already scrubs per-delta via streamGrokLiveTo*; non-stream collect does not.
+		if silent {
+			target := disguiseTargetForModel(responseModel)
+			result.Text = maybeRewriteAssistantTextForTarget(result.Text, true, target)
+			result.Thinking = maybeRewriteAssistantTextForTarget(result.Thinking, true, target)
+		}
 		if format == "claude" {
-			result.Text = maybeRewriteAssistantText(result.Text, silent)
 			est := estimateClaudeishOutputTokens(result.Text, len(result.ToolCalls))
 			if result.OutTok <= 0 || (len([]rune(result.Text)) > 0 && result.OutTok > est*4 && est > 0) {
 				result.OutTok = est
@@ -601,7 +614,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
 		cp.RecordSuccess(acc.ID)
 		cp.UpdateStats(acc.ID, result.InTok+result.OutTok, credits)
-		h.recordSuccessLog(logEndpoint, clientModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(logEndpoint, logModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
 		logger.Infof("[Codex] done display=%s outTok=%d stream=%v ms=%d", responseModel, result.OutTok, stream, time.Since(reqStart).Milliseconds())
 
 		if stream {
