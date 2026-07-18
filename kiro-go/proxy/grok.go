@@ -767,8 +767,10 @@ func openaiMessagesToGrokInput(msgs []OpenAIMessage) []map[string]interface{} {
 	return out
 }
 
-// convertOpenAIToolsToGrokResponses maps Chat Completions tools â†’ Responses function tools
+// convertOpenAIToolsToGrokResponses maps Chat Completions tools → Responses function tools
 // (9router grok-cli: {type:"function", name, description, parameters}).
+// parameters must be a valid JSON Schema object; Grok rejects required:null with
+// "Schema validation failed: /required: null is not of type array".
 func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interface{} {
 	if len(tools) == 0 {
 		return nil
@@ -787,13 +789,12 @@ func convertOpenAIToolsToGrokResponses(tools []OpenAITool) []map[string]interfac
 			continue
 		}
 		seen[name] = true
-		params := t.Function.Parameters
-		if params == nil {
-			params = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-		}
+		// Reuse the Kiro schema cleaner: drops required:null / empty required,
+		// additionalProperties, and forces type:object when missing.
+		params := ensureObjectSchema(t.Function.Parameters)
 		item := map[string]interface{}{
-			"type":      "function",
-			"name":      name,
+			"type":       "function",
+			"name":       name,
 			"parameters": params,
 		}
 		if d := strings.TrimSpace(t.Function.Description); d != "" {
@@ -942,6 +943,17 @@ func isGrokPromptTooLongError(msg string) bool {
 	return strings.Contains(low, "maximum prompt length") ||
 		strings.Contains(low, "prompt length") && strings.Contains(low, "tokens") ||
 		(strings.Contains(low, "invalid-argument") && strings.Contains(low, "500000"))
+}
+
+// isGrokFreeUsageExhausted detects xAI Build free-tier rolling-window exhaustion
+// (HTTP 429 body code "subscription:free-usage-exhausted"). This is a real quota
+// hit, not a brief rate limit — accounts should be cooled down / disabled.
+func isGrokFreeUsageExhausted(msg string) bool {
+	low := strings.ToLower(msg)
+	return strings.Contains(low, "free-usage-exhausted") ||
+		strings.Contains(low, "included free usage") ||
+		(strings.Contains(low, "free usage") && strings.Contains(low, "exhausted")) ||
+		strings.Contains(low, "grok-4.5-build-free")
 }
 
 // stripThinkTags removes stray <think>/</think> markers that Grok sometimes leaks
@@ -2632,6 +2644,13 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	if displayModel != "" {
 		responseModel = displayModel
 	}
+	// On the silent disguise path, req.Model has already been rewritten to the
+	// upstream Grok id (e.g. grok-4.5-high). Log + bill against the CUSTOMER's
+	// requested model so request logs never show "grok-*" for silent traffic.
+	logModel := clientModel
+	if silent {
+		logModel = responseModel
+	}
 
 	logEndpoint := "openai-grok"
 	if format == "claude" {
@@ -2644,7 +2663,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 
 	sendErr := func(status int, errType, msg string) {
 		// Admin request log table previously only recorded successes for Grok.
-		h.recordFailureWithDetails(logEndpoint, clientModel, lastTriedAccountID, fmt.Errorf("%s", msg))
+		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		// Re-map through Kiro-style classifier (status/type may be overridden).
 		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
@@ -2787,7 +2806,29 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if resp.StatusCode == 429 || resp.StatusCode == 502 || resp.StatusCode == 503 {
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastErr = fmt.Errorf("transient HTTP %d: %s", resp.StatusCode, truncateStr(string(b), 200))
+				bodyStr := string(b)
+				// free-usage-exhausted is a real quota hit (rolling 24h), NOT a transient
+				// rate-limit blip. Cooldown the account so we stop hammering it; keep the
+				// customer-facing lastErr short (no provider model names / JSON dumps).
+				// Do NOT Release here — fall through to the outer err/resp==nil path which
+				// excludes + RecordError + Release once.
+				if resp.StatusCode == 429 && isGrokFreeUsageExhausted(bodyStr) {
+					logger.Warnf("[Grok] free-usage exhausted account=%s body=%s", acc.Email, truncateStr(bodyStr, 200))
+					_ = config.SetGrokAccountQuota(acc.ID, "exhausted", "Usage limit reached (cooldown 10m)", 0, 0)
+					gp.Cooldown(acc.ID, "free usage exhausted", 10*time.Minute)
+					streak := gp.RecordQuota402(acc.ID) // reuse consecutive-quota counter
+					if streak >= grokQuota402DisableThreshold {
+						reason := fmt.Sprintf("Free usage exhausted (%d consecutive) — auto-disabled %s", streak, time.Now().Format("2006-01-02 15:04"))
+						gp.Disable(acc.ID, reason)
+						gp.ResetQuota402(acc.ID)
+						logger.Errorf("[Grok] account=%s DISABLED after %d consecutive free-usage 429 — admin must re-enable", acc.Email, streak)
+					}
+					lastErr = fmt.Errorf("Usage limit reached")
+					resp = nil
+					err = fmt.Errorf("quota exhausted")
+					break // do not retry same account
+				}
+				lastErr = fmt.Errorf("transient HTTP %d: %s", resp.StatusCode, truncateStr(bodyStr, 200))
 				logger.Warnf("[Grok] transient %d try=%d %s", resp.StatusCode, tTry+1, acc.Email)
 				resp = nil
 				continue
@@ -2901,7 +2942,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if cErr != nil {
 				logger.Warnf("[Grok] live stream error after start: %v", cErr)
 				// headers already sent — cannot retry accounts
-				h.recordFailureWithDetails(logEndpoint, clientModel, acc.ID, cErr)
+				h.recordFailureWithDetails(logEndpoint, logModel, acc.ID, cErr)
 				gp.RecordError(acc.ID)
 				gp.Release(acc.ID)
 				return
@@ -2950,7 +2991,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
 		gp.RecordSuccess(acc.ID)
 		gp.UpdateStats(acc.ID, result.InTok+result.OutTok, credits)
-		h.recordSuccessLog(logEndpoint, clientModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(logEndpoint, logModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
 		logger.Infof("[Grok] done display=%s outTok=%d textLen=%d incomplete=%v stream=%v ms=%d",
 			responseModel, result.OutTok, len([]rune(result.Text)), result.Incomplete, stream, time.Since(reqStart).Milliseconds())
 

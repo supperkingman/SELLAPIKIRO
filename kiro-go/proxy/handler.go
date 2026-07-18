@@ -1600,6 +1600,9 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
+// Silent disguise paths (openai-grok-silent / claude-grok-silent / *-codex-silent)
+// are rewritten so the admin/customer-facing log never leaks the real provider
+// name, upstream model id, or raw provider error body.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
@@ -1609,6 +1612,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	}
 
 	errMsg := err.Error()
+	endpoint, model, errMsg = scrubSilentRequestLog(endpoint, model, errMsg)
 	errType := classifyError(errMsg)
 
 	entry := RequestLog{
@@ -1626,6 +1630,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 
 // recordSuccessLog records a successful request in the request logs.
 func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+	endpoint, model, _ = scrubSilentRequestLog(endpoint, model, "")
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
 		Endpoint:  endpoint,
@@ -1638,6 +1643,82 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int
 	}
 
 	h.appendRequestLog(entry)
+}
+
+// scrubSilentRequestLog rewrites silent-disguise log fields so the request log
+// table never exposes Grok/Codex as the real backend. Endpoint becomes the
+// customer-facing API family (openai/claude); raw provider error bodies become
+// short Kiro-style public messages; bare "grok-*" model ids are left as-is only
+// when the customer explicitly requested a Grok model (non-silent path).
+func scrubSilentRequestLog(endpoint, model, errMsg string) (string, string, string) {
+	ep := strings.ToLower(strings.TrimSpace(endpoint))
+	silent := strings.Contains(ep, "silent") || strings.Contains(ep, "grok-silent") || strings.Contains(ep, "codex-silent")
+	if !silent {
+		// Still scrub raw provider dumps that mention free-usage / schema validation
+		// when they would otherwise surface in shared UIs.
+		if errMsg != "" && (strings.Contains(strings.ToLower(errMsg), "grok-") ||
+			strings.Contains(strings.ToLower(errMsg), "xai") ||
+			strings.Contains(strings.ToLower(errMsg), "free-usage") ||
+			strings.Contains(strings.ToLower(errMsg), "schema validation")) {
+			// Keep classifyable short form for non-silent; full body stays in server logs only.
+			errMsg = sanitizeRequestLogError(errMsg)
+		}
+		return endpoint, model, errMsg
+	}
+
+	// Endpoint: openai-grok-silent / claude-grok-silent / openai-codex-silent → openai/claude
+	switch {
+	case strings.Contains(ep, "claude"):
+		endpoint = "claude"
+	case strings.Contains(ep, "openai"):
+		endpoint = "openai"
+	default:
+		endpoint = "openai"
+	}
+
+	// Model: if the log still carries the upstream disguise model (grok-4.5-high),
+	// replace with a neutral placeholder only when it looks like a provider id.
+	// Callers on the silent path should already pass the customer display model;
+	// this is a safety net.
+	ml := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(ml, "grok-") || strings.HasPrefix(ml, "cx/") || strings.HasPrefix(ml, "codex/") {
+		model = "claude-opus-4.8"
+	}
+
+	if errMsg != "" {
+		errMsg = sanitizeRequestLogError(errMsg)
+	}
+	return endpoint, model, errMsg
+}
+
+// sanitizeRequestLogError turns raw upstream bodies into short safe messages for
+// the request-log table (never store provider JSON / model names).
+func sanitizeRequestLogError(msg string) string {
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "schema validation") || strings.Contains(low, "required: null") ||
+		strings.Contains(low, "invalid-argument") && strings.Contains(low, "schema"):
+		return "Invalid request content (tool schema)"
+	case strings.Contains(low, "free-usage-exhausted") || strings.Contains(low, "usage limit") ||
+		strings.Contains(low, "quota") || strings.Contains(low, "402"):
+		return "Usage limit reached"
+	case strings.Contains(low, "429") || (strings.Contains(low, "rate") && strings.Contains(low, "limit")):
+		return "Rate limit reached"
+	case strings.Contains(low, "401") || strings.Contains(low, "403") || strings.Contains(low, "auth"):
+		return "Authentication failed"
+	case strings.Contains(low, "prompt") && strings.Contains(low, "long") ||
+		strings.Contains(low, "context") && strings.Contains(low, "window") ||
+		strings.Contains(low, "input is too long") || strings.Contains(low, "content_length"):
+		return "Request too large for model context window"
+	case strings.Contains(low, "no available accounts"):
+		return "No available accounts"
+	default:
+		// Drop provider dumps; keep a short generic label.
+		if len(msg) > 80 || strings.Contains(msg, "{") {
+			return "Upstream request failed"
+		}
+		return msg
+	}
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
