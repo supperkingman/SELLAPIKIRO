@@ -1572,7 +1572,10 @@ func collectGrokResponse(body io.Reader) (grokCollectResult, error) {
 	if bestThink != "" && len([]rune(bestThink)) >= len([]rune(thinking)) {
 		thinking = bestThink
 	}
-	res.Thinking = thinking
+	// Thinking from completed snapshot is raw; strip tags here. Identity scrub
+	// (Grok/xAI → Claude) happens later at the silent-path write site where we
+	// know the disguise target.
+	res.Thinking = stripThinkTags(thinking)
 	if res.OutTok <= 0 {
 		res.OutTok = maxInt(1, len([]rune(text))/4)
 	}
@@ -2060,7 +2063,7 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		// "I'm actually Grok, built by xAI" in its thinking, which otherwise
 		// streams verbatim to the client. Same scrub as visible text.
 		d = stripThinkTags(d)
-		d = maybeRewriteAssistantText(d, silent)
+		d = maybeRewriteAssistantTextForTarget(d, silent, disguiseTargetForModel(model))
 		if d == "" {
 			return
 		}
@@ -2240,7 +2243,7 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		return res, err
 	}
 
-		gotThink := thinkingAssembled.String()
+	gotThink := thinkingAssembled.String()
 	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(gotThink)) {
 		rest := bestThinking
 		if gotThink != "" && strings.HasPrefix(bestThinking, gotThink) {
@@ -2252,17 +2255,23 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		}
 	}
 
-got := assembled.String()
+	got := assembled.String()
 	if bestFull != "" && len([]rune(bestFull)) > len([]rune(got)) {
 		rest := bestFull
 		if got != "" && strings.HasPrefix(bestFull, got) {
 			rest = strings.TrimPrefix(bestFull, got)
 		}
 		if rest != "" {
-			logger.Infof("[Grok] live OpenAI gap-fill +%d runes", len([]rune(rest)))
-			writeChunk(map[string]interface{}{"content": rest}, nil)
-			assembled.WriteString(rest)
-			got = assembled.String()
+			// Scrub before writing — bestFull is the raw completed snapshot and may
+			// contain Grok/xAI self-ID that was never seen in per-delta scrubbing.
+			rest = stripThinkTags(rest)
+			rest = maybeRewriteAssistantTextForTarget(rest, silent, disguiseTargetForModel(model))
+			if rest != "" {
+				logger.Infof("[Grok] live OpenAI gap-fill +%d runes", len([]rune(rest)))
+				writeChunk(map[string]interface{}{"content": rest}, nil)
+				assembled.WriteString(rest)
+				got = assembled.String()
+			}
 		}
 	}
 	finishFC()
@@ -2274,7 +2283,13 @@ got := assembled.String()
 	res.Text = got
 	res.Thinking = thinkingAssembled.String()
 	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(res.Thinking)) {
-		res.Thinking = bestThinking
+		// bestThinking is raw upstream; scrub before storing so any non-stream
+		// consumer of res.Thinking never sees Grok self-ID.
+		scrubbed := stripThinkTags(bestThinking)
+		scrubbed = maybeRewriteAssistantTextForTarget(scrubbed, silent, disguiseTargetForModel(model))
+		if scrubbed != "" {
+			res.Thinking = scrubbed
+		}
 	}
 	res.ToolCalls = toolCalls
 	if res.OutTok <= 0 {
@@ -2602,7 +2617,12 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 	res.Text = got
 	res.Thinking = thinkingAssembled.String()
 	if bestThinking != "" && len([]rune(bestThinking)) > len([]rune(res.Thinking)) {
-		res.Thinking = bestThinking
+		// bestThinking is raw upstream; scrub before storing.
+		scrubbed := stripThinkTags(bestThinking)
+		scrubbed = maybeRewriteAssistantTextForTarget(scrubbed, silent, disguiseTargetForModel(model))
+		if scrubbed != "" {
+			res.Thinking = scrubbed
+		}
 	}
 	res.ToolCalls = toolCalls
 	if res.OutTok <= 0 {
@@ -2963,8 +2983,14 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			result.InTok = estimateOpenAIRequestInputTokens(req)
 		}
 		// Disguise: rewrite Grok self-ID when silent; fix token estimates to Claude-like scale.
+		// Apply to BOTH text and thinking, for BOTH claude and openai formats — non-stream
+		// collect path only strips think tags, it does not know the disguise target.
+		if silent {
+			target := disguiseTargetForModel(responseModel)
+			result.Text = maybeRewriteAssistantTextForTarget(result.Text, true, target)
+			result.Thinking = maybeRewriteAssistantTextForTarget(result.Thinking, true, target)
+		}
 		if format == "claude" {
-			result.Text = maybeRewriteAssistantText(result.Text, silent)
 			// Prefer char-based estimate when upstream usage looks inflated/odd for short replies.
 			est := estimateClaudeishOutputTokens(result.Text, len(result.ToolCalls))
 			if result.OutTok <= 0 || (len([]rune(result.Text)) > 0 && result.OutTok > est*4 && est > 0) {
