@@ -284,6 +284,37 @@ func clampCodexEffort(effort string) string {
 	}
 }
 
+// fixCodexFunctionCallIDs normalizes function_call item ids for ChatGPT Codex.
+// Codex's Responses API requires every function_call item's "id" to begin with
+// "fc" (e.g. "fc_..."); it rejects the request with HTTP 400
+// ("Invalid 'input[n].id': ... Expected an ID that begins with 'fc'.") otherwise.
+// kiro-go's shared OpenAI->Responses converter sets id == call_id (e.g. "call_.."
+// or a client "toolu_..." id), which is valid for Grok but not Codex. This runs
+// only on the Codex path: it prefixes any non-conforming id with "fc_" and leaves
+// call_id (which pairs the call with its function_call_output) untouched.
+func fixCodexFunctionCallIDs(input []map[string]interface{}) []map[string]interface{} {
+	for _, item := range input {
+		t, _ := item["type"].(string)
+		if t != "function_call" {
+			continue
+		}
+		id, _ := item["id"].(string)
+		if id == "" {
+			// No id: derive from call_id so the item still carries a valid fc id.
+			if cid, ok := item["call_id"].(string); ok && cid != "" {
+				item["id"] = "fc_" + strings.TrimPrefix(cid, "fc_")
+			} else {
+				item["id"] = "fc_" + uuid.New().String()
+			}
+			continue
+		}
+		if !strings.HasPrefix(id, "fc") {
+			item["id"] = "fc_" + id
+		}
+	}
+	return input
+}
+
 func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayModel string) map[string]interface{} {
 	// Defensive clamp: ChatGPT Codex only accepts none/low/medium/high/xhigh.
 	// Anything else (e.g. "minimal", "max", or a stray suffix) returns HTTP 400
@@ -292,7 +323,7 @@ func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayMod
 	effort = clampCodexEffort(effort)
 	body := map[string]interface{}{
 		"model":  upstreamModel,
-		"input":  openaiMessagesToGrokInput(req.Messages),
+		"input":  fixCodexFunctionCallIDs(openaiMessagesToGrokInput(req.Messages)),
 		"stream": true,
 		"store":  false,
 		"reasoning": map[string]interface{}{
