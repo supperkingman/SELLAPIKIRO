@@ -2647,14 +2647,18 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 }
 
 func (h *Handler) handleGrokOpenAIChat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest) {
-	h.handleGrokWithFormat(w, r, req, "openai", "")
+	if !h.handleGrokWithFormat(w, r, req, "openai", "") {
+		h.sendOpenAIError(w, 503, "server_error", withSupportHint("No available accounts"))
+	}
 }
 
 func (h *Handler) handleGrokClaudeMessages(w http.ResponseWriter, r *http.Request, req *ClaudeRequest) {
-	h.handleGrokWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "")
+	if !h.handleGrokWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "") {
+		h.sendClaudeError(w, 503, "api_error", withSupportHint("No available accounts"))
+	}
 }
 
-func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string) {
+func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string) bool {
 	reqStart := time.Now()
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	stream := req.Stream
@@ -2680,6 +2684,10 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		logEndpoint += "-silent"
 	}
 	lastTriedAccountID := ""
+	// served is true only when we wrote a successful response (or a mid-stream
+	// error after headers). Terminal pool-empty 503s leave served=false so
+	// silent callers can try Codex / the other provider.
+	served := false
 
 	sendErr := func(status int, errType, msg string) {
 		// Admin request log table previously only recorded successes for Grok.
@@ -2707,6 +2715,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 
 		// Already streaming: Anthropic SSE error event (same shape as Kiro mid-stream).
 		if stream && w.Header().Get("Content-Type") != "" {
+			served = true // headers already out; cannot cascade to another provider
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
 				h.sendSSE(w, fl, "error", map[string]interface{}{
 					"type": "error", "error": map[string]string{"type": errType, "message": msg},
@@ -2725,6 +2734,11 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		}
 
 		// Non-stream / before body: match Kiro sendClaudeError / sendOpenAIError exactly.
+		// Silent path: do NOT write the body yet — caller may cascade (Codex ↔ Grok).
+		if silent {
+			return
+		}
+		served = true
 		if format == "claude" {
 			h.sendClaudeError(w, status, errType, msg)
 			return
@@ -2738,7 +2752,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	}
 	if gp.Count() == 0 {
 		sendErr(503, "api_error", "No available accounts")
-		return
+		return served
 	}
 
 	upstreamModel, effort := ResolveGrokModel(clientModel)
@@ -2942,7 +2956,17 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			if isGrokPromptTooLongError(bodyStr) || isGrokPromptTooLongError(lastErr.Error()) {
 				logger.Warnf("[Grok] prompt too long account=%s — stop failover", acc.Email)
 				sendErr(400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
-				return
+				// Non-silent: sendErr already wrote body (served=true). Silent: still
+				// stop cascade — same prompt is too long on every provider account.
+				if silent && !served {
+					served = true
+					if format == "claude" {
+						h.sendClaudeError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
+					} else {
+						h.sendOpenAIError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
+					}
+				}
+				return served
 			}
 			continue
 		}
@@ -2961,11 +2985,11 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			resp.Body.Close()
 			if cErr != nil {
 				logger.Warnf("[Grok] live stream error after start: %v", cErr)
-				// headers already sent — cannot retry accounts
+				// headers already sent — cannot retry accounts or cascade
 				h.recordFailureWithDetails(logEndpoint, logModel, acc.ID, cErr)
 				gp.RecordError(acc.ID)
 				gp.Release(acc.ID)
-				return
+				return true
 			}
 		} else {
 			result, cErr = collectGrokResponse(resp.Body)
@@ -3024,7 +3048,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		if stream {
 			// live path already wrote SSE to completion
 			gp.Release(acc.ID)
-			return
+			return true
 		}
 		if format == "claude" {
 			if len(result.ToolCalls) > 0 && stopReason == "end_turn" {
@@ -3038,10 +3062,11 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 			writeOpenAIJSONWithToolsAndThinking(w, responseModel, result.Text, result.Thinking, result.InTok, result.OutTok, finish, result.ToolCalls)
 		}
 		gp.Release(acc.ID)
-		return
+		return true
 	}
 
 	// Same end-state as Kiro when pool exhausted: 503 + "No available accounts" (+ support contact).
+	// Silent: sendErr does not write body so caller can cascade to Codex.
 	msg := "No available accounts"
 	if lastErr != nil {
 		msg = lastErr.Error()
@@ -3049,6 +3074,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	logger.Warnf("[Grok] FAIL all accounts silent=%v display=%s available=%d excluded=%d last=%v",
 		silent, responseModel, gp.AvailableCount(), len(excluded), lastErr)
 	sendErr(503, "api_error", msg)
+	return served
 }
 
 
@@ -3067,8 +3093,8 @@ func (h *Handler) trySilentGrokClaudeFallback(w http.ResponseWriter, r *http.Req
 	oai.Model = silentGrokUpstreamForDisplay(requestedModel)
 	oai.MaxTokens = 0
 	logger.Infof("[GrokSilent] claude %s -> %s", requestedModel, oai.Model)
-	h.handleGrokWithFormat(w, r, oai, "claude", requestedModel)
-	return true
+	// false when every Grok account failed before writing — caller may try Codex.
+	return h.handleGrokWithFormat(w, r, oai, "claude", requestedModel)
 }
 
 func (h *Handler) trySilentGrokOpenAIFallback(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, requestedModel string) bool {
@@ -3086,8 +3112,7 @@ func (h *Handler) trySilentGrokOpenAIFallback(w http.ResponseWriter, r *http.Req
 	proxyReq.Model = silentGrokUpstreamForDisplay(requestedModel)
 	proxyReq.MaxTokens = 0
 	logger.Infof("[GrokSilent] openai %s -> %s", requestedModel, proxyReq.Model)
-	h.handleGrokWithFormat(w, r, &proxyReq, "openai", requestedModel)
-	return true
+	return h.handleGrokWithFormat(w, r, &proxyReq, "openai", requestedModel)
 }
 
 func (h *Handler) kiroPoolEmpty() bool {

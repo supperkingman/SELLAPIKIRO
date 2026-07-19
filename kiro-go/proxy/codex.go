@@ -1,4 +1,4 @@
-// Package proxy — OpenAI Codex (ChatGPT backend) provider path.
+﻿// Package proxy â€” OpenAI Codex (ChatGPT backend) provider path.
 // Mirrors the Grok flow: separate account pool, rotation, cooldown/health-check,
 // silent disguise (impersonate the customer's displayed model), identity scrubbing.
 //
@@ -67,7 +67,7 @@ func getCodexHTTPClient(acc *config.CodexAccount) *http.Client {
 		return codexHTTPClient
 	}
 	return &http.Client{
-		// No total timeout — see codexHTTPClient note (long streams read body > 20m).
+		// No total timeout â€” see codexHTTPClient note (long streams read body > 20m).
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyURL(pu),
 			MaxIdleConns:          64,
@@ -269,13 +269,17 @@ func (h *Handler) handleCodexOpenAIChat(w http.ResponseWriter, r *http.Request, 
 	// Codex-family cascade: Codex -> Kiro (native gpt-5.6) -> Grok (disguised as gpt-5.6).
 	orig := *req
 	fallback := func() bool { return h.codexFallbackOpenAI(w, r, &orig) }
-	h.handleCodexWithFormat(w, r, req, "openai", "", fallback)
+	if !h.handleCodexWithFormat(w, r, req, "openai", "", fallback) {
+		h.sendOpenAIError(w, 503, "server_error", withSupportHint("No available accounts"))
+	}
 }
 
 func (h *Handler) handleCodexClaudeMessages(w http.ResponseWriter, r *http.Request, req *ClaudeRequest) {
 	orig := *req
 	fallback := func() bool { return h.codexFallbackClaude(w, r, &orig) }
-	h.handleCodexWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "", fallback)
+	if !h.handleCodexWithFormat(w, r, claudeRequestToOpenAI(req), "claude", "", fallback) {
+		h.sendClaudeError(w, 503, "api_error", withSupportHint("No available accounts"))
+	}
 }
 
 // codexFallbackClaude serves a Codex-family Claude request via Kiro (native
@@ -353,7 +357,7 @@ func (h *Handler) codexFallbackOpenAI(w http.ResponseWriter, r *http.Request, re
 // account failed) AND nothing has been written to the client yet; it returns true
 // if it produced the response (Kiro or Grok), letting the customer's gpt model stay
 // resilient without leaking the real backend.
-func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string, fallback func() bool) {
+func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, format, displayModel string, fallback func() bool) bool {
 	reqStart := time.Now()
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	stream := req.Stream
@@ -378,6 +382,9 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		logEndpoint += "-silent"
 	}
 	lastTriedAccountID := ""
+	// served=true when a response (or mid-stream error) was written to the client.
+	// Terminal silent 503 leaves served=false so trySilent* can cascade to Grok.
+	served := false
 
 	sendErr := func(status int, errType, msg string) {
 		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
@@ -399,6 +406,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		}
 		msg = public
 		if stream && w.Header().Get("Content-Type") != "" {
+			served = true
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
 				h.sendSSE(w, fl, "error", map[string]interface{}{
 					"type": "error", "error": map[string]string{"type": errType, "message": msg},
@@ -415,6 +423,11 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 		}
+		// Silent: do not write body — caller may cascade to Grok.
+		if silent {
+			return
+		}
+		served = true
 		if format == "claude" {
 			h.sendClaudeError(w, status, errType, msg)
 			return
@@ -429,10 +442,10 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 	if cp.Count() == 0 {
 		// No Codex account: cascade to Kiro -> Grok before erroring.
 		if fallback != nil && fallback() {
-			return
+			return true
 		}
 		sendErr(503, "api_error", "No available accounts")
-		return
+		return served
 	}
 
 	upstreamModel, effort := ResolveCodexModel(clientModel)
@@ -546,7 +559,15 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			cp.Release(acc.ID)
 			if isGrokPromptTooLongError(bodyStr) {
 				sendErr(400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
-				return
+				if silent && !served {
+					served = true
+					if format == "claude" {
+						h.sendClaudeError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
+					} else {
+						h.sendOpenAIError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
+					}
+				}
+				return served
 			}
 			continue
 		}
@@ -565,7 +586,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 				h.recordFailureWithDetails(logEndpoint, logModel, acc.ID, cErr)
 				cp.RecordError(acc.ID)
 				cp.Release(acc.ID)
-				return
+				return true
 			}
 		} else {
 			result, cErr = collectGrokResponse(resp.Body)
@@ -619,7 +640,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 
 		if stream {
 			cp.Release(acc.ID)
-			return
+			return true
 		}
 		if format == "claude" {
 			if len(result.ToolCalls) > 0 && stopReason == "end_turn" {
@@ -633,7 +654,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			writeOpenAIJSONWithToolsAndThinking(w, responseModel, result.Text, result.Thinking, result.InTok, result.OutTok, finish, result.ToolCalls)
 		}
 		cp.Release(acc.ID)
-		return
+		return true
 	}
 
 	msg := "No available accounts"
@@ -644,9 +665,10 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 	// Every Codex account failed. If we have not written anything to the client yet
 	// (non-stream, or stream that never started), cascade to Kiro -> Grok.
 	if fallback != nil && fallback() {
-		return
+		return true
 	}
 	sendErr(503, "api_error", msg)
+	return served
 }
 
 // trySilentCodexClaudeFallback serves a Claude request via Codex (disguised).
@@ -665,8 +687,8 @@ func (h *Handler) trySilentCodexClaudeFallback(w http.ResponseWriter, r *http.Re
 	oai.Model = silentCodexUpstreamForDisplay(requestedModel)
 	oai.MaxTokens = 0
 	logger.Infof("[CodexSilent] claude %s -> %s", requestedModel, oai.Model)
-	h.handleCodexWithFormat(w, r, oai, "claude", requestedModel, nil)
-	return true
+	// false when every Codex account failed before writing — caller may try Grok.
+	return h.handleCodexWithFormat(w, r, oai, "claude", requestedModel, nil)
 }
 
 // trySilentCodexOpenAIFallback serves an OpenAI request via Codex (disguised).
@@ -685,8 +707,7 @@ func (h *Handler) trySilentCodexOpenAIFallback(w http.ResponseWriter, r *http.Re
 	proxyReq.Model = silentCodexUpstreamForDisplay(requestedModel)
 	proxyReq.MaxTokens = 0
 	logger.Infof("[CodexSilent] openai %s -> %s", requestedModel, proxyReq.Model)
-	h.handleCodexWithFormat(w, r, &proxyReq, "openai", requestedModel, nil)
-	return true
+	return h.handleCodexWithFormat(w, r, &proxyReq, "openai", requestedModel, nil)
 }
 
 // codexPoolReady reports whether at least one Codex account is available.
