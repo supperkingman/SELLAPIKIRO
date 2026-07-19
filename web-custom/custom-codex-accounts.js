@@ -128,7 +128,8 @@
       (a.planType ? ' <span style="font-size:11px;color:#10a37f;border:1px solid #10a37f;border-radius:4px;padding:0 4px">' + esc(a.planType) + '</span>' : '') +
       '</div>' +
       '<div style="font-size:11.5px;color:var(--muted-foreground,#8b93a9)">' + status + quota +
-      ' · tokens=' + (a.totalTokens || 0) + ' · credits=' + (a.totalCredits || 0) +
+      ' · reqs=' + (a.requestCount || 0) +
+      ' · tokens=' + (a.totalTokens || 0) + ' · credits=' + (Number(a.totalCredits || 0).toFixed(2)) +
       ' · exp=' + fmtTime(a.expiresAt) + '</div>' +
       '</div>' +
       '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
