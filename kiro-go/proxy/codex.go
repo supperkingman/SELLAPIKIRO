@@ -32,7 +32,7 @@ const (
 	codexOriginator   = "codex_cli_rs"
 	codexUserAgent    = "codex_cli_rs/0.20.0 (linux; x86_64)"
 	// Silent upstream model for disguise (min effort high; thinking -> xhigh).
-	codexSilentUpstream = "gpt-5.6-sol"
+	codexSilentUpstream  = "gpt-5.6-sol"
 	codexMaxOutputTokens = 65536
 )
 
@@ -102,37 +102,57 @@ func IsExplicitCodexModel(model string) bool {
 }
 
 // ResolveCodexModel maps a client model id to an upstream model + effort.
-// Suffixes -low/-medium/-high/-xhigh(-max) set the reasoning effort (default high).
+// Suffixes -low/-medium/-high/-xhigh/-max set the reasoning effort (default high).
+// The UI-compatible -thinking alias maps to xhigh unless an explicit effort suffix
+// is also present. Every recognized suffix is stripped before calling ChatGPT Codex.
 func ResolveCodexModel(clientModel string) (upstreamModel, effort string) {
 	m := strings.ToLower(strings.TrimSpace(clientModel))
 	m = strings.TrimPrefix(m, "cx/")
 	m = strings.TrimPrefix(m, "codex/")
+	m = strings.TrimPrefix(m, "codex-")
 	effort = "high"
-	switch {
-	case strings.HasSuffix(m, "-max"):
-		// "max" is its own tier (highest reasoning budget + credit multiplier).
-		effort = "max"
-		m = strings.TrimSuffix(m, "-max")
-	case strings.HasSuffix(m, "-xhigh"):
-		effort = "xhigh"
-		m = strings.TrimSuffix(m, "-xhigh")
-	case strings.HasSuffix(m, "-high"):
-		effort = "high"
-		m = strings.TrimSuffix(m, "-high")
-	case strings.HasSuffix(m, "-medium"):
-		effort = "medium"
-		m = strings.TrimSuffix(m, "-medium")
-	case strings.HasSuffix(m, "-low"):
-		effort = "low"
-		m = strings.TrimSuffix(m, "-low")
-	case strings.HasSuffix(m, "-minimal"):
-		effort = "minimal"
-		m = strings.TrimSuffix(m, "-minimal")
+	effortExplicit := false
+	thinkingAlias := false
+	for {
+		switch {
+		case strings.HasSuffix(m, "-thinking"):
+			thinkingAlias = true
+			m = strings.TrimSuffix(m, "-thinking")
+		case strings.HasSuffix(m, "-max"):
+			// "max" is its own tier (highest reasoning budget + credit multiplier).
+			effort = "max"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-max")
+		case strings.HasSuffix(m, "-xhigh"):
+			effort = "xhigh"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-xhigh")
+		case strings.HasSuffix(m, "-high"):
+			effort = "high"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-high")
+		case strings.HasSuffix(m, "-medium"):
+			effort = "medium"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-medium")
+		case strings.HasSuffix(m, "-low"):
+			effort = "low"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-low")
+		case strings.HasSuffix(m, "-minimal"):
+			effort = "minimal"
+			effortExplicit = true
+			m = strings.TrimSuffix(m, "-minimal")
+		default:
+			if thinkingAlias && !effortExplicit {
+				effort = "xhigh"
+			}
+			if m == "" {
+				m = codexSilentUpstream
+			}
+			return m, effort
+		}
 	}
-	if m == "" {
-		m = codexSilentUpstream
-	}
-	return m, effort
 }
 
 // silentCodexUpstreamForDisplay picks upstream model/effort for disguise.
@@ -565,25 +585,22 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			}
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(detail, 400))
 			logger.Warnf("[Codex] HTTP %d account=%s email=%s detail=%s", resp.StatusCode, acc.ID, acc.Email, truncateStr(detail, 240))
-			excluded[acc.ID] = true
-			cp.RecordError(acc.ID)
 			cp.Release(acc.ID)
-			if isGrokPromptTooLongError(bodyStr) {
-				sendErr(400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
-				if silent && !served {
-					served = true
-					if format == "claude" {
-						h.sendClaudeError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
-					} else {
-						h.sendOpenAIError(w, 400, "invalid_request_error", "Request too large for model context window. Reduce conversation/tool output size and retry.")
-					}
+
+			// HTTP 400 is caused by this model/body, not by the selected account.
+			// Rotating through every account and cooling each one turns one malformed
+			// request into a pool-wide outage (the next valid request then gets 503).
+			if resp.StatusCode == http.StatusBadRequest {
+				msg := detail
+				if isGrokPromptTooLongError(bodyStr) {
+					msg = "Request too large for model context window. Reduce conversation/tool output size and retry."
 				}
+				sendErr(http.StatusBadRequest, "invalid_request_error", msg)
 				return served
 			}
-			// Soft-cooldown on hard auth/parameter errors so rotation prefers the other account.
-			if resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
-				cp.Cooldown(acc.ID, detail, 2*time.Minute)
-			}
+
+			excluded[acc.ID] = true
+			cp.RecordError(acc.ID)
 			continue
 		}
 
@@ -648,6 +665,11 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 
 		credits := GrokCreditsForRequest(effort, result.InTok+result.OutTok)
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
+		// A real completed response is stronger evidence than an older transient
+		// failure: recover the account immediately instead of waiting up to a minute
+		// for the background hello probe to clear its stale cooldown.
+		cp.ClearCooldown(acc.ID)
+		_ = config.SetCodexAccountQuota(acc.ID, "active", "", -1, 0)
 		cp.RecordSuccess(acc.ID)
 		cp.UpdateStats(acc.ID, result.InTok+result.OutTok, credits)
 		h.recordSuccessLog(logEndpoint, logModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
