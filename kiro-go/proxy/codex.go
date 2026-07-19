@@ -1,4 +1,4 @@
-﻿// Package proxy â€” OpenAI Codex (ChatGPT backend) provider path.
+// Package proxy â€” OpenAI Codex (ChatGPT backend) provider path.
 // Mirrors the Grok flow: separate account pool, rotation, cooldown/health-check,
 // silent disguise (impersonate the customer's displayed model), identity scrubbing.
 //
@@ -136,13 +136,15 @@ func ResolveCodexModel(clientModel string) (upstreamModel, effort string) {
 }
 
 // silentCodexUpstreamForDisplay picks upstream model/effort for disguise.
-// Uses gpt-5.6-sol: thinking UI -> xhigh, otherwise high. (Explicit gpt-5.6-sol-max
-// requests keep max via ResolveCodexModel; silent disguise never downgrades below high.)
+// ChatGPT Codex only accepts bare model ids (e.g. gpt-5.6-sol). Effort suffixes
+// like -high/-xhigh on the model id return 400 "model is not supported".
+// ResolveCodexModel still parses effort from these composite ids for the
+// reasoning.effort field; the model string itself is stripped of the suffix.
 func silentCodexUpstreamForDisplay(displayModel string) string {
 	if modelWantsThinkingUI(displayModel) {
-		return "gpt-5.6-sol-xhigh"
+		return "gpt-5.6-sol-xhigh" // ResolveCodexModel -> model=gpt-5.6-sol, effort=xhigh
 	}
-	return "gpt-5.6-sol-high"
+	return "gpt-5.6-sol-high" // ResolveCodexModel -> model=gpt-5.6-sol, effort=high
 }
 
 func (h *Handler) ensureValidCodexToken(acc *config.CodexAccount) error {
@@ -229,20 +231,17 @@ func buildCodexHeaders(acc *config.CodexAccount, sessionID string) http.Header {
 
 // buildCodexRequestBody builds a Responses API body for Codex.
 // Reuses the Grok converters since both use the same Responses schema.
+//
+// IMPORTANT: ChatGPT Codex (chatgpt.com/backend-api/codex/responses) rejects
+// max_output_tokens with HTTP 400 "Unsupported parameter: max_output_tokens".
+// Grok accepts that field; Codex must omit it. Effort stays in reasoning.effort
+// (never as a model-id suffix like gpt-5.6-sol-high — that also 400s).
 func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayModel string) map[string]interface{} {
-	maxOut := codexMaxOutputTokens
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low":
-		maxOut = 16384
-	case "medium":
-		maxOut = 32768
-	}
 	body := map[string]interface{}{
-		"model":             upstreamModel,
-		"input":             openaiMessagesToGrokInput(req.Messages),
-		"stream":            true,
-		"store":             false,
-		"max_output_tokens": maxOut,
+		"model":  upstreamModel,
+		"input":  openaiMessagesToGrokInput(req.Messages),
+		"stream": true,
+		"store":  false,
 		"reasoning": map[string]interface{}{
 			"effort":  effort,
 			"summary": grokReasoningSummary(effort),

@@ -417,7 +417,8 @@ func parseCodexAccountJSON(raw []byte) (*config.CodexAccount, error) {
 	return acc, nil
 }
 
-// testCodexAccountHello sends a tiny non-stream request to verify the account works.
+// testCodexAccountHello sends a tiny stream request to verify the account works.
+// ChatGPT Codex rejects max_output_tokens — do not set it here.
 func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]interface{} {
 	out := map[string]interface{}{
 		"id": acc.ID, "email": acc.Email, "enabled": acc.Enabled, "ok": false,
@@ -429,12 +430,11 @@ func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]int
 		return out
 	}
 	probe := &OpenAIRequest{
-		Model:    "gpt-5.5",
+		Model:    "gpt-5.6-sol",
 		Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
-		Stream:   false,
+		Stream:   true,
 	}
-	body := buildCodexRequestBody(probe, "gpt-5.5", "low", "gpt-5.5")
-	body["max_output_tokens"] = 16
+	body := buildCodexRequestBody(probe, "gpt-5.6-sol", "low", "gpt-5.6-sol")
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequest(http.MethodPost, codexResponsesURL, strings.NewReader(string(raw)))
 	if err != nil {
@@ -443,7 +443,6 @@ func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]int
 		return out
 	}
 	httpReq.Header = buildCodexHeaders(acc, uuid.New().String())
-	httpReq.Header.Set("Accept", "application/json")
 	resp, err := getCodexHTTPClient(acc).Do(httpReq)
 	if err != nil {
 		out["status"] = "network_error"
