@@ -122,22 +122,28 @@
   function accRow(a) {
     var status = a.enabled ? '<span style="color:#34d399">enabled</span>' : '<span style="color:#f87171">disabled</span>';
     var quota = a.quotaStatus ? ' · <span style="color:var(--muted-foreground,#8b93a9)">' + esc(a.quotaStatus) + '</span>' : '';
-    var reqs = a.requestCount || 0;
-    var errs = a.errorCount || 0;
-    var tokens = a.totalTokens || 0;
-    var credits = Number(a.totalCredits || 0).toFixed(2);
+    var reqs = Number(a.requestCount != null ? a.requestCount : 0) || 0;
+    var errs = Number(a.errorCount != null ? a.errorCount : 0) || 0;
+    var tokens = Number(a.totalTokens != null ? a.totalTokens : 0) || 0;
+    var credits = Number(a.totalCredits || 0);
+    if (!isFinite(credits)) credits = 0;
+    var reqsPill =
+      '<span style="display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700;' +
+      'background:#10a37f22;color:#10a37f;border:1px solid #10a37f;vertical-align:middle">' +
+      'Reqs ' + esc(reqs) + '</span>';
     return '<div class="codex-row" data-id="' + esc(a.id) + '" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--border,#e5e5e5);border-radius:8px;margin-bottom:6px;flex-wrap:wrap">' +
       '<div style="min-width:0;flex:1">' +
       '<div style="font-weight:600;font-size:13px">' + esc(a.email || a.displayName || a.id) +
       (a.planType ? ' <span style="font-size:11px;color:#10a37f;border:1px solid #10a37f;border-radius:4px;padding:0 4px">' + esc(a.planType) + '</span>' : '') +
+      reqsPill +
       '</div>' +
       '<div style="font-size:11.5px;color:var(--muted-foreground,#8b93a9);margin-top:2px">' + status + quota +
       ' · exp=' + fmtTime(a.expiresAt) + '</div>' +
-      '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:6px;font-size:12px;color:var(--muted-foreground,#525252)">' +
-      '<span>reqs: <b style="color:var(--foreground,#111)">' + esc(reqs) + '</b></span>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:6px;font-size:12.5px;color:var(--muted-foreground,#525252)">' +
+      '<span>reqs: <b style="color:var(--foreground,#111);font-size:14px">' + esc(reqs) + '</b></span>' +
       '<span>errors: <b style="color:var(--foreground,#111)">' + esc(errs) + '</b></span>' +
       '<span>tokens: <b style="color:var(--foreground,#111)">' + esc(tokens) + '</b></span>' +
-      '<span>credits: <b style="color:var(--foreground,#111)">' + esc(credits) + '</b></span>' +
+      '<span>credits: <b style="color:var(--foreground,#111)">' + esc(credits.toFixed(2)) + '</b></span>' +
       '</div>' +
       '</div>' +
       '<div style="display:flex;gap:6px;flex-wrap:wrap">' +

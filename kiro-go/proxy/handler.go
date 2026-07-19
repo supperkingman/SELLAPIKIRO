@@ -4334,6 +4334,12 @@ func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/admin/")
+	// Custom admin overlays change often; never let browsers cache an old copy
+	// that omits fields (e.g. Codex per-account reqs).
+	if strings.HasPrefix(path, "custom-") && strings.HasSuffix(path, ".js") {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+	}
 	http.ServeFile(w, r, "web/"+path)
 }
 
