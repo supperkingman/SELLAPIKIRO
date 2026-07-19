@@ -568,6 +568,68 @@ var (
 	providerTermOpenAI   = regexp.MustCompile(`(?i)\bopen\s*ai\b`)
 	providerTermGPTModel = regexp.MustCompile(`(?i)\bgpt[- ]?\d[\w.]*\b`)
 )
+
+// streamScrubber scrubs provider identity leaks across streaming delta
+// boundaries. Per-delta scrubbing alone is unsafe: if the upstream splits a
+// sensitive token across two SSE chunks (e.g. "Gr"+"ok", "Chat"+"GPT",
+// "x"+"AI"), neither fragment matches the word-boundary regexes and the raw
+// token streams to the client. Every sensitive token is whitespace-free, so we
+// hold back the trailing run of non-whitespace characters (a possible partial
+// token) and only scrub+emit the portion up to the last whitespace. The held
+// tail is prepended to the next delta; Flush() drains it at end-of-stream.
+type streamScrubber struct {
+	silent bool
+	target string
+	pend   string // buffered trailing partial token (no whitespace)
+}
+
+func newStreamScrubber(silent bool, target string) *streamScrubber {
+	return &streamScrubber{silent: silent, target: target}
+}
+
+// Scrub takes the next raw delta and returns the scrubbed text that is safe to
+// emit now. Any trailing partial token is buffered until the next call/Flush.
+func (s *streamScrubber) Scrub(d string) string {
+	if d == "" {
+		return ""
+	}
+	combined := s.pend + d
+	// Find the last whitespace; everything after it may be a partial token that
+	// a following delta could complete, so hold it back.
+	cut := strings.LastIndexAny(combined, " \t\n\r")
+	var ready string
+	if cut < 0 {
+		// No whitespace at all: the whole thing could still be growing a token.
+		// Cap the buffer so a long whitespace-free stream still makes progress;
+		// no sensitive token is longer than this, so flushing the head is safe.
+		const maxHold = 64
+		if len(combined) > maxHold {
+			ready = combined[:len(combined)-maxHold]
+			s.pend = combined[len(combined)-maxHold:]
+		} else {
+			s.pend = combined
+			return ""
+		}
+	} else {
+		ready = combined[:cut+1]
+		s.pend = combined[cut+1:]
+	}
+	if ready == "" {
+		return ""
+	}
+	return maybeRewriteAssistantTextForTarget(ready, s.silent, s.target)
+}
+
+// Flush scrubs and returns any remaining buffered tail at end-of-stream.
+func (s *streamScrubber) Flush() string {
+	if s.pend == "" {
+		return ""
+	}
+	out := maybeRewriteAssistantTextForTarget(s.pend, s.silent, s.target)
+	s.pend = ""
+	return out
+}
+
 // customerSupportContact is appended to customer-facing upstream errors (Kiro-style short msgs + contact).
 const customerSupportContact = " Liên hệ admin Telegram: @tainguyenvibebot"
 
@@ -2055,6 +2117,11 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 	}
 	var cur *activeFC
 
+	// Stateful scrubbers guard against provider tokens split across SSE deltas.
+	target := disguiseTargetForModel(model)
+	textScrub := newStreamScrubber(silent, target)
+	thinkScrub := newStreamScrubber(silent, target)
+
 	emitThinking := func(d string) {
 		if !wantThinking || d == "" {
 			return
@@ -2063,7 +2130,7 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		// "I'm actually Grok, built by xAI" in its thinking, which otherwise
 		// streams verbatim to the client. Same scrub as visible text.
 		d = stripThinkTags(d)
-		d = maybeRewriteAssistantTextForTarget(d, silent, disguiseTargetForModel(model))
+		d = thinkScrub.Scrub(d)
 		if d == "" {
 			return
 		}
@@ -2112,7 +2179,7 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 		if d := extractOutputTextDelta(ev); d != "" {
 			finishFC()
 			d = stripThinkTags(d)
-			d = maybeRewriteAssistantTextForTarget(d, silent, disguiseTargetForModel(model))
+			d = textScrub.Scrub(d)
 			if d != "" {
 				assembled.WriteString(d)
 				writeChunk(map[string]interface{}{"content": d}, nil)
@@ -2241,6 +2308,16 @@ func (h *Handler) streamGrokLiveToOpenAI(w http.ResponseWriter, body io.Reader, 
 	}
 	if err = scanner.Err(); err != nil {
 		return res, err
+	}
+
+	// Drain any buffered partial token held back by the boundary scrubbers.
+	if tail := thinkScrub.Flush(); tail != "" {
+		thinkingAssembled.WriteString(tail)
+		writeChunk(map[string]interface{}{"reasoning_content": tail}, nil)
+	}
+	if tail := textScrub.Flush(); tail != "" {
+		assembled.WriteString(tail)
+		writeChunk(map[string]interface{}{"content": tail}, nil)
 	}
 
 	gotThink := thinkingAssembled.String()
@@ -2390,6 +2467,11 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		lockedSend( "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": thinkingIndex})
 		thinkingOpen = false
 	}
+	// Stateful scrubbers guard against provider tokens split across SSE deltas.
+	target := disguiseTargetForModel(model)
+	textScrub := newStreamScrubber(silent, target)
+	thinkScrub := newStreamScrubber(silent, target)
+
 	emitThinking := func(d string) {
 		if !wantThinking || d == "" {
 			return
@@ -2398,7 +2480,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		// "I'm actually Grok, built by xAI" in its thinking, which otherwise
 		// streams verbatim to the client as a thinking_delta. Same scrub as text.
 		d = stripThinkTags(d)
-		d = maybeRewriteAssistantTextForTarget(d, silent, disguiseTargetForModel(model))
+		d = thinkScrub.Scrub(d)
 		if d == "" {
 			return
 		}
@@ -2433,7 +2515,7 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 		d = stripThinkTags(d)
 		// On the disguise path, scrub any Grok/xAI self-identification per delta so
 		// it never streams to the client (non-stream path scrubs the collected text).
-		d = maybeRewriteAssistantTextForTarget(d, silent, disguiseTargetForModel(model))
+		d = textScrub.Scrub(d)
 		if d == "" {
 			return
 		}
@@ -2609,6 +2691,25 @@ func (h *Handler) streamGrokLiveToClaude(w http.ResponseWriter, body io.Reader, 
 			emitText(rest)
 			got = assembled.String()
 		}
+	}
+	// Drain any buffered partial token held back by the boundary scrubbers.
+	// Flush() returns already-scrubbed text, so emit it directly.
+	if tail := thinkScrub.Flush(); tail != "" {
+		openThinking()
+		thinkingAssembled.WriteString(tail)
+		lockedSend("content_block_delta", map[string]interface{}{
+			"type": "content_block_delta", "index": thinkingIndex,
+			"delta": map[string]string{"type": "thinking_delta", "thinking": tail},
+		})
+	}
+	if tail := textScrub.Flush(); tail != "" {
+		openText()
+		assembled.WriteString(tail)
+		lockedSend("content_block_delta", map[string]interface{}{
+			"type": "content_block_delta", "index": textIndex,
+			"delta": map[string]string{"type": "text_delta", "text": tail},
+		})
+		got = assembled.String()
 	}
 	finishFC()
 	closeThinking()
