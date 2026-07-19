@@ -1801,6 +1801,13 @@ func sanitizeRequestLogError(msg string) string {
 	case strings.Contains(low, "schema validation") || strings.Contains(low, "required: null") ||
 		strings.Contains(low, "invalid-argument") && strings.Contains(low, "schema"):
 		return "Invalid request content (tool schema)"
+	case strings.Contains(low, "max_output_tokens") || strings.Contains(low, "unsupported parameter"):
+		// ChatGPT Codex rejects max_output_tokens (fixed in buildCodexRequestBody).
+		return "Upstream rejected request parameter"
+	case strings.Contains(low, "model is not supported") || strings.Contains(low, "unsupported model"):
+		return "Upstream rejected model id"
+	case strings.Contains(low, "stream must be set to true"):
+		return "Upstream requires streaming"
 	case strings.Contains(low, "free-usage-exhausted") || strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "quota") || strings.Contains(low, "402"):
 		return "Usage limit reached"
@@ -1814,6 +1821,14 @@ func sanitizeRequestLogError(msg string) string {
 		return "Request too large for model context window"
 	case strings.Contains(low, "no available accounts"):
 		return "No available accounts"
+	case strings.Contains(low, "network:") || strings.Contains(low, "connection refused") ||
+		strings.Contains(low, "timeout") || strings.Contains(low, "i/o timeout") ||
+		strings.Contains(low, "tls") || strings.Contains(low, "eof"):
+		return "Upstream network error"
+	case strings.Contains(low, "http 400") || strings.Contains(low, "http 4"):
+		return "Upstream rejected request (4xx)"
+	case strings.Contains(low, "http 5") || strings.Contains(low, "transient http"):
+		return "Upstream temporary error (5xx)"
 	default:
 		// Drop provider dumps; keep a short generic label.
 		if len(msg) > 80 || strings.Contains(msg, "{") {
