@@ -910,12 +910,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// or all accounts quota-blocked). When a Kiro account is available, serve it
 	// first; the post-failure fallback below still degrades gracefully if Kiro fails
 	// before any client body is written.
+	//
+	// IMPORTANT: order is driven by GrokSplitPercent / CodexSplitPercent. Previously
+	// empty-pool and post-Kiro failure always tried Grok first, so setting Codex to
+	// 100% still sent Claude traffic to Grok whenever Kiro was empty or failed.
 	normalizeClaudeRequestForAgents(&req)
 	if h.kiroPoolEmpty() {
-		if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
-			return
-		}
-		if h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
+		if h.trySilentProvidersClaude(w, r, &req, req.Model) {
 			return
 		}
 	} else {
@@ -928,8 +929,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 				return
 			}
+			// Chosen provider not ready: try the other silent pool before Kiro so a
+			// Codex-100% deploy does not silently fall back to Kiro-only when Grok
+			// is still partially configured, and vice versa.
+			if h.codexPoolReady() && h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
+				return
+			}
 		case "codex":
 			if h.codexPoolReady() && h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
+				return
+			}
+			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 				return
 			}
 		}
@@ -963,8 +973,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if handled {
 		return
 	}
-	// All Kiro accounts failed before any client body was written → silent Grok xhigh.
-	if h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
+	// All Kiro accounts failed before any client body was written → silent providers
+	// in split-priority order (Codex-first when Codex split is 100%).
+	if h.trySilentProvidersClaude(w, r, &req, req.Model) {
 		return
 	}
 	h.sendClaudeError(w, 503, "api_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
@@ -1488,7 +1499,12 @@ var splitCounter uint64
 // pickSplitProvider decides which backend an eligible request should use, honoring
 // GrokSplitPercent + CodexSplitPercent together (three-way split). Returns "grok",
 // "codex", or "kiro". When both percentages are 0 it always returns "kiro" (default
-// = 100% Kiro). Grok keeps priority if the two shares would exceed 100%.
+// = 100% Kiro).
+//
+// If Grok+Codex shares exceed 100%, the larger share keeps its percent and the
+// smaller is truncated (equal → Codex keeps its share, Grok takes the remainder).
+// Previously Grok always won the overflow, so Codex=100 with a leftover Grok>0
+// still sent almost everything to Grok.
 //
 // Explicit grok-*/gpt-5.* model ids never reach here — they are routed directly
 // (no split) before this is called, so a customer asking for a real Grok/Codex
@@ -1508,10 +1524,28 @@ func (h *Handler) pickSplitProvider() string {
 	if g > 100 {
 		g = 100
 	}
+	if c > 100 {
+		c = 100
+	}
 	if g+c > 100 {
-		c = 100 - g // never exceed 100%; Grok priority, Codex takes the remainder
+		if c >= g {
+			g = 100 - c
+		} else {
+			c = 100 - g
+		}
 	}
 	idx := (atomic.AddUint64(&splitCounter, 1) - 1) % 100 // 0..99
+	// Prefer the higher-share provider in the low indices so a Codex-100 config
+	// (g=0,c=100) maps idx 0..99 entirely to codex.
+	if c >= g {
+		if idx < uint64(c) {
+			return "codex"
+		}
+		if idx < uint64(c+g) {
+			return "grok"
+		}
+		return "kiro"
+	}
 	if idx < uint64(g) {
 		return "grok"
 	}
@@ -1519,6 +1553,74 @@ func (h *Handler) pickSplitProvider() string {
 		return "codex"
 	}
 	return "kiro"
+}
+
+// silentProviderOrder returns preferred silent backends for Claude/OpenAI
+// disguise when Kiro is empty or failed. Honors GrokSplitPercent /
+// CodexSplitPercent: higher share is tried first; ties prefer Codex when only
+// Codex is configured, Grok when only Grok is configured. When both are 0,
+// keep historical Grok-then-Codex order as a last-resort safety net.
+func silentProviderOrder() []string {
+	g := config.GetGrokSplitPercent()
+	c := config.GetCodexSplitPercent()
+	if g < 0 {
+		g = 0
+	}
+	if c < 0 {
+		c = 0
+	}
+	switch {
+	case c > 0 && g <= 0:
+		return []string{"codex", "grok"}
+	case g > 0 && c <= 0:
+		return []string{"grok", "codex"}
+	case c > g:
+		return []string{"codex", "grok"}
+	case g > c:
+		return []string{"grok", "codex"}
+	case g == 0 && c == 0:
+		return []string{"grok", "codex"} // legacy last-resort
+	default:
+		// Equal positive shares: prefer Codex only when explicitly configured
+		// equal; still try both. Use Grok first only if both zero handled above.
+		return []string{"codex", "grok"}
+	}
+}
+
+// trySilentProvidersClaude tries silent Grok/Codex for a Claude request in
+// split-priority order. Returns true if a provider produced a response.
+func (h *Handler) trySilentProvidersClaude(w http.ResponseWriter, r *http.Request, req *ClaudeRequest, model string) bool {
+	for _, p := range silentProviderOrder() {
+		switch p {
+		case "codex":
+			if h.codexPoolReady() && h.trySilentCodexClaudeFallback(w, r, req, model) {
+				return true
+			}
+		case "grok":
+			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, req, model) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// trySilentProvidersOpenAI tries silent Grok/Codex for an OpenAI-format request
+// in split-priority order.
+func (h *Handler) trySilentProvidersOpenAI(w http.ResponseWriter, r *http.Request, req *OpenAIRequest, model string) bool {
+	for _, p := range silentProviderOrder() {
+		switch p {
+		case "codex":
+			if h.codexPoolReady() && h.trySilentCodexOpenAIFallback(w, r, req, model) {
+				return true
+			}
+		case "grok":
+			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, req, model) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1939,11 +2041,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// Grok/Codex are FALLBACKS for when no usable Kiro account exists (empty pool or
 	// all accounts quota-blocked). Serve Kiro first; the post-failure fallback
 	// below still degrades gracefully if Kiro fails before any client body is written.
+	// Order follows GrokSplitPercent / CodexSplitPercent (see trySilentProvidersOpenAI).
 	if h.kiroPoolEmpty() {
-		if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
-			return
-		}
-		if h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
+		if h.trySilentProvidersOpenAI(w, r, &req, req.Model) {
 			return
 		}
 	} else {
@@ -1956,8 +2056,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 				return
 			}
+			if h.codexPoolReady() && h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
+				return
+			}
 		case "codex":
 			if h.codexPoolReady() && h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
+				return
+			}
+			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 				return
 			}
 		}
@@ -1981,8 +2087,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if handled {
 		return
 	}
-	// All Kiro accounts failed before any client body was written → silent Grok xhigh.
-	if h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
+	// All Kiro accounts failed before any client body was written → silent providers
+	// in split-priority order.
+	if h.trySilentProvidersOpenAI(w, r, &req, req.Model) {
 		return
 	}
 	h.sendOpenAIError(w, 503, "server_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
