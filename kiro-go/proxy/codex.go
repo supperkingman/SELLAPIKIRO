@@ -591,7 +591,13 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 				lastErr = fmt.Errorf("network: %w", err)
 				continue
 			}
-			if resp.StatusCode == 429 || resp.StatusCode == 502 || resp.StatusCode == 503 {
+			// 502/503 are true transient gateway errors — retry in-place.
+			// 429 is NOT retried here: ChatGPT Codex returns it for real
+			// rate/usage limits, which must fall through to the 429 cooldown
+			// branch below so the account leaves rotation. Retrying (and then
+			// nil-ing resp) previously bypassed that cooldown entirely, leaving
+			// rate-limited accounts live in the pool.
+			if resp.StatusCode == 502 || resp.StatusCode == 503 {
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				lastErr = fmt.Errorf("transient HTTP %d: %s", resp.StatusCode, truncateStr(string(b), 200))
