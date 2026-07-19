@@ -417,8 +417,11 @@ func parseCodexAccountJSON(raw []byte) (*config.CodexAccount, error) {
 	return acc, nil
 }
 
-// testCodexAccountHello sends a tiny stream request to verify the account works.
-// ChatGPT Codex rejects max_output_tokens — do not set it here.
+// testCodexAccountHello verifies a Codex account with a tiny stream probe.
+// ChatGPT Codex rejects max_output_tokens and requires stream=true. We must NOT
+// ReadAll the full SSE (that can hang minutes on high-effort models). Instead:
+// use a short client timeout, read a small prefix, and treat HTTP 2xx + any body
+// as success (or 2xx alone if headers already prove the account is accepted).
 func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]interface{} {
 	out := map[string]interface{}{
 		"id": acc.ID, "email": acc.Email, "enabled": acc.Enabled, "ok": false,
@@ -435,6 +438,11 @@ func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]int
 		Stream:   true,
 	}
 	body := buildCodexRequestBody(probe, "gpt-5.6-sol", "low", "gpt-5.6-sol")
+	// Health probe: keep reasoning cheap so first byte arrives quickly.
+	if r, ok := body["reasoning"].(map[string]interface{}); ok {
+		r["effort"] = "low"
+		r["summary"] = "concise"
+	}
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequest(http.MethodPost, codexResponsesURL, strings.NewReader(string(raw)))
 	if err != nil {
@@ -443,23 +451,73 @@ func (h *Handler) testCodexAccountHello(acc *config.CodexAccount) map[string]int
 		return out
 	}
 	httpReq.Header = buildCodexHeaders(acc, uuid.New().String())
-	resp, err := getCodexHTTPClient(acc).Do(httpReq)
+
+	// Bound the whole probe (connect + headers + first body bytes). Do not reuse
+	// the long-lived streaming client (5m ResponseHeaderTimeout, no total timeout).
+	client := getCodexHTTPClient(acc)
+	probeClient := &http.Client{
+		Timeout:   25 * time.Second,
+		Transport: client.Transport,
+	}
+	resp, err := probeClient.Do(httpReq)
 	if err != nil {
 		out["status"] = "network_error"
 		out["error"] = truncateStr(err.Error(), 160)
 		return out
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	// Read at most ~4KB — enough to see response.created or a JSON error detail.
+	// Do NOT drain the rest of the SSE stream (would wait for full completion).
+	limited := io.LimitReader(resp.Body, 4096)
+	b, _ := io.ReadAll(limited)
+	// Force-close so the transport does not keep waiting on the open stream.
+	_ = resp.Body.Close()
 	out["status"] = resp.StatusCode
+	bodyStr := string(b)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// 200 + SSE started (or empty body after timeout race) = credentials work.
 		out["ok"] = true
+		if strings.Contains(bodyStr, "response.created") || strings.Contains(bodyStr, `"type"`) {
+			out["detail"] = "stream_started"
+		} else {
+			out["detail"] = "http_ok"
+		}
 	} else {
-		// Never leak provider identity to the client; short label only.
+		// Never leak long provider dumps to the admin toast; short label + server log.
 		out["error"] = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		logger.Warnf("[Codex] test account=%s HTTP %d body=%s", acc.Email, resp.StatusCode, truncateStr(string(b), 200))
+		if detail := extractCodexErrorDetail(bodyStr); detail != "" {
+			out["error"] = truncateStr(detail, 160)
+		}
+		logger.Warnf("[Codex] test account=%s HTTP %d body=%s", acc.Email, resp.StatusCode, truncateStr(bodyStr, 200))
 	}
 	return out
+}
+
+// extractCodexErrorDetail pulls a short human message from ChatGPT Codex error JSON.
+func extractCodexErrorDetail(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(body), &m) == nil {
+		if d, ok := m["detail"].(string); ok && d != "" {
+			return d
+		}
+		if errObj, ok := m["error"].(map[string]interface{}); ok {
+			if msg, ok := errObj["message"].(string); ok && msg != "" {
+				return msg
+			}
+		}
+		if msg, ok := m["message"].(string); ok && msg != "" {
+			return msg
+		}
+	}
+	// SSE error line sometimes embeds JSON after "data: "
+	if i := strings.Index(body, "{"); i >= 0 {
+		return extractCodexErrorDetail(body[i:])
+	}
+	return ""
 }
 
 var _ = strconv.Atoi

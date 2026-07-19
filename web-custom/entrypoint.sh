@@ -1,4 +1,4 @@
-#!/bin/sh
+﻿#!/bin/sh
 # entrypoint.sh - Wrapper khoi dong kiro-go, tu dong chen tinh nang tao key hang loat.
 #
 # Chay MOI LAN container khoi dong -> tinh nang khong bao gio bi mat du container
@@ -26,7 +26,7 @@ else
     if grep -q "$js" "$INDEX" 2>/dev/null; then
       echo "[entrypoint] $js da co san trong UI."
     else
-      tag="<script src=\"/admin/$js?v=1\" defer></script>"
+      tag="<script src=\"/admin/$js?v=2\" defer></script>"
       sed -i "s#</body>#${tag}</body>#" "$INDEX"
       echo "[entrypoint] Da chen $js vao UI."
     fi
@@ -36,3 +36,4 @@ fi
 # Chuyen quyen dieu khien cho kiro-go (WORKDIR=/app, binary o /app/kiro-go).
 echo "[entrypoint] Khoi dong kiro-go..."
 exec ./kiro-go
+

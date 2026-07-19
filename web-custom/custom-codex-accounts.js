@@ -217,16 +217,70 @@
 
   async function testAllCodex() {
     var pw = getPassword();
-    if (!pw) return;
+    if (!pw) { toast('Chưa nhập mật khẩu admin', false); return; }
     var btn = document.getElementById('codexTestAllBtn');
-    if (btn) { btn.disabled = true; }
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span class="btn-text">Testing…</span>';
+    }
+    var listEl = document.getElementById(LIST_ID);
+    if (listEl) {
+      listEl.querySelectorAll('.codex-row').forEach(function (row) {
+        var badge = row.querySelector('.codex-test-result');
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'codex-test-result';
+          badge.style.cssText = 'font-size:11px;margin-left:6px';
+          var title = row.querySelector('div > div');
+          if (title) title.appendChild(badge);
+        }
+        badge.style.color = 'var(--muted-foreground,#8b93a9)';
+        badge.textContent = '…';
+      });
+    }
     try {
-      var res = await fetch('/admin/api/codex-accounts/test', { method: 'POST', headers: { 'X-Admin-Password': pw } });
-      var d = await res.json();
-      toast('Codex test: ' + (d.ok || 0) + ' OK, ' + (d.failed || 0) + ' lỗi', (d.failed || 0) === 0);
-    } catch (e) { toast('Lỗi mạng', false); }
-    if (btn) { btn.disabled = false; }
-    loadCodexAccounts();
+      var res = await fetch('/admin/api/codex-accounts/test', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': pw }
+      });
+      var d = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        toast(d.error || ('Test all HTTP ' + res.status), false);
+      } else {
+        var results = d.results || [];
+        var byId = {};
+        results.forEach(function (r) { if (r && r.id) byId[r.id] = r; });
+        if (listEl) {
+          listEl.querySelectorAll('.codex-row').forEach(function (row) {
+            var id = row.getAttribute('data-id');
+            var r = byId[id];
+            var badge = row.querySelector('.codex-test-result');
+            if (!badge) return;
+            if (!r) { badge.textContent = '?'; return; }
+            if (r.ok) {
+              badge.style.color = '#34d399';
+              badge.textContent = 'OK';
+            } else if (r.skipped) {
+              badge.style.color = 'var(--muted-foreground,#8b93a9)';
+              badge.textContent = 'skip';
+            } else {
+              badge.style.color = '#f87171';
+              badge.textContent = 'FAIL';
+              badge.title = r.error || String(r.status || '');
+            }
+          });
+        }
+        var okN = d.ok || 0, failN = d.failed || 0;
+        toast('Codex test: ' + okN + ' OK, ' + failN + ' lỗi' + (results.length ? ' (' + results.length + ' acc)' : ''), failN === 0);
+      }
+    } catch (e) {
+      toast('Lỗi mạng khi test all (timeout hoặc server treo). Deploy bản test Codex mới nếu chưa.', false);
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-plug-circle-check"></i> <span class="btn-text">Test all</span>';
+    }
+    // Do not full-reload list immediately — keep OK/FAIL badges visible.
   }
 
   function init() {
