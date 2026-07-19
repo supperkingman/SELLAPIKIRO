@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+	"time"
+)
 
 func TestResolveCodexModel(t *testing.T) {
 	tests := []struct {
@@ -54,6 +58,58 @@ func TestClampCodexEffort(t *testing.T) {
 		if got := clampCodexEffort(in); got != want {
 			t.Errorf("clampCodexEffort(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestParseCodexRateLimit verifies the x-codex-* usage headers are parsed and
+// that exhaustion / reset-window logic matches what the live endpoint reports.
+func TestParseCodexRateLimit(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", "100")
+	h.Set("x-codex-secondary-used-percent", "0")
+	h.Set("x-codex-primary-reset-after-seconds", "557411")
+	h.Set("x-codex-credits-has-credits", "False")
+	h.Set("x-codex-credits-unlimited", "False")
+	rl := parseCodexRateLimit(h)
+	if !rl.present {
+		t.Fatal("expected present=true")
+	}
+	if !rl.exhausted() {
+		t.Fatal("expected exhausted=true at 100% used")
+	}
+	// cooldown should track the real reset window (~6.4 days), clamped <= 24h.
+	if rl.cooldownFor() != 24*time.Hour {
+		t.Fatalf("expected cooldown clamped to 24h, got %s", rl.cooldownFor())
+	}
+
+	// Healthy account: low usage, has credits.
+	h2 := http.Header{}
+	h2.Set("x-codex-primary-used-percent", "12")
+	h2.Set("x-codex-credits-has-credits", "True")
+	rl2 := parseCodexRateLimit(h2)
+	if rl2.exhausted() {
+		t.Fatal("expected not exhausted at 12% used")
+	}
+
+	// No headers at all: must not report exhausted (avoid false cooldown).
+	if parseCodexRateLimit(http.Header{}).exhausted() {
+		t.Fatal("empty headers must not be exhausted")
+	}
+
+	// Out of credits on a metered plan => exhausted.
+	h3 := http.Header{}
+	h3.Set("x-codex-credits-has-credits", "False")
+	h3.Set("x-codex-credits-unlimited", "False")
+	if !parseCodexRateLimit(h3).exhausted() {
+		t.Fatal("no credits on metered plan should be exhausted")
+	}
+
+	// Short reset window is floored to 1m to avoid hot retry loops.
+	h4 := http.Header{}
+	h4.Set("x-codex-primary-used-percent", "100")
+	h4.Set("x-codex-primary-reset-after-seconds", "5")
+	if got := parseCodexRateLimit(h4).cooldownFor(); got != time.Minute {
+		t.Fatalf("expected 1m floor, got %s", got)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"kiro-go/pool"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -348,6 +349,86 @@ func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayMod
 	return body
 }
 
+// codexRateLimit holds the usage/limit state ChatGPT Codex reports on EVERY
+// response via x-codex-* headers (the same signal the real Codex CLI and 9router
+// use to show usage %). Reading these lets us proactively pause an exhausted
+// account and cool it exactly until its real reset — instead of blindly retrying
+// and re-hitting the limit.
+type codexRateLimit struct {
+	primaryUsedPercent   float64
+	secondaryUsedPercent float64
+	primaryResetAfter    time.Duration // seconds until the primary window resets
+	hasCredits           bool
+	creditsUnlimited     bool
+	present              bool // at least one x-codex-* header was present
+}
+
+// parseCodexRateLimit extracts the usage/limit state from response headers.
+func parseCodexRateLimit(hdr http.Header) codexRateLimit {
+	rl := codexRateLimit{hasCredits: true}
+	get := func(k string) string { return strings.TrimSpace(hdr.Get(k)) }
+	if v := get("x-codex-primary-used-percent"); v != "" {
+		rl.present = true
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			rl.primaryUsedPercent = f
+		}
+	}
+	if v := get("x-codex-secondary-used-percent"); v != "" {
+		rl.present = true
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			rl.secondaryUsedPercent = f
+		}
+	}
+	if v := get("x-codex-primary-reset-after-seconds"); v != "" {
+		rl.present = true
+		if s, err := strconv.ParseInt(v, 10, 64); err == nil && s > 0 {
+			rl.primaryResetAfter = time.Duration(s) * time.Second
+		}
+	}
+	// "False"/"True" strings from the backend.
+	if v := get("x-codex-credits-has-credits"); v != "" {
+		rl.present = true
+		rl.hasCredits = !strings.EqualFold(v, "false")
+	}
+	if v := get("x-codex-credits-unlimited"); v != "" {
+		rl.creditsUnlimited = strings.EqualFold(v, "true")
+	}
+	return rl
+}
+
+// exhausted reports whether the account has hit its usage limit and should be
+// pulled from rotation. Either primary or secondary window at/above 100%, or no
+// credits left on a metered plan.
+func (rl codexRateLimit) exhausted() bool {
+	if !rl.present {
+		return false
+	}
+	if rl.primaryUsedPercent >= 100 || rl.secondaryUsedPercent >= 100 {
+		return true
+	}
+	if !rl.creditsUnlimited && !rl.hasCredits {
+		return true
+	}
+	return false
+}
+
+// cooldownFor returns how long to pause an exhausted account: the real reset
+// window reported by Codex, clamped to a sane range so a bogus/huge value can't
+// park an account forever and a tiny one can't cause a hot retry loop.
+func (rl codexRateLimit) cooldownFor() time.Duration {
+	d := rl.primaryResetAfter
+	if d <= 0 {
+		d = codexQuotaCooldown
+	}
+	if d < time.Minute {
+		d = time.Minute
+	}
+	if d > 24*time.Hour {
+		d = 24 * time.Hour
+	}
+	return d
+}
+
 func (h *Handler) handleCodexOpenAIChat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest) {
 	// Codex-family cascade: Codex -> Kiro (native gpt-5.6) -> Grok (disguised as gpt-5.6).
 	orig := *req
@@ -635,10 +716,20 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		}
 		if resp.StatusCode == 402 || resp.StatusCode == 429 {
 			b, _ := io.ReadAll(resp.Body)
+			rl := parseCodexRateLimit(resp.Header)
 			resp.Body.Close()
-			logger.Warnf("[Codex] %d quota/rate account=%s body=%s", resp.StatusCode, acc.Email, truncateStr(string(b), 200))
-			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", "Usage limit reached (cooldown 10m)", 0, 0)
-			cp.Cooldown(acc.ID, "quota exhausted", codexQuotaCooldown)
+			// Cool the account for its REAL reset window (from x-codex headers),
+			// not a fixed 10m — weekly limits reset in days, so retrying after
+			// 10m just re-hits the limit. Fall back to 10m if no header present.
+			cd := codexQuotaCooldown
+			if rl.present {
+				cd = rl.cooldownFor()
+			}
+			msg := fmt.Sprintf("Usage limit reached (cooldown %s)", cd.Round(time.Minute))
+			logger.Warnf("[Codex] %d quota/rate account=%s used=%.0f%% reset=%s body=%s",
+				resp.StatusCode, acc.Email, rl.primaryUsedPercent, cd.Round(time.Second), truncateStr(string(b), 200))
+			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", msg, 0, 0)
+			cp.Cooldown(acc.ID, "quota exhausted", cd)
 			excluded[acc.ID] = true
 			cp.RecordError(acc.ID)
 			lastErr = fmt.Errorf("Usage limit reached")
@@ -681,6 +772,12 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			cp.RecordError(acc.ID)
 			continue
 		}
+
+		// Proactive limit check (like 9router/Codex CLI): the x-codex-* headers on
+		// this successful response tell us the account's current usage. Capture now
+		// so that after serving we can cool it until its real reset if it just hit
+		// 100% — instead of waiting for the next request to fail with 429.
+		rlOK := parseCodexRateLimit(resp.Header)
 
 		var result grokCollectResult
 		var cErr error
@@ -743,12 +840,24 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 
 		credits := GrokCreditsForRequest(effort, result.InTok+result.OutTok)
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
-		// A real completed response is stronger evidence than an older transient
-		// failure: recover the account immediately instead of waiting up to a minute
-		// for the background hello probe to clear its stale cooldown.
-		cp.ClearCooldown(acc.ID)
-		_ = config.SetCodexAccountQuota(acc.ID, "active", "", -1, 0)
 		cp.RecordSuccess(acc.ID)
+		// Proactive limit management from the x-codex-* headers on THIS response:
+		// if the account just crossed 100% (or ran out of credits), cool it until
+		// its real reset so the next request skips it instead of failing with 429.
+		// Otherwise the request succeeded, so recover the account immediately
+		// rather than waiting for the background hello probe to clear a stale
+		// cooldown.
+		if rlOK.exhausted() {
+			cd := rlOK.cooldownFor()
+			cp.Cooldown(acc.ID, "quota exhausted (proactive)", cd)
+			_ = config.SetCodexAccountQuota(acc.ID, "exhausted",
+				fmt.Sprintf("Usage limit reached (cooldown %s)", cd.Round(time.Minute)), 0, 0)
+			logger.Infof("[Codex] account=%s hit %.0f%% usage — cooling %s until reset",
+				acc.Email, rlOK.primaryUsedPercent, cd.Round(time.Second))
+		} else {
+			cp.ClearCooldown(acc.ID)
+			_ = config.SetCodexAccountQuota(acc.ID, "active", "", -1, 0)
+		}
 		cp.UpdateStats(acc.ID, result.InTok+result.OutTok, credits)
 		h.recordSuccessLog(logEndpoint, logModel, acc.ID, result.InTok+result.OutTok, credits, time.Since(reqStart).Milliseconds())
 		logger.Infof("[Codex] done display=%s outTok=%d stream=%v ms=%d", responseModel, result.OutTok, stream, time.Since(reqStart).Milliseconds())
