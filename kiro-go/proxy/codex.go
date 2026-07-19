@@ -140,7 +140,11 @@ func ResolveCodexModel(clientModel string) (upstreamModel, effort string) {
 			effortExplicit = true
 			m = strings.TrimSuffix(m, "-low")
 		case strings.HasSuffix(m, "-minimal"):
-			effort = "minimal"
+			// ChatGPT Codex does NOT support reasoning.effort="minimal" (it 400s:
+			// "Unsupported value: 'minimal' ... Supported values are: 'none',
+			// 'low', 'medium', 'high', and 'xhigh'."). Map the client's -minimal
+			// alias to the nearest supported tier so the request still succeeds.
+			effort = "low"
 			effortExplicit = true
 			m = strings.TrimSuffix(m, "-minimal")
 		default:
@@ -256,7 +260,36 @@ func buildCodexHeaders(acc *config.CodexAccount, sessionID string) http.Header {
 // max_output_tokens with HTTP 400 "Unsupported parameter: max_output_tokens".
 // Grok accepts that field; Codex must omit it. Effort stays in reasoning.effort
 // (never as a model-id suffix like gpt-5.6-sol-high — that also 400s).
+// clampCodexEffort maps any effort tier to a value ChatGPT Codex accepts.
+// Live probing confirms Codex accepts none/low/medium/high/xhigh AND our "max"
+// tier, but rejects "minimal" with HTTP 400 (which would drop the account from
+// rotation). Map "minimal" down to "low" and pass through the known-good tiers;
+// anything unrecognized falls back to "high".
+func clampCodexEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none":
+		return "none"
+	case "minimal", "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh":
+		return "xhigh"
+	case "max":
+		return "max"
+	default:
+		return "high"
+	}
+}
+
 func buildCodexRequestBody(req *OpenAIRequest, upstreamModel, effort, displayModel string) map[string]interface{} {
+	// Defensive clamp: ChatGPT Codex only accepts none/low/medium/high/xhigh.
+	// Anything else (e.g. "minimal", "max", or a stray suffix) returns HTTP 400
+	// and would take the whole account out of rotation. Keep this the single
+	// choke point so no upstream request can carry an unsupported effort.
+	effort = clampCodexEffort(effort)
 	body := map[string]interface{}{
 		"model":  upstreamModel,
 		"input":  openaiMessagesToGrokInput(req.Messages),
@@ -591,12 +624,20 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			// Rotating through every account and cooling each one turns one malformed
 			// request into a pool-wide outage (the next valid request then gets 503).
 			if resp.StatusCode == http.StatusBadRequest {
-				msg := detail
+				// Genuine "prompt too large" is a client-facing error: surface it
+				// directly. Cascading would not help — Kiro/Grok reject it too.
 				if isGrokPromptTooLongError(bodyStr) {
-					msg = "Request too large for model context window. Reduce conversation/tool output size and retry."
+					sendErr(http.StatusBadRequest, "invalid_request_error",
+						"Request too large for model context window. Reduce conversation/tool output size and retry.")
+					return served
 				}
-				sendErr(http.StatusBadRequest, "invalid_request_error", msg)
-				return served
+				// Any other 400 is specific to Codex's stricter Responses API for
+				// this body. Do NOT cool the whole pool AND do NOT hard-fail the
+				// customer: stop retrying Codex and fall through to the post-loop
+				// cascade (Kiro native gpt-5.6 -> Grok disguised as gpt) so the
+				// customer's gpt model still gets served. Only if the cascade also
+				// cannot serve does the post-loop handler surface the error.
+				break
 			}
 
 			excluded[acc.ID] = true
