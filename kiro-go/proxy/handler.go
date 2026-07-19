@@ -923,9 +923,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		// Three-way split: distribute a configured share of eligible requests to
 		// Grok/Codex (silent disguise) even though Kiro is available. A request only
 		// leaves Kiro if the chosen provider's pool is ready; otherwise it falls
-		// through to the normal Kiro path below.
+		// through to the normal Kiro path below — unless silent share is 100%,
+		// in which case we must NOT serve Kiro (admin set Codex/Grok to take all).
+		splitHit := false
 		switch h.pickSplitProvider() {
 		case "grok":
+			splitHit = true
 			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 				return
 			}
@@ -936,12 +939,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 				return
 			}
 		case "codex":
+			splitHit = true
 			if h.codexPoolReady() && h.trySilentCodexClaudeFallback(w, r, &req, req.Model) {
 				return
 			}
 			if h.grokPoolReady() && h.trySilentGrokClaudeFallback(w, r, &req, req.Model) {
 				return
 			}
+		}
+		if splitHit && silentSplitIsExclusive() {
+			// Admin configured 100% silent (e.g. Codex 100 / Grok 0). Do not fall
+			// through to Kiro — that looked like "Codex works" while all success
+			// credits went to Kiro accounts and Codex stats stayed 0.
+			logger.Warnf("[Split] exclusive silent failed for claude model=%s — not falling through to Kiro", req.Model)
+			h.recordFailureWithDetails("claude", req.Model, "", fmt.Errorf("exclusive silent providers failed"))
+			h.sendClaudeError(w, 503, "api_error", withSupportHint("No available accounts"))
+			return
 		}
 	}
 
@@ -1555,6 +1568,21 @@ func (h *Handler) pickSplitProvider() string {
 	return "kiro"
 }
 
+// silentSplitIsExclusive reports whether admin assigned 100% of eligible traffic
+// to silent providers (Grok+Codex). When true, a failed silent attempt must not
+// fall through to Kiro — that produced "Codex 100%" deploys still billing Kiro.
+func silentSplitIsExclusive() bool {
+	g := config.GetGrokSplitPercent()
+	c := config.GetCodexSplitPercent()
+	if g < 0 {
+		g = 0
+	}
+	if c < 0 {
+		c = 0
+	}
+	return g+c >= 100
+}
+
 // silentProviderOrder returns preferred silent backends for Claude/OpenAI
 // disguise when Kiro is empty or failed. Honors GrokSplitPercent /
 // CodexSplitPercent: higher share is tried first; ties prefer Codex when only
@@ -2065,9 +2093,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		// Three-way split: distribute a configured share of eligible requests to
 		// Grok/Codex (silent disguise) even though Kiro is available. A request only
 		// leaves Kiro if the chosen provider's pool is ready; otherwise it falls
-		// through to the normal Kiro path below.
+		// through to the normal Kiro path below — unless silent share is 100%.
+		splitHit := false
 		switch h.pickSplitProvider() {
 		case "grok":
+			splitHit = true
 			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 				return
 			}
@@ -2075,12 +2105,19 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case "codex":
+			splitHit = true
 			if h.codexPoolReady() && h.trySilentCodexOpenAIFallback(w, r, &req, req.Model) {
 				return
 			}
 			if h.grokPoolReady() && h.trySilentGrokOpenAIFallback(w, r, &req, req.Model) {
 				return
 			}
+		}
+		if splitHit && silentSplitIsExclusive() {
+			logger.Warnf("[Split] exclusive silent failed for openai model=%s — not falling through to Kiro", req.Model)
+			h.recordFailureWithDetails("openai", req.Model, "", fmt.Errorf("exclusive silent providers failed"))
+			h.sendOpenAIError(w, 503, "server_error", withSupportHint("No available accounts"))
+			return
 		}
 	}
 

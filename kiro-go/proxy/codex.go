@@ -386,7 +386,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 	served := false
 
 	sendErr := func(status int, errType, msg string) {
-		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
+		// Re-map through Kiro-style classifier (status/type may be overridden).
 		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
 			status, errType, public = st, et, public
@@ -406,6 +406,8 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		msg = public
 		if stream && w.Header().Get("Content-Type") != "" {
 			served = true
+			// Mid-stream failure is a real client-visible error — log it.
+			h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
 				h.sendSSE(w, fl, "error", map[string]interface{}{
 					"type": "error", "error": map[string]string{"type": errType, "message": msg},
@@ -422,10 +424,15 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 		}
-		// Silent: do not write body — caller may cascade to Grok.
+		// Silent: do not write body AND do not record a Failed row yet —
+		// caller may cascade to Grok/Kiro. Logging here produced the
+		// "1 OK 1 Failed" admin pattern for the same customer request.
 		if silent {
+			logger.Warnf("[Codex] silent cascade (no client body yet) account=%s msg=%s", lastTriedAccountID, truncateStr(msg, 160))
 			return
 		}
+		// Explicit Codex path: client-visible error — log + write body.
+		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		served = true
 		if format == "claude" {
 			h.sendClaudeError(w, status, errType, msg)
@@ -552,7 +559,12 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			bodyStr := string(b)
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(bodyStr, 400))
+			detail := extractCodexErrorDetail(bodyStr)
+			if detail == "" {
+				detail = truncateStr(bodyStr, 200)
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(detail, 400))
+			logger.Warnf("[Codex] HTTP %d account=%s email=%s detail=%s", resp.StatusCode, acc.ID, acc.Email, truncateStr(detail, 240))
 			excluded[acc.ID] = true
 			cp.RecordError(acc.ID)
 			cp.Release(acc.ID)
@@ -567,6 +579,10 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 					}
 				}
 				return served
+			}
+			// Soft-cooldown on hard auth/parameter errors so rotation prefers the other account.
+			if resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+				cp.Cooldown(acc.ID, detail, 2*time.Minute)
 			}
 			continue
 		}

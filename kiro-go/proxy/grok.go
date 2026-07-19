@@ -2690,8 +2690,6 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 	served := false
 
 	sendErr := func(status int, errType, msg string) {
-		// Admin request log table previously only recorded successes for Grok.
-		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		// Re-map through Kiro-style classifier (status/type may be overridden).
 		st, et, public := kiroStylePublicError(msg, silent)
 		if silent {
@@ -2716,6 +2714,7 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		// Already streaming: Anthropic SSE error event (same shape as Kiro mid-stream).
 		if stream && w.Header().Get("Content-Type") != "" {
 			served = true // headers already out; cannot cascade to another provider
+			h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 			if fl, ok := w.(http.Flusher); ok && format == "claude" {
 				h.sendSSE(w, fl, "error", map[string]interface{}{
 					"type": "error", "error": map[string]string{"type": errType, "message": msg},
@@ -2734,10 +2733,12 @@ func (h *Handler) handleGrokWithFormat(w http.ResponseWriter, r *http.Request, r
 		}
 
 		// Non-stream / before body: match Kiro sendClaudeError / sendOpenAIError exactly.
-		// Silent path: do NOT write the body yet — caller may cascade (Codex ↔ Grok).
+		// Silent path: do NOT write the body AND do NOT log Failed yet — caller may cascade.
 		if silent {
+			logger.Warnf("[Grok] silent cascade (no client body yet) account=%s msg=%s", lastTriedAccountID, truncateStr(msg, 160))
 			return
 		}
+		h.recordFailureWithDetails(logEndpoint, logModel, lastTriedAccountID, fmt.Errorf("%s", msg))
 		served = true
 		if format == "claude" {
 			h.sendClaudeError(w, status, errType, msg)
