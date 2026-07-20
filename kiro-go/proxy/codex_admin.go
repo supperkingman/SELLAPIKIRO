@@ -297,10 +297,41 @@ func (h *Handler) StartCodexHealthChecker() {
 		defer ticker.Stop()
 		for range ticker.C {
 			cp := pool.GetCodexPool()
-			cooling := cp.CoolingDownAccounts()
-			if len(cooling) == 0 {
-				continue
+
+			// 1) Auto-re-enable accounts we auto-disabled on a long-term quota
+			// limit, once their reset time has passed. Only accounts bearing the
+			// auto-quota marker are touched, so admin-disabled accounts stay off.
+			now := time.Now().Unix()
+			for _, acc := range config.GetCodexAccounts() {
+				if acc.Enabled {
+					continue
+				}
+				if !strings.Contains(acc.BanReason, codexAutoDisableMarker) {
+					continue
+				}
+				if acc.ResetAt <= 0 || now < acc.ResetAt {
+					continue // not yet time to recover
+				}
+				// Reset window elapsed: verify with a live hello before re-enabling.
+				probe := acc
+				_ = h.refreshCodexToken(&probe)
+				res := h.testCodexAccountHello(&probe)
+				if ok, _ := res["ok"].(bool); ok {
+					_ = config.SetCodexAccountEnabled(acc.ID, true, "")
+					_ = config.SetCodexAccountQuota(acc.ID, "active", "", -1, 0)
+					cp.Reload()
+					logger.Infof("[CodexHealth] account=%s quota reset — auto-re-enabled", acc.Email)
+				} else {
+					// Still limited: push the reset out an hour so we retry later
+					// instead of hammering it every cycle.
+					_ = config.SetCodexAccountUsage(acc.ID, acc.UsedPercent, acc.SecondaryUsedPercent, now+3600)
+					logger.Infof("[CodexHealth] account=%s reset time passed but still limited — retrying in ~1h", acc.Email)
+				}
 			}
+
+			// 2) Re-test accounts in temporary cooldown (short ~5h windows) and
+			// clear the cooldown on recovery.
+			cooling := cp.CoolingDownAccounts()
 			for i := range cooling {
 				acc := cooling[i]
 				_ = h.refreshCodexToken(&acc)

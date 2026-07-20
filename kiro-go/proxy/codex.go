@@ -457,6 +457,12 @@ func (rl codexRateLimit) cooldownFor() time.Duration {
 // possibly recover for days.
 const codexLongTermExhaustThreshold = 6 * time.Hour
 
+// codexAutoDisableMarker is embedded in the ban reason of accounts we auto-disable
+// on a confirmed long-term quota limit. The health-checker uses it to distinguish
+// these from accounts an admin disabled manually, so only quota-disabled accounts
+// are auto-re-enabled once their reset time passes.
+const codexAutoDisableMarker = "[auto-quota]"
+
 // longTermExhausted reports whether the account is exhausted AND its reset is far
 // enough out that it should be disabled instead of merely cooled.
 func (rl codexRateLimit) longTermExhausted() bool {
@@ -778,7 +784,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			// quota on) it. A short ~5h window instead just gets a timed cooldown
 			// so it auto-recovers when the window rolls over.
 			if rl.longTermExhausted() {
-				reason := fmt.Sprintf("Usage limit reached — auto-disabled (resets in %s)", cd.Round(time.Minute))
+				reason := fmt.Sprintf("%s Usage limit reached — auto-disabled (resets in %s)", codexAutoDisableMarker, cd.Round(time.Minute))
 				logger.Warnf("[Codex] %d LONG-TERM limit account=%s used=%.0f%% reset=%s — disabling. body=%s",
 					resp.StatusCode, acc.Email, rl.primaryUsedPercent, cd.Round(time.Second), truncateStr(string(b), 200))
 				_ = config.SetCodexAccountQuota(acc.ID, "exhausted", reason, 0, 0)
@@ -914,7 +920,7 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			// health-checker skip it entirely (no wasted probe quota) until an
 			// admin re-enables or it is re-imported after reset.
 			cd := rlOK.cooldownFor()
-			reason := fmt.Sprintf("Usage limit reached — auto-disabled (resets in %s)", cd.Round(time.Minute))
+			reason := fmt.Sprintf("%s Usage limit reached — auto-disabled (resets in %s)", codexAutoDisableMarker, cd.Round(time.Minute))
 			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", reason, 0, 0)
 			cp.Disable(acc.ID, reason)
 			logger.Warnf("[Codex] account=%s hit %.0f%% LONG-TERM usage — auto-disabled (resets in %s)",
