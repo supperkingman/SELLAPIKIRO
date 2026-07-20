@@ -404,19 +404,19 @@ func parseCodexRateLimit(hdr http.Header) codexRateLimit {
 }
 
 // exhausted reports whether the account has hit its usage limit and should be
-// pulled from rotation. Either primary or secondary window at/above 100%, or no
-// credits left on a metered plan.
+// pulled from rotation. We rely ONLY on the primary/secondary usage windows.
+//
+// NOTE: we intentionally do NOT treat x-codex-credits-has-credits=False as
+// exhausted. On subscription plans (e.g. "plus") the account runs on the
+// window quota, and the pay-as-you-go credits pool is separately empty
+// (has-credits=False) even when the account is perfectly healthy. Keying off
+// credits therefore disabled healthy plus accounts. Credits are only meaningful
+// on a metered/credit plan, which the window percent already reflects.
 func (rl codexRateLimit) exhausted() bool {
 	if !rl.present {
 		return false
 	}
-	if rl.primaryUsedPercent >= 100 || rl.secondaryUsedPercent >= 100 {
-		return true
-	}
-	if !rl.creditsUnlimited && !rl.hasCredits {
-		return true
-	}
-	return false
+	return rl.primaryUsedPercent >= 100 || rl.secondaryUsedPercent >= 100
 }
 
 // resetAtUnix returns the absolute Unix-seconds reset instant, preferring the
@@ -469,10 +469,8 @@ func (rl codexRateLimit) longTermExhausted() bool {
 	if !rl.exhausted() {
 		return false
 	}
-	// No credits on a metered plan is a hard stop regardless of window.
-	if !rl.creditsUnlimited && !rl.hasCredits {
-		return true
-	}
+	// Only a genuinely far-out reset (weekly window) is a long-term limit worth
+	// disabling for. Credits are deliberately ignored here (see exhausted()).
 	return rl.primaryResetAfter >= codexLongTermExhaustThreshold
 }
 

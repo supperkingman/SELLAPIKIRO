@@ -309,8 +309,14 @@ func (h *Handler) StartCodexHealthChecker() {
 				if !strings.Contains(acc.BanReason, codexAutoDisableMarker) {
 					continue
 				}
-				if acc.ResetAt <= 0 || now < acc.ResetAt {
-					continue // not yet time to recover
+				// Recover when EITHER the reset time has passed OR the account's
+				// last-known usage is under 100% (i.e. it was disabled by an older
+				// bug that keyed off the credits pool, not a real limit). The live
+				// hello below is the final gate before re-enabling.
+				resetElapsed := acc.ResetAt > 0 && now >= acc.ResetAt
+				notActuallyFull := acc.UsedPercent < 100
+				if !resetElapsed && !notActuallyFull {
+					continue // still genuinely limited and reset not yet due
 				}
 				// Reset window elapsed: verify with a live hello before re-enabling.
 				probe := acc

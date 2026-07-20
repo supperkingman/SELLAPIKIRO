@@ -97,12 +97,14 @@ func TestParseCodexRateLimit(t *testing.T) {
 		t.Fatal("empty headers must not be exhausted")
 	}
 
-	// Out of credits on a metered plan => exhausted.
+	// Empty pay-as-you-go credits pool but usage window not full (typical of a
+	// healthy subscription/plus account) => NOT exhausted. Credits are ignored.
 	h3 := http.Header{}
+	h3.Set("x-codex-primary-used-percent", "30")
 	h3.Set("x-codex-credits-has-credits", "False")
 	h3.Set("x-codex-credits-unlimited", "False")
-	if !parseCodexRateLimit(h3).exhausted() {
-		t.Fatal("no credits on metered plan should be exhausted")
+	if parseCodexRateLimit(h3).exhausted() {
+		t.Fatal("healthy plus account with empty credits pool must NOT be exhausted")
 	}
 
 	// Short reset window is floored to 1m to avoid hot retry loops.
@@ -134,12 +136,13 @@ func TestCodexLongTermExhausted(t *testing.T) {
 		t.Fatal("5h window should NOT be long-term exhausted")
 	}
 
-	// No credits on a metered plan => long-term regardless of window.
+	// Empty credits pool but window under 100% (healthy plus) => NOT long-term.
 	noCredits := http.Header{}
+	noCredits.Set("x-codex-primary-used-percent", "30")
 	noCredits.Set("x-codex-credits-has-credits", "False")
 	noCredits.Set("x-codex-credits-unlimited", "False")
-	if !parseCodexRateLimit(noCredits).longTermExhausted() {
-		t.Fatal("no credits should be long-term exhausted")
+	if parseCodexRateLimit(noCredits).longTermExhausted() {
+		t.Fatal("healthy plus account with empty credits must NOT be long-term exhausted")
 	}
 
 	// Healthy account is neither.
