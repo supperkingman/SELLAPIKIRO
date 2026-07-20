@@ -510,6 +510,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 	var lastErr error
 	reresolvedProfile := false
+	shrankForLength := false
 retryEndpoints:
 	for _, ep := range endpoints {
 		// Update the origin field for the selected endpoint.
@@ -585,6 +586,28 @@ retryEndpoints:
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
+			}
+			// Upstream rejected the request as too large (CONTENT_LENGTH_EXCEEDS_
+			// THRESHOLD / "Input is too long"). Our pre-send budget is only an
+			// estimate of the real threshold, so aggressively shrink the payload
+			// once and retry from the first endpoint. All 3 endpoints share the
+			// same limit, so cycling endpoints without shrinking cannot help.
+			if resp.StatusCode == 400 && !shrankForLength {
+				low := strings.ToLower(string(errBody))
+				if strings.Contains(low, "content_length") || strings.Contains(low, "input is too long") ||
+					(strings.Contains(low, "too long") && strings.Contains(low, "input")) {
+					shrankForLength = true
+					// Target a hard 400KB body: well under the observed threshold.
+					hardLimit := 400 * 1024
+					if hardLimit >= maxPayloadBytesForModel(currentMessageModelID(payload)) {
+						hardLimit = maxPayloadBytesForModel(currentMessageModelID(payload)) / 2
+					}
+					hasPriming := len(payload.ConversationState.History) >= 2
+					if shrinkPayloadToHardLimit(payload, hasPriming, hardLimit) {
+						logger.Warnf("[KiroAPI] %s HTTP 400 input-too-long; shrank payload to <=%dKB and retrying", ep.Name, hardLimit/1024)
+						goto retryEndpoints
+					}
+				}
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
 			continue

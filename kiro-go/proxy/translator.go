@@ -1744,6 +1744,76 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	}
 }
 
+// shrinkPayloadToHardLimit aggressively forces a payload under an explicit byte
+// limit, used to RECOVER from an upstream HTTP 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD
+// that slipped past the pre-send budget (the real threshold varies and our budget
+// is only an estimate). Unlike truncatePayloadToLimit it does not preserve a
+// minimum number of recent turns: it will drop conversation down to the current
+// message, then shrink history content, then hard-truncate the current message,
+// until the payload fits. Returns true if the payload was changed.
+func shrinkPayloadToHardLimit(payload *KiroPayload, hasPriming bool, limit int) bool {
+	if payload == nil || limit <= 0 {
+		return false
+	}
+	if payloadByteSize(payload) <= limit {
+		return false
+	}
+
+	history := payload.ConversationState.History
+	primingCount := 0
+	if hasPriming && len(history) >= 2 {
+		primingCount = 2
+	}
+	priming := history[:primingCount]
+	conversation := history[primingCount:]
+
+	placeholderEntry := KiroHistoryMessage{
+		UserInputMessage: &KiroUserInputMessage{
+			Content: truncationPlaceholder,
+			ModelID: currentMessageModelID(payload),
+			Origin:  "AI_EDITOR",
+		},
+	}
+
+	// Drop conversation turns from the oldest end until it fits, allowing removal
+	// of ALL conversation turns if necessary (no minimum kept).
+	entrySizes := make([]int, len(conversation))
+	for i := range conversation {
+		entrySizes[i] = historyEntryByteSize(conversation[i])
+	}
+	payload.ConversationState.History = priming
+	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
+	keepFrom := len(conversation)
+	running := baseSize
+	for i := len(conversation) - 1; i >= 0; i-- {
+		running += entrySizes[i]
+		if running > limit {
+			break
+		}
+		keepFrom = i
+	}
+	tail := dropLeadingAssistant(conversation[keepFrom:])
+	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
+	rebuilt = append(rebuilt, priming...)
+	if keepFrom > 0 {
+		rebuilt = append(rebuilt, placeholderEntry)
+	}
+	rebuilt = append(rebuilt, tail...)
+	payload.ConversationState.History = rebuilt
+
+	if payloadByteSize(payload) > limit {
+		truncateOversizedHistoryContent(payload, limit)
+	}
+	if payloadByteSize(payload) > limit {
+		// As an absolute last resort, drop retained conversation entirely.
+		payload.ConversationState.History = priming
+	}
+	if payloadByteSize(payload) > limit {
+		truncateCurrentMessage(payload)
+	}
+	return true
+}
+
 // historyEntryByteSize returns the serialized size of a single history entry,
 // including the surrounding JSON array delimiter overhead (1 byte for the comma).
 func historyEntryByteSize(entry KiroHistoryMessage) int {
