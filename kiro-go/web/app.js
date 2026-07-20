@@ -928,6 +928,40 @@
     });
   }
 
+  // Format a Unix-seconds reset instant as a human "reset in Xh Ym (local time)".
+  function formatCodexReset(resetAt) {
+    if (!resetAt) return '';
+    const now = Math.floor(Date.now() / 1000);
+    let secs = resetAt - now;
+    if (secs <= 0) return 'sẵn sàng / ready';
+    const d = Math.floor(secs / 86400); secs -= d * 86400;
+    const h = Math.floor(secs / 3600); secs -= h * 3600;
+    const m = Math.floor(secs / 60);
+    let rel = '';
+    if (d > 0) rel = d + 'd ' + h + 'h';
+    else if (h > 0) rel = h + 'h ' + m + 'm';
+    else rel = m + 'm';
+    const when = new Date(resetAt * 1000).toLocaleString();
+    return rel + ' (' + when + ')';
+  }
+
+  // Codex usage gauge (like 9router): shows how full the primary window is and
+  // when it resets. Only rendered when the backend has captured x-codex headers.
+  function renderCodexUsageBlock(a) {
+    if (a.usedPercent == null && !a.resetAt) return '';
+    const pct = Math.max(0, Math.min(100, a.usedPercent || 0));
+    const cls = pct >= 100 ? 'critical' : pct > 80 ? 'high' : '';
+    const resetStr = formatCodexReset(a.resetAt);
+    const exhausted = pct >= 100 || (a.quotaStatus === 'exhausted');
+    const label = exhausted ? 'Quota Codex — HẾT' : 'Quota Codex';
+    return '<div class="account-usage">' +
+      '<div class="usage-label">' + escapeHtml(label) +
+      (resetStr ? ' · reset: ' + escapeHtml(resetStr) : '') + '</div>' +
+      '<div class="usage-bar"><div class="usage-fill ' + cls + '" data-usage-pct="' + escapeAttr(pct) + '"></div></div>' +
+      '<div class="usage-text"><span>' + (exhausted ? 'Hết quota' : 'Còn dùng được') + '</span><span>' + pct.toFixed(0) + '%</span></div>' +
+      '</div>';
+  }
+
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -995,6 +1029,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        renderCodexUsageBlock(a) +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +

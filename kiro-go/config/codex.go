@@ -55,6 +55,15 @@ type CodexAccount struct {
 	QuotaCheckedAt int64   `json:"quotaCheckedAt,omitempty"`
 	QuotaRemaining float64 `json:"quotaRemaining,omitempty"`
 	QuotaLimit     float64 `json:"quotaLimit,omitempty"`
+
+	// Usage snapshot read from the x-codex-* response headers (like 9router's
+	// usage display). UsedPercent is 0..100; ResetAt is the Unix-seconds instant
+	// the primary window resets (0 if unknown). These are display aids so the
+	// admin can see how full an account is and when a disabled/exhausted one
+	// becomes usable again.
+	UsedPercent          float64 `json:"usedPercent,omitempty"`
+	SecondaryUsedPercent float64 `json:"secondaryUsedPercent,omitempty"`
+	ResetAt              int64   `json:"resetAt,omitempty"`
 }
 
 // DefaultCodexClientID is the public OAuth client id used by the Codex CLI.
@@ -283,6 +292,30 @@ func SetCodexAccountQuota(id, status, message string, remaining, limit float64) 
 		cfg.CodexAccounts[i].QuotaCheckedAt = time.Now().Unix()
 		cfg.CodexAccounts[i].QuotaRemaining = remaining
 		cfg.CodexAccounts[i].QuotaLimit = limit
+		return Save()
+	}
+	return fmt.Errorf("codex account not found")
+}
+
+// SetCodexAccountUsage records the usage snapshot from the x-codex-* headers so
+// the admin UI can show how full an account is and when it resets (9router-style).
+// resetAt is Unix seconds (0 if unknown).
+func SetCodexAccountUsage(id string, usedPercent, secondaryUsedPercent float64, resetAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	for i, a := range cfg.CodexAccounts {
+		if a.ID != id {
+			continue
+		}
+		cfg.CodexAccounts[i].UsedPercent = usedPercent
+		cfg.CodexAccounts[i].SecondaryUsedPercent = secondaryUsedPercent
+		if resetAt > 0 {
+			cfg.CodexAccounts[i].ResetAt = resetAt
+		}
+		cfg.CodexAccounts[i].QuotaCheckedAt = time.Now().Unix()
 		return Save()
 	}
 	return fmt.Errorf("codex account not found")

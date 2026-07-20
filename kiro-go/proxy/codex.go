@@ -358,6 +358,7 @@ type codexRateLimit struct {
 	primaryUsedPercent   float64
 	secondaryUsedPercent float64
 	primaryResetAfter    time.Duration // seconds until the primary window resets
+	primaryResetAt       int64         // absolute Unix seconds of reset (0 if unknown)
 	hasCredits           bool
 	creditsUnlimited     bool
 	present              bool // at least one x-codex-* header was present
@@ -385,6 +386,12 @@ func parseCodexRateLimit(hdr http.Header) codexRateLimit {
 			rl.primaryResetAfter = time.Duration(s) * time.Second
 		}
 	}
+	if v := get("x-codex-primary-reset-at"); v != "" {
+		rl.present = true
+		if s, err := strconv.ParseInt(v, 10, 64); err == nil && s > 0 {
+			rl.primaryResetAt = s
+		}
+	}
 	// "False"/"True" strings from the backend.
 	if v := get("x-codex-credits-has-credits"); v != "" {
 		rl.present = true
@@ -410,6 +417,19 @@ func (rl codexRateLimit) exhausted() bool {
 		return true
 	}
 	return false
+}
+
+// resetAtUnix returns the absolute Unix-seconds reset instant, preferring the
+// explicit x-codex-primary-reset-at header and falling back to now+reset-after.
+// Returns 0 if neither is known.
+func (rl codexRateLimit) resetAtUnix() int64 {
+	if rl.primaryResetAt > 0 {
+		return rl.primaryResetAt
+	}
+	if rl.primaryResetAfter > 0 {
+		return time.Now().Add(rl.primaryResetAfter).Unix()
+	}
+	return 0
 }
 
 // cooldownFor returns how long to pause an exhausted account: the real reset
@@ -745,6 +765,8 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			cd := codexQuotaCooldown
 			if rl.present {
 				cd = rl.cooldownFor()
+				// Persist the usage snapshot so admin sees % used + reset time.
+				_ = config.SetCodexAccountUsage(acc.ID, rl.primaryUsedPercent, rl.secondaryUsedPercent, rl.resetAtUnix())
 			}
 			excluded[acc.ID] = true
 			cp.RecordError(acc.ID)
@@ -875,6 +897,12 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		credits := GrokCreditsForRequest(effort, result.InTok+result.OutTok)
 		h.recordSuccessForApiKey(apiKeyID, result.InTok, result.OutTok, credits)
 		cp.RecordSuccess(acc.ID)
+		// Persist a live usage snapshot (percent used + reset time) from the
+		// x-codex-* headers on THIS response so the admin sees a 9router-style
+		// gauge of how full each account is, even while it is still healthy.
+		if rlOK.present {
+			_ = config.SetCodexAccountUsage(acc.ID, rlOK.primaryUsedPercent, rlOK.secondaryUsedPercent, rlOK.resetAtUnix())
+		}
 		// Proactive limit management from the x-codex-* headers on THIS response:
 		// if the account just crossed 100% (or ran out of credits), cool it until
 		// its real reset so the next request skips it instead of failing with 429.

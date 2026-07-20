@@ -73,6 +73,9 @@ func (h *Handler) apiGetCodexAccounts(w http.ResponseWriter, r *http.Request) {
 		QuotaStatus    string  `json:"quotaStatus,omitempty"`
 		QuotaMessage   string  `json:"quotaMessage,omitempty"`
 		QuotaCheckedAt int64   `json:"quotaCheckedAt,omitempty"`
+		UsedPercent    float64 `json:"usedPercent,omitempty"`
+		SecondaryUsedPercent float64 `json:"secondaryUsedPercent,omitempty"`
+		ResetAt        int64   `json:"resetAt,omitempty"`
 		AddedAt        int64   `json:"addedAt,omitempty"`
 		Warming        bool    `json:"warming,omitempty"`
 		WarmupMaxConc  int     `json:"warmupMaxConcurrent,omitempty"`
@@ -96,6 +99,7 @@ func (h *Handler) apiGetCodexAccounts(w http.ResponseWriter, r *http.Request) {
 			HasRefresh: a.RefreshToken != "",
 			MachineId:  a.MachineId, ProxyURL: a.ProxyURL, LastUsed: last,
 			QuotaStatus: a.QuotaStatus, QuotaMessage: a.QuotaMessage, QuotaCheckedAt: a.QuotaCheckedAt,
+			UsedPercent: a.UsedPercent, SecondaryUsedPercent: a.SecondaryUsedPercent, ResetAt: a.ResetAt,
 			AddedAt: a.AddedAt, Warming: wi.Warming,
 			WarmupMaxConc: wi.MaxConcurrent, WarmupSpacing: wi.MinSpacingSec,
 		})
