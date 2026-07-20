@@ -38,6 +38,38 @@
     try { return new Date(unix * 1000).toLocaleString(); } catch (e) { return '—'; }
   }
 
+  // "reset trong 5d 3h (giờ địa phương)" từ Unix seconds.
+  function fmtReset(unix) {
+    if (!unix) return '';
+    var now = Math.floor(Date.now() / 1000);
+    var secs = unix - now;
+    if (secs <= 0) return 'sẵn sàng';
+    var d = Math.floor(secs / 86400); secs -= d * 86400;
+    var h = Math.floor(secs / 3600); secs -= h * 3600;
+    var m = Math.floor(secs / 60);
+    var rel = d > 0 ? (d + 'd ' + h + 'h') : (h > 0 ? (h + 'h ' + m + 'm') : (m + 'm'));
+    return rel + ' (' + fmtTime(unix) + ')';
+  }
+
+  // Thanh quota Codex kiểu 9router: % đã dùng + thời gian reset.
+  function usageBlock(a) {
+    if (a.usedPercent == null && !a.resetAt) return '';
+    var pct = Math.max(0, Math.min(100, Number(a.usedPercent) || 0));
+    var color = pct >= 100 ? '#f87171' : (pct > 80 ? '#fbbf24' : '#34d399');
+    var exhausted = pct >= 100 || a.quotaStatus === 'exhausted';
+    var resetStr = fmtReset(a.resetAt);
+    return '<div style="margin-top:6px">' +
+      '<div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted-foreground,#8b93a9);margin-bottom:2px">' +
+      '<span>' + (exhausted ? 'Quota Codex — HẾT' : 'Quota Codex') +
+      (resetStr ? ' · reset: ' + esc(resetStr) : '') + '</span>' +
+      '<span style="font-weight:700;color:' + color + '">' + pct.toFixed(0) + '%</span>' +
+      '</div>' +
+      '<div style="height:6px;border-radius:999px;background:var(--border,#e5e5e5);overflow:hidden">' +
+      '<div style="height:100%;width:' + pct + '%;background:' + color + '"></div>' +
+      '</div>' +
+      '</div>';
+  }
+
   function ensureSection() {
     var tab = document.getElementById('tabAccounts');
     if (!tab) return null;
@@ -145,6 +177,7 @@
       '<span>tokens: <b style="color:var(--foreground,#111)">' + esc(tokens) + '</b></span>' +
       '<span>credits: <b style="color:var(--foreground,#111)">' + esc(credits.toFixed(2)) + '</b></span>' +
       '</div>' +
+      usageBlock(a) +
       '</div>' +
       '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
       '<button type="button" class="btn btn-outline btn-sm codex-test" data-id="' + esc(a.id) + '"><i class="fa-solid fa-plug-circle-check"></i></button>' +
