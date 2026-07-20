@@ -429,6 +429,27 @@ func (rl codexRateLimit) cooldownFor() time.Duration {
 	return d
 }
 
+// codexLongTermExhaustThreshold separates a short rolling window (the ~5h Codex
+// window, which recovers on its own) from a genuine long-term/weekly limit. When
+// the reset is farther out than this, the account is effectively dead for the
+// session and should be DISABLED rather than left cooling — this stops the
+// health-checker from probing (and burning quota on) an account that cannot
+// possibly recover for days.
+const codexLongTermExhaustThreshold = 6 * time.Hour
+
+// longTermExhausted reports whether the account is exhausted AND its reset is far
+// enough out that it should be disabled instead of merely cooled.
+func (rl codexRateLimit) longTermExhausted() bool {
+	if !rl.exhausted() {
+		return false
+	}
+	// No credits on a metered plan is a hard stop regardless of window.
+	if !rl.creditsUnlimited && !rl.hasCredits {
+		return true
+	}
+	return rl.primaryResetAfter >= codexLongTermExhaustThreshold
+}
+
 func (h *Handler) handleCodexOpenAIChat(w http.ResponseWriter, r *http.Request, req *OpenAIRequest) {
 	// Codex-family cascade: Codex -> Kiro (native gpt-5.6) -> Grok (disguised as gpt-5.6).
 	orig := *req
@@ -725,15 +746,28 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 			if rl.present {
 				cd = rl.cooldownFor()
 			}
+			excluded[acc.ID] = true
+			cp.RecordError(acc.ID)
+			lastErr = fmt.Errorf("Usage limit reached")
+			cp.Release(acc.ID)
+			// A confirmed long-term/weekly limit (reset days away, or no credits)
+			// means the account is dead for this session: DISABLE it so it leaves
+			// the pool entirely and the health-checker stops probing (and burning
+			// quota on) it. A short ~5h window instead just gets a timed cooldown
+			// so it auto-recovers when the window rolls over.
+			if rl.longTermExhausted() {
+				reason := fmt.Sprintf("Usage limit reached — auto-disabled (resets in %s)", cd.Round(time.Minute))
+				logger.Warnf("[Codex] %d LONG-TERM limit account=%s used=%.0f%% reset=%s — disabling. body=%s",
+					resp.StatusCode, acc.Email, rl.primaryUsedPercent, cd.Round(time.Second), truncateStr(string(b), 200))
+				_ = config.SetCodexAccountQuota(acc.ID, "exhausted", reason, 0, 0)
+				cp.Disable(acc.ID, reason)
+				continue
+			}
 			msg := fmt.Sprintf("Usage limit reached (cooldown %s)", cd.Round(time.Minute))
 			logger.Warnf("[Codex] %d quota/rate account=%s used=%.0f%% reset=%s body=%s",
 				resp.StatusCode, acc.Email, rl.primaryUsedPercent, cd.Round(time.Second), truncateStr(string(b), 200))
 			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", msg, 0, 0)
 			cp.Cooldown(acc.ID, "quota exhausted", cd)
-			excluded[acc.ID] = true
-			cp.RecordError(acc.ID)
-			lastErr = fmt.Errorf("Usage limit reached")
-			cp.Release(acc.ID)
 			continue
 		}
 		if resp.StatusCode >= 400 {
@@ -847,7 +881,18 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		// Otherwise the request succeeded, so recover the account immediately
 		// rather than waiting for the background hello probe to clear a stale
 		// cooldown.
-		if rlOK.exhausted() {
+		if rlOK.longTermExhausted() {
+			// Confirmed long-term/weekly limit: disable so the pool and the
+			// health-checker skip it entirely (no wasted probe quota) until an
+			// admin re-enables or it is re-imported after reset.
+			cd := rlOK.cooldownFor()
+			reason := fmt.Sprintf("Usage limit reached — auto-disabled (resets in %s)", cd.Round(time.Minute))
+			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", reason, 0, 0)
+			cp.Disable(acc.ID, reason)
+			logger.Warnf("[Codex] account=%s hit %.0f%% LONG-TERM usage — auto-disabled (resets in %s)",
+				acc.Email, rlOK.primaryUsedPercent, cd.Round(time.Second))
+		} else if rlOK.exhausted() {
+			// Short ~5h window: cool until it rolls over, then auto-recover.
 			cd := rlOK.cooldownFor()
 			cp.Cooldown(acc.ID, "quota exhausted (proactive)", cd)
 			_ = config.SetCodexAccountQuota(acc.ID, "exhausted",

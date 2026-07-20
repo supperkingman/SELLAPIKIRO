@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -110,6 +111,43 @@ func TestParseCodexRateLimit(t *testing.T) {
 	h4.Set("x-codex-primary-reset-after-seconds", "5")
 	if got := parseCodexRateLimit(h4).cooldownFor(); got != time.Minute {
 		t.Fatalf("expected 1m floor, got %s", got)
+	}
+}
+
+// TestCodexLongTermExhausted verifies the disable-vs-cooldown decision: a weekly
+// limit (reset days away) or no credits is long-term (disable), while a short
+// ~5h window is not (cooldown + auto-recover).
+func TestCodexLongTermExhausted(t *testing.T) {
+	// Weekly limit: 100% used, resets in ~6.4 days => long-term.
+	weekly := http.Header{}
+	weekly.Set("x-codex-primary-used-percent", "100")
+	weekly.Set("x-codex-primary-reset-after-seconds", "557411")
+	if !parseCodexRateLimit(weekly).longTermExhausted() {
+		t.Fatal("weekly limit should be long-term exhausted")
+	}
+
+	// Short 5h window: 100% used, resets in ~5h => NOT long-term.
+	short := http.Header{}
+	short.Set("x-codex-primary-used-percent", "100")
+	short.Set("x-codex-primary-reset-after-seconds", strconv.Itoa(5*60*60))
+	if parseCodexRateLimit(short).longTermExhausted() {
+		t.Fatal("5h window should NOT be long-term exhausted")
+	}
+
+	// No credits on a metered plan => long-term regardless of window.
+	noCredits := http.Header{}
+	noCredits.Set("x-codex-credits-has-credits", "False")
+	noCredits.Set("x-codex-credits-unlimited", "False")
+	if !parseCodexRateLimit(noCredits).longTermExhausted() {
+		t.Fatal("no credits should be long-term exhausted")
+	}
+
+	// Healthy account is neither.
+	ok := http.Header{}
+	ok.Set("x-codex-primary-used-percent", "20")
+	ok.Set("x-codex-credits-has-credits", "True")
+	if parseCodexRateLimit(ok).longTermExhausted() {
+		t.Fatal("healthy account must not be long-term exhausted")
 	}
 }
 
