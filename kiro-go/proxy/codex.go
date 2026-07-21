@@ -913,23 +913,24 @@ func (h *Handler) handleCodexWithFormat(w http.ResponseWriter, r *http.Request, 
 		// Otherwise the request succeeded, so recover the account immediately
 		// rather than waiting for the background hello probe to clear a stale
 		// cooldown.
-		if rlOK.longTermExhausted() {
-			// Confirmed long-term/weekly limit: disable so the pool and the
-			// health-checker skip it entirely (no wasted probe quota) until an
-			// admin re-enables or it is re-imported after reset.
-			cd := rlOK.cooldownFor()
-			reason := fmt.Sprintf("%s Usage limit reached — auto-disabled (resets in %s)", codexAutoDisableMarker, cd.Round(time.Minute))
-			_ = config.SetCodexAccountQuota(acc.ID, "exhausted", reason, 0, 0)
-			cp.Disable(acc.ID, reason)
-			logger.Warnf("[Codex] account=%s hit %.0f%% LONG-TERM usage — auto-disabled (resets in %s)",
-				acc.Email, rlOK.primaryUsedPercent, cd.Round(time.Second))
-		} else if rlOK.exhausted() {
-			// Short ~5h window: cool until it rolls over, then auto-recover.
+		// This request just succeeded (HTTP 200), so the account is demonstrably
+		// usable RIGHT NOW — never disable it here. Disabling on a successful
+		// response is what previously killed healthy accounts: a weekly/secondary
+		// window can read >=100% while the primary window (the one that actually
+		// gates serving) is fine, and the request still went through. We only ever
+		// disable on a real upstream rejection (429/402 branch above).
+		//
+		// Proactive management from THIS response's x-codex-* headers is limited to
+		// a timed cooldown, and only when the PRIMARY window is truly full — that is
+		// the window whose exhaustion actually blocks the next request. A secondary
+		// window reading full while primary is fine must NOT pull the account, since
+		// serving clearly still works.
+		if rlOK.present && rlOK.primaryUsedPercent >= 100 {
 			cd := rlOK.cooldownFor()
 			cp.Cooldown(acc.ID, "quota exhausted (proactive)", cd)
 			_ = config.SetCodexAccountQuota(acc.ID, "exhausted",
 				fmt.Sprintf("Usage limit reached (cooldown %s)", cd.Round(time.Minute)), 0, 0)
-			logger.Infof("[Codex] account=%s hit %.0f%% usage — cooling %s until reset",
+			logger.Infof("[Codex] account=%s primary window at %.0f%% — cooling %s until reset",
 				acc.Email, rlOK.primaryUsedPercent, cd.Round(time.Second))
 		} else {
 			cp.ClearCooldown(acc.ID)
