@@ -352,6 +352,14 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
 	}
+	// Headless API-key accounts have their profile bound to the key server-side;
+	// ListAvailableProfiles is neither needed nor available for them. Short-circuit
+	// with a soft error so callers skip resolution instead of logging a hard failure
+	// or (worse) probing and caching a bogus ARN. This must be a soft error so
+	// isProfileArnResolutionSoftError treats it as expected.
+	if account.IsApiKeyCredential() {
+		return "", fmt.Errorf("profile ARN resolution skipped: api_key account uses key-bound profile")
+	}
 
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error

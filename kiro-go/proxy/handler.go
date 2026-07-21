@@ -2980,6 +2980,62 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.ID == "" {
 		account.ID = auth.GenerateAccountID()
 	}
+
+	// Headless Kiro API-key accounts: the ksk_ key IS the credential. Validate it,
+	// normalize the auth method, mirror it into AccessToken (pool routing / model
+	// refresh gate on a non-empty AccessToken), and probe the region the key serves
+	// so an EU key does not inherit us-east-1 and 403 forever. ExpiresAt stays 0 so
+	// the refresh paths skip it — API keys are never refreshed. Detection is
+	// case-insensitive and also fires when a bare kiroApiKey arrives without an
+	// explicit authMethod.
+	account.KiroApiKey = strings.TrimSpace(account.KiroApiKey)
+	var apiKeyInfo *config.AccountInfo
+	if account.IsApiKeyCredential() || account.KiroApiKey != "" {
+		if account.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		// Reject a contradictory payload: a key plus a different explicit OAuth
+		// method would otherwise be silently rewritten to api_key.
+		if am := strings.TrimSpace(account.AuthMethod); am != "" && !account.IsApiKeyCredential() {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey cannot be combined with authMethod " + am})
+			return
+		}
+		if !strings.HasPrefix(account.KiroApiKey, "ksk_") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey must start with ksk_"})
+			return
+		}
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		account.AccessToken = account.KiroApiKey
+		region, info, retryable, err := resolveApiKeyRegion(account.KiroApiKey, account.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		account.Region = region
+		apiKeyInfo = info
+		if info != nil {
+			if account.Email == "" {
+				account.Email = info.Email
+			}
+			if account.UserId == "" {
+				account.UserId = info.UserId
+			}
+		}
+		if account.MachineId == "" {
+			account.MachineId = config.GenerateMachineId()
+		}
+	}
+
 	if account.Region == "" {
 		account.Region = "us-east-1"
 	}
@@ -2988,6 +3044,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+
+	// For api_key accounts the probe already fetched the subscription/usage; persist
+	// it so /admin/pool shows real quota immediately (not only after a later refresh).
+	if apiKeyInfo != nil {
+		if updateErr := config.UpdateAccountInfo(account.ID, *apiKeyInfo); updateErr != nil {
+			logger.Warnf("[AddAccount] failed to persist api_key account info for %s: %v", account.ID, updateErr)
+		}
 	}
 
 	h.pool.Reload()
@@ -4521,6 +4585,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt    int64  `json:"expiresAt"`
 		AuthMethod   string `json:"authMethod,omitempty"`
 		Provider     string `json:"provider,omitempty"`
+		KiroApiKey   string `json:"kiroApiKey,omitempty"` // Present for api_key accounts so backup/restore round-trips
 	}
 
 	type ExportSubscription struct {
@@ -4605,6 +4670,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
 				AuthMethod:   authMethod,
 				Provider:     a.Provider,
+				KiroApiKey:   a.KiroApiKey,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

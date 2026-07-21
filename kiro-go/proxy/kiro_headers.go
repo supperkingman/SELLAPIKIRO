@@ -109,6 +109,16 @@ func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kir
 	if account != nil && account.AuthMethod == "external_idp" {
 		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
+	// Headless Kiro API keys (ksk_...) are sent as the bearer token, but the
+	// upstream requires a "tokentype: API_KEY" header to recognize the key type.
+	// Prefer the KiroApiKey field explicitly so it works even if AccessToken was
+	// not mirrored for some reason.
+	if account != nil && account.IsApiKeyCredential() {
+		if account.KiroApiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+account.KiroApiKey)
+		}
+		req.Header.Set("tokentype", "API_KEY")
+	}
 	if values.Host != "" {
 		req.Host = values.Host
 	}
