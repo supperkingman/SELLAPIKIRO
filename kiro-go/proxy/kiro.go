@@ -645,6 +645,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	// receivedAny tracks whether we already parsed at least one full event frame.
+	// Kiro's upstream sometimes drops the connection mid-stream, which surfaces as
+	// io.ErrUnexpectedEOF from io.ReadFull. If we have already delivered usable
+	// output (text/tool/reasoning events), salvage it and finish gracefully instead
+	// of failing the whole request — the client has the partial reply, and failing
+	// here just turns a truncated-but-usable answer into a hard "unexpected EOF".
+	receivedAny := false
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -654,6 +661,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
+			// A clean stream ends with io.EOF above. An UnexpectedEOF here means the
+			// connection was cut between frames. Salvage anything already received.
+			if err == io.ErrUnexpectedEOF && receivedAny {
+				logger.Warnf("[KiroAPI] stream ended early (%v) after receiving events; salvaging partial reply", err)
+				break
+			}
 			return err
 		}
 
@@ -669,8 +682,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			// Connection cut mid-frame: salvage prior events rather than hard-failing.
+			if (err == io.ErrUnexpectedEOF || err == io.EOF) && receivedAny {
+				logger.Warnf("[KiroAPI] stream ended mid-frame (%v) after receiving events; salvaging partial reply", err)
+				break
+			}
 			return err
 		}
+		receivedAny = true
 
 		if headersLength > len(msgBuf)-4 {
 			continue
