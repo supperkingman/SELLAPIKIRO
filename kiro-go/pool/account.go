@@ -171,11 +171,21 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 // accountHasModel 检查账号是否支持指定模型。
 // 若该账号尚无模型列表（冷启动），视为支持所有模型。
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	// gpt-5.6 家族（sol/terra/luna 及其 effort 后缀）是 Codex→Kiro 级联的目标：
+	// Kiro 作为原生后端服务这些模型。每个账号的广告模型列表来自 Kiro 的
+	// ListAvailableModels（仅含 claude-* 原生模型），并不包含 gpt-5.6-*，
+	// 因此若在此按广告列表过滤，会把所有存活的 Kiro 账号都排除掉，导致
+	// Codex 耗尽后级联到 Kiro 时误报 "No available accounts"。故 gpt-5.6*
+	// 对所有 Kiro 账号一律视为可服务。
+	if strings.HasPrefix(m, "gpt-5.6") || strings.HasPrefix(m, "gpt-5.6-") {
+		return true
+	}
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
 		return true // 冷启动：列表未就绪，乐观放行
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	return list[m]
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。
