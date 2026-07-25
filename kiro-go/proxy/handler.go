@@ -1969,6 +1969,24 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 
+		// Upstream can answer HTTP 200 with a completely empty body: no text, no
+		// reasoning, no tool calls. This happens when the request is refused
+		// silently upstream (e.g. an oversized/pattern-tripping system prompt)
+		// rather than with an error status. Returning that as a success produced a
+		// 200 with completion_tokens=0 and no content, which agent clients read as
+		// "empty response" and retry blindly. Treat it as a failure so we try
+		// another account and, if none succeeds, surface a real error to the caller.
+		// A reply carrying only tool calls is legitimate, hence the toolUses check.
+		if strings.TrimSpace(content) == "" && strings.TrimSpace(thinkingContent) == "" && len(toolUses) == 0 {
+			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
+			logger.Warnf("[Claude] empty upstream reply account=%s model=%s — trying another account", account.Email, model)
+			// Deliberately NOT RecordError: an empty reply is caused by the request
+			// (system prompt/context), not by this account. Cooling accounts here
+			// would let one bad prompt drain the whole pool into cooldown.
+			excluded[account.ID] = true
+			continue
+		}
+
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		rawThinkingContent := thinkingContent
@@ -2633,6 +2651,17 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		// See handleClaudeNonStream: a 200 with no text, no reasoning and no tool
+		// calls is a silent upstream refusal, not a valid answer. Fail over instead
+		// of handing the client an empty completion it can only retry on.
+		if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoningContent) == "" && len(toolUses) == 0 {
+			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
+			logger.Warnf("[OpenAI] empty upstream reply account=%s model=%s — trying another account", account.Email, model)
+			// Not RecordError: request-caused, not account-caused (see Claude path).
+			excluded[account.ID] = true
 			continue
 		}
 
