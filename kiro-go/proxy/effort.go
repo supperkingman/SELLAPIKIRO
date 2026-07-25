@@ -15,7 +15,9 @@ package proxy
 // list advertises one variant per level.
 
 import (
+	"errors"
 	"strings"
+	"sync/atomic"
 
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -136,7 +138,9 @@ func modelSupportsEffort(model string) bool {
 // suffixLevel comes from stripEffortSuffix, nativeHint from the request body.
 func resolveEffort(model, suffixLevel, nativeHint string) (level string, enabled bool) {
 	cfg := config.GetEffortConfig()
-	if cfg.EffortFormat == effortFormatOff {
+	// Ask effortWireFormat rather than reading the config field directly, so there
+	// is a single place that decides the active format.
+	if effortWireFormat() == effortFormatOff {
 		return "", false
 	}
 	if !modelSupportsEffort(model) {
@@ -163,7 +167,11 @@ func resolveEffort(model, suffixLevel, nativeHint string) (level string, enabled
 // back to the reasoning shape, which is the minimal one and the most widely
 // accepted; a wrong guess costs one retry, handled by isEffortRejection400.
 func effortWireFormat() string {
-	switch config.GetEffortConfig().EffortFormat {
+	format := config.GetEffortConfig().EffortFormat
+	if o := effortFormatOverride.Load(); o != nil {
+		format = *o
+	}
+	switch format {
 	case effortFormatOutputConfig:
 		return effortFormatOutputConfig
 	case effortFormatReasoning:
@@ -174,6 +182,11 @@ func effortWireFormat() string {
 		return effortFormatReasoning
 	}
 }
+
+// effortFormatOverride lets tests select a wire format without touching the stored
+// configuration. UpdateEffortConfig persists to disk, which is both unavailable in
+// unit tests and would leak state between them.
+var effortFormatOverride atomic.Pointer[string]
 
 // applyEffortToPayload attaches the effort level to an outgoing Kiro request.
 // A no-op when the level is empty, so a request without effort keeps exactly the
@@ -230,6 +243,28 @@ func reduceEffortOnPayload(payload *KiroPayload) (from, to string, ok bool) {
 	from = payload.EffortLevel
 	applyEffortToPayload(payload, next)
 	return from, next, true
+}
+
+// isEffortRejection reports whether err looks like upstream refusing the effort
+// fields we added, in either of the two ways it does so.
+//
+// The 400 path is the obvious one. The empty-stream path is the one that caught us
+// out in production: rather than rejecting an unrecognised additionalModelRequest-
+// Fields shape with an error, Kiro's upstream answers HTTP 200 and closes the
+// stream without sending a single frame. That is indistinguishable from a throttle
+// at the transport level, so effort has to be treated as a suspect whenever we
+// attached it and got nothing back.
+//
+// Retrying without effort is safe either way: if the real cause was a throttle, the
+// retry simply fails again and normal failover continues.
+func isEffortRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errKiroEmptyStream) {
+		return true
+	}
+	return isEffortRejection400(err.Error())
 }
 
 // isEffortRejection400 guesses whether a 400 was caused by the effort fields

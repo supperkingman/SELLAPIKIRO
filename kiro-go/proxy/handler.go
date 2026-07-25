@@ -1489,13 +1489,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		err := CallKiroAPI(account, payload, callback)
 
-		// The effort wire shape is a guess for models whose schema we cannot read,
-		// so a 400 naming those fields means the guess was wrong rather than the
-		// request being bad. Retry once on the SAME account without effort: the cost
-		// of guessing wrong stays one request, and a request that worked before this
-		// feature existed keeps working. Only safe pre-commit.
+		// The effort wire shape is a guess for models whose schema we cannot read, so
+		// a rejection means the guess was wrong rather than the request being bad.
+		// Upstream signals this either with a 400 or, in practice more often, with a
+		// HTTP 200 empty stream. Retry once on the SAME account without effort: the
+		// cost of guessing wrong stays one request, and a request that worked before
+		// this feature existed keeps working. Only safe pre-commit.
 		if err != nil && !messageStarted && payload.EffortLevel != "" && !effortRetried &&
-			isEffortRejection400(err.Error()) {
+			isEffortRejection(err) {
 			effortRetried = true
 			logger.Warnf("[Effort] upstream rejected the effort fields (%v); retrying without effort", err)
 			stripEffortFromPayload(payload)
@@ -2672,11 +2673,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		err := CallKiroAPI(account, payload, callback)
 
-		// Same as the Claude stream: a 400 naming the effort fields means our wire
-		// shape guess was wrong, not that the request is bad. Retry once without
-		// effort so a request that worked before this feature keeps working.
+		// Same as the Claude stream: a rejection of the effort fields, whether a 400
+		// or an empty 200 stream, means our wire shape guess was wrong rather than the
+		// request being bad. Retry once without effort so a request that worked before
+		// this feature keeps working.
 		if err != nil && !responseStarted && payload.EffortLevel != "" && !effortRetried &&
-			isEffortRejection400(err.Error()) {
+			isEffortRejection(err) {
 			effortRetried = true
 			logger.Warnf("[Effort] upstream rejected the effort fields (%v); retrying without effort", err)
 			stripEffortFromPayload(payload)

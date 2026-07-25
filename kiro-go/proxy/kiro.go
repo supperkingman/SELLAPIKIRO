@@ -120,7 +120,12 @@ func kiroStreamFirstFrameTimeout() time.Duration {
 			return time.Duration(s) * time.Second
 		}
 	}
-	return 600 * time.Second
+	// 240s, not the 600s first tried. A generous budget is not free: every waiting
+	// request holds a connection and a goroutine for its whole duration, so too
+	// large a value converts a fast failure into minutes of held capacity and the
+	// proxy starts refusing new connections under load. 240s still covers a large
+	// prefill while bounding how much capacity one stuck request can occupy.
+	return 240 * time.Second
 }
 
 // kiroStreamHeartbeatInterval is how often we notify the caller while a frame

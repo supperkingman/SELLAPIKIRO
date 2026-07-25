@@ -1,9 +1,25 @@
 package proxy
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"kiro-go/config"
 )
+
+// withEffortFormat turns the effort wire format on for one test and clears it
+// afterwards. Needed because the shipped default is "off".
+//
+// This sets the in-memory override rather than calling UpdateEffortConfig, which
+// persists to disk: there is no config file in a unit test, and a stored value
+// would leak into every test that runs after this one.
+func withEffortFormat(t *testing.T, format string) {
+	t.Helper()
+	effortFormatOverride.Store(&format)
+	t.Cleanup(func() { effortFormatOverride.Store(nil) })
+}
 
 // TestStripEffortSuffix is the highest-risk piece of this feature: every other
 // consumer matches on the model name, so a suffix left attached becomes an unknown
@@ -79,6 +95,10 @@ func TestNormalizeEffort(t *testing.T) {
 // TestResolveEffortPriority pins the documented precedence: model suffix beats a
 // native body hint, which beats the configured default.
 func TestResolveEffortPriority(t *testing.T) {
+	// The default format is off, so enable it: this test is about priority between
+	// the three sources, not about whether the feature is switched on.
+	withEffortFormat(t, "reasoning")
+
 	// Suffix wins over a conflicting native hint.
 	if lvl, ok := resolveEffort("claude-opus-5", effortLow, "max"); !ok || lvl != effortLow {
 		t.Errorf("suffix should win: got (%q, %v), want (low, true)", lvl, ok)
@@ -106,6 +126,8 @@ func TestResolveEffortSkipsNonClaudeModels(t *testing.T) {
 // TestApplyEffortToPayloadReasoningShape checks the wire shape and, importantly,
 // that a request without effort is left byte-identical to before this feature.
 func TestApplyEffortToPayloadReasoningShape(t *testing.T) {
+	withEffortFormat(t, "reasoning")
+
 	payload := &KiroPayload{}
 	applyEffortToPayload(payload, effortHigh)
 
@@ -150,6 +172,8 @@ func TestReduceEffortWalksDown(t *testing.T) {
 // TestReduceEffortOnPayload verifies the in-place step down and that it reports
 // failure at the bottom, so a caller cannot loop forever lowering effort.
 func TestReduceEffortOnPayload(t *testing.T) {
+	withEffortFormat(t, "reasoning")
+
 	payload := &KiroPayload{}
 	applyEffortToPayload(payload, effortMax)
 
@@ -211,6 +235,52 @@ func TestIsEffortRejection400(t *testing.T) {
 		if isEffortRejection400(msg) {
 			t.Errorf("isEffortRejection400(%q) = true, want false", msg)
 		}
+	}
+}
+
+// TestIsEffortRejectionCoversEmptyStream is the regression test for the failure
+// that reached production. Upstream does not reject an unrecognised effort shape
+// with a 400; it answers HTTP 200 and closes the stream with no frames. The
+// original safety net only looked for a 400, so it never fired and every Claude
+// request broke instead.
+func TestIsEffortRejectionCoversEmptyStream(t *testing.T) {
+	if !isEffortRejection(errKiroEmptyStream) {
+		t.Error("an empty stream must be treated as a possible effort rejection")
+	}
+	// Wrapped, as it arrives through the call stack.
+	if !isEffortRejection(fmt.Errorf("account kr77: %w", errKiroEmptyStream)) {
+		t.Error("a wrapped empty stream must still be recognised")
+	}
+	// The 400 forms still count.
+	if !isEffortRejection(errors.New("HTTP 400: unexpected field additionalModelRequestFields")) {
+		t.Error("a 400 naming our fields must still be recognised")
+	}
+	// Unrelated failures must not trigger a retry: retrying an auth or quota error
+	// without effort just wastes a request and delays failover.
+	for _, msg := range []string{
+		"HTTP 401 unauthorized",
+		"HTTP 429 quota exhausted",
+		"HTTP 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+	} {
+		if isEffortRejection(errors.New(msg)) {
+			t.Errorf("isEffortRejection(%q) = true, want false", msg)
+		}
+	}
+	if isEffortRejection(nil) {
+		t.Error("nil must not be treated as a rejection")
+	}
+}
+
+// TestEffortDefaultsToOff pins the safer default. Effort must not alter requests
+// until an operator has confirmed a format upstream accepts, because a wrong guess
+// fails silently rather than loudly.
+func TestEffortDefaultsToOff(t *testing.T) {
+	if got := config.GetEffortConfig().EffortFormat; got != "off" {
+		t.Errorf("default effortFormat = %q, want \"off\"", got)
+	}
+	// With the format off, nothing should be attached even at max.
+	if _, enabled := resolveEffort("claude-opus-5", effortMax, ""); enabled {
+		t.Error("effort must not be applied while the format is off")
 	}
 }
 
