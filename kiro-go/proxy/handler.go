@@ -2335,6 +2335,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	// wroteToWire records that at least one byte reached the client, which commits
+	// the status and headers. It lives outside the retry loop on purpose: a keepalive
+	// sent while waiting on one account commits the response for every later attempt
+	// too, whereas responseStarted is per-attempt and tracks real output only.
+	wroteToWire := false
 	reqStart := time.Now()
 	// effortRetried keeps the retry-without-effort attempt to once per request, so
 	// a persistent 400 cannot turn into a retry loop across the account pool.
@@ -2667,6 +2672,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				writeMu.Lock()
 				fmt.Fprintf(w, ": keepalive %d\n\n", time.Now().Unix())
 				flusher.Flush()
+				// Writing anything commits the response: the status and headers are on
+				// the wire now, even though this comment is not output. Record that
+				// separately from responseStarted so a later failure cannot try to send
+				// an error status onto an already-committed stream, which produced a
+				// truncated reply instead of a usable error.
+				wroteToWire = true
 				writeMu.Unlock()
 			},
 		}
@@ -2810,10 +2821,43 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return true
 	}
 
-	// Nothing written yet — let caller try silent Grok xhigh fallback.
 	if lastErr != nil {
 		h.recordFailureWithDetails("openai", model, "", lastErr)
 	}
+
+	// A keepalive comment sent while waiting on a stalled upstream already committed
+	// the status and headers, even though no output followed. Returning false here
+	// would let the caller write an error status onto a response that is already a
+	// 200, which is the "superfluous WriteHeader" case: the client then receives a
+	// truncated stream instead of either an answer or a usable error.
+	//
+	// Since the status can no longer be changed, end the SSE stream the way clients
+	// expect instead: a final chunk with an error finish reason, then [DONE]. The
+	// failure is still recorded above, so accounting and logs are unaffected.
+	if wroteToWire {
+		writeMu.Lock()
+		final := map[string]interface{}{
+			"id":      chatID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]interface{}{{
+				"index":         0,
+				"delta":         map[string]interface{}{},
+				"finish_reason": "error",
+			}},
+		}
+		if data, err := json.Marshal(final); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		writeMu.Unlock()
+		logger.Warnf("[OpenAI] stream already committed by a keepalive; closed it with finish_reason=error model=%s lastErr=%v", model, lastErr)
+		return true
+	}
+
+	// Nothing written yet — let caller try silent Grok xhigh fallback.
 	return false
 }
 

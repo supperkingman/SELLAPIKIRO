@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -932,6 +933,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 	// tool use). Upstream soft-throttles by closing a HTTP 200 stream without ever
 	// sending one, which must be surfaced as a failure rather than an empty success.
 	contentFrames := 0
+	// Diagnostics for the contentFrames == 0 case only. Counting every frame and
+	// every event type is what makes it possible to say whether upstream sent
+	// nothing at all or sent something this parser does not understand.
+	frameCount := 0
+	seenEventTypes := map[string]int{}
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -981,6 +987,8 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 		}
 
 		eventType := extractEventType(msgBuf[0:headersLength])
+		frameCount++
+		seenEventTypes[eventType]++
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue
@@ -1046,6 +1054,23 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 	// content frame means nothing was written to the wire yet, so the caller is
 	// still pre-commit and can retry on another account.
 	if contentFrames == 0 {
+		// Distinguish "upstream sent nothing" from "upstream sent frames we failed to
+		// recognise". Both reach here, but they need opposite responses: the first is a
+		// genuine throttle worth failing over, the second means this parser is out of
+		// step with the wire format and no amount of failover will help.
+		//
+		// The event types are logged because that difference is invisible otherwise: a
+		// renamed field or event would silently turn every good answer into an "empty
+		// stream", which looks exactly like a throttle from the outside.
+		if len(seenEventTypes) > 0 {
+			types := make([]string, 0, len(seenEventTypes))
+			for t, n := range seenEventTypes {
+				types = append(types, fmt.Sprintf("%s=%d", t, n))
+			}
+			sort.Strings(types)
+			logger.Warnf("[KiroAPI] stream carried %d frames but no recognised content; event types: %s",
+				frameCount, strings.Join(types, " "))
+		}
 		return errKiroEmptyStream
 	}
 
