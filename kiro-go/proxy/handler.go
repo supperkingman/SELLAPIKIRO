@@ -1438,6 +1438,24 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return true
 		}
 
+		// Upstream finished without error but emitted nothing usable: no text, no
+		// reasoning, no tool calls, and not a single SSE event sent yet. Continuing
+		// here would synthesize message_start + message_delta + message_stop with
+		// completion_tokens=0, i.e. a "usage-only" stream that agent clients read as
+		// an empty response and retry with the identical payload. Because nothing has
+		// been written to the wire yet (messageStarted == false), we can safely fail
+		// over to another account, and if none succeeds the caller surfaces a real
+		// error instead of a fake successful completion.
+		if !messageStarted && rawContentBuilder.Len() == 0 && rawThinkingBuilder.Len() == 0 && len(toolUses) == 0 {
+			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
+			logger.Warnf("[Claude] empty upstream stream account=%s model=%s — trying another account", account.Email, model)
+			// Not RecordError: an empty reply is caused by the request (system
+			// prompt/context), not by this account. Penalizing accounts here would let
+			// one bad prompt drain the whole pool into cooldown.
+			excluded[account.ID] = true
+			continue
+		}
+
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
 			sendText("", 3)
@@ -2536,6 +2554,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			flusher.Flush()
 			writeMu.Unlock()
 			return true
+		}
+
+		// See handleClaudeStream: upstream finished without error but produced no
+		// text, no reasoning and no tool calls, and no chunk has hit the wire yet.
+		// Emitting the final chunk here would produce a usage-only stream ending in
+		// [DONE] with completion_tokens=0, which agent clients read as an empty
+		// response and retry with the same payload. Fail over instead.
+		if !responseStarted && rawContentBuilder.Len() == 0 && rawReasoningBuilder.Len() == 0 && len(toolCalls) == 0 {
+			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
+			logger.Warnf("[OpenAI] empty upstream stream account=%s model=%s — trying another account", account.Email, model)
+			// Not RecordError: request-caused, not account-caused.
+			excluded[account.ID] = true
+			continue
 		}
 
 		processText("", false, true)
