@@ -129,6 +129,12 @@ func kiroStreamFirstFrameTimeout() time.Duration {
 	return 240 * time.Second
 }
 
+// streamRetryBackoff spaces out retries of a stream that died before emitting
+// anything. Without a pause the next endpoint is tried within the same second and
+// tends to fail the same way, because whatever upstream condition dropped the
+// stream has not cleared yet.
+const streamRetryBackoff = 2 * time.Second
+
 // kiroStreamHeartbeatInterval is how often we notify the caller while a frame
 // read is blocked, so it can put a keepalive byte on the wire. Intermediate
 // reverse proxies and tunnels close idle connections well before our own idle
@@ -750,10 +756,30 @@ retryEndpoints:
 			onHeartbeat = callback.OnHeartbeat
 		}
 		guard := newIdleGuard(cancelReq, onHeartbeat)
-		err = parseEventStream(resp.Body, callback, guard)
+		emitted, err := parseEventStreamTracked(resp.Body, callback, guard)
 		guard.close()
 		resp.Body.Close()
-		return err
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// Stream parsing was the only failure branch here that returned instead of
+		// trying the next endpoint, so an upstream that dropped the connection was
+		// never retried however early it happened. Retry only while nothing has been
+		// emitted: the client has seen no bytes, so a fresh attempt cannot duplicate
+		// output. Once content is out, retrying would concatenate two partial answers,
+		// so the error is still surfaced and the missing stop_reason keeps the
+		// truncation detectable by the client.
+		if emitted {
+			return err
+		}
+		logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output: %v", ep.Name, err)
+		// The pause is what makes the retry worth attempting. Cross-endpoint attempts
+		// otherwise fire within the same second and tend to fail together, since the
+		// upstream condition causing the drop has not cleared yet.
+		time.Sleep(streamRetryBackoff)
+		continue
 	}
 
 	if lastErr != nil {
@@ -907,13 +933,33 @@ func (g *idleGuard) translateErr(err error) error {
 	return err
 }
 
-// parseEventStream decodes an AWS binary Event Stream response body.
+// parseEventStream keeps the original signature for callers that do not care
+// whether anything was emitted (non-streaming paths and tests).
+func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleGuard) error {
+	return parseEventStreamInto(body, callback, guard, nil)
+}
+
+// parseEventStreamTracked additionally reports whether any client-visible output
+// (text, reasoning or tool use) already reached the caller. That distinction is
+// what makes a retry safe: with nothing emitted the client has seen no bytes, so a
+// fresh attempt cannot duplicate output, whereas retrying after content is out
+// would concatenate two partial answers.
+func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback, guard *idleGuard) (emitted bool, err error) {
+	n := 0
+	err = parseEventStreamInto(body, callback, guard, &n)
+	return n > 0, err
+}
+
+// parseEventStreamInto decodes an AWS binary Event Stream response body.
 //
 // guard may be nil (non-streaming callers and tests). When present, every
 // completed read reports progress to it, and it cancels the request if the stream
 // goes silent. Reads stay plain and sequential: this goroutine is the only reader
 // of body, which is what makes the framing reliable.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleGuard) error {
+//
+// contentOut, when non-nil, receives the number of content frames seen, on every
+// exit path.
+func parseEventStreamInto(body io.Reader, callback *KiroStreamCallback, guard *idleGuard, contentOut *int) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -933,6 +979,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 	// tool use). Upstream soft-throttles by closing a HTTP 200 stream without ever
 	// sending one, which must be surfaced as a failure rather than an empty success.
 	contentFrames := 0
+	// Reported through a defer so that every return path, including the error ones,
+	// tells the caller what was emitted.
+	if contentOut != nil {
+		defer func() { *contentOut = contentFrames }()
+	}
 	// Diagnostics for the contentFrames == 0 case only. Counting every frame and
 	// every event type is what makes it possible to say whether upstream sent
 	// nothing at all or sent something this parser does not understand.
