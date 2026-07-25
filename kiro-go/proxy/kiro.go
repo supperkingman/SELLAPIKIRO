@@ -216,6 +216,14 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// UpstreamRejectedContext is set by the request handlers when every Kiro
+	// account answered with a completely empty reply (no content, reasoning or
+	// tool calls). Upstream does that instead of returning an error when it
+	// refuses the request context, so the distinction matters to the caller: it
+	// means "this context was rejected", not "no accounts were available", and
+	// the client deserves the former message. Not serialized to the Kiro API body.
+	UpstreamRejectedContext bool `json:"-"`
 }
 
 type KiroUserInputMessage struct {

@@ -991,8 +991,21 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if h.trySilentProvidersClaude(w, r, &req, req.Model) {
 		return
 	}
+	// Upstream refusing the request context is a different failure from having no
+	// usable accounts, and reporting it as the latter sends customers chasing a
+	// capacity problem that does not exist.
+	if kiroPayload != nil && kiroPayload.UpstreamRejectedContext {
+		h.sendClaudeError(w, 502, "api_error", upstreamContextRejectedMessage)
+		return
+	}
 	h.sendClaudeError(w, 503, "api_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
 }
+
+// upstreamContextRejectedMessage is returned when every backend answered with an
+// empty reply, which is how upstream signals that it refused the request context.
+// Deliberately neutral: it tells the customer which part of the request to change
+// without describing our routing or backends.
+const upstreamContextRejectedMessage = "Upstream policy rejected this request context. Reduce the system prompt / conversation context and retry. Nếu cần hỗ trợ, liên hệ Telegram: @tainguyenvibebot"
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) bool {
@@ -1449,6 +1462,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !messageStarted && rawContentBuilder.Len() == 0 && rawThinkingBuilder.Len() == 0 && len(toolUses) == 0 {
 			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
 			logger.Warnf("[Claude] empty upstream stream account=%s model=%s — trying another account", account.Email, model)
+			payload.UpstreamRejectedContext = true
 			// Not RecordError: an empty reply is caused by the request (system
 			// prompt/context), not by this account. Penalizing accounts here would let
 			// one bad prompt drain the whole pool into cooldown.
@@ -1998,6 +2012,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if strings.TrimSpace(content) == "" && strings.TrimSpace(thinkingContent) == "" && len(toolUses) == 0 {
 			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
 			logger.Warnf("[Claude] empty upstream reply account=%s model=%s — trying another account", account.Email, model)
+			payload.UpstreamRejectedContext = true
 			// Deliberately NOT RecordError: an empty reply is caused by the request
 			// (system prompt/context), not by this account. Cooling accounts here
 			// would let one bad prompt drain the whole pool into cooldown.
@@ -2178,6 +2193,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// All Kiro accounts failed before any client body was written → silent providers
 	// in split-priority order.
 	if h.trySilentProvidersOpenAI(w, r, &req, req.Model) {
+		return
+	}
+	// See the Claude path: distinguish a refused context from an empty pool.
+	if kiroPayload != nil && kiroPayload.UpstreamRejectedContext {
+		h.sendOpenAIError(w, 502, "server_error", upstreamContextRejectedMessage)
 		return
 	}
 	h.sendOpenAIError(w, 503, "server_error", "No available accounts Liên hệ admin Telegram: @tainguyenvibebot")
@@ -2564,6 +2584,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if !responseStarted && rawContentBuilder.Len() == 0 && rawReasoningBuilder.Len() == 0 && len(toolCalls) == 0 {
 			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
 			logger.Warnf("[OpenAI] empty upstream stream account=%s model=%s — trying another account", account.Email, model)
+			payload.UpstreamRejectedContext = true
 			// Not RecordError: request-caused, not account-caused.
 			excluded[account.ID] = true
 			continue
@@ -2691,6 +2712,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoningContent) == "" && len(toolUses) == 0 {
 			lastErr = fmt.Errorf("upstream returned an empty response (no content, reasoning, or tool calls)")
 			logger.Warnf("[OpenAI] empty upstream reply account=%s model=%s — trying another account", account.Email, model)
+			payload.UpstreamRejectedContext = true
 			// Not RecordError: request-caused, not account-caused (see Claude path).
 			excluded[account.ID] = true
 			continue
