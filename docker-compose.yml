@@ -51,6 +51,11 @@ services:
       # TEST-ONLY: pin all Kiro requests to a single upstream endpoint by name
       # ("Kiro IDE" | "CodeWhisperer" | "AmazonQ"). Empty = normal multi-endpoint.
       - KIRO_FORCE_ENDPOINT=${KIRO_FORCE_ENDPOINT:-}
+      # Byte budget (in KB) for the serialized upstream request body, before the
+      # per-model tier multiplier. Empty = built-in default (640KB base, x4 for
+      # 1M-context models such as claude-opus-5). Lower this if upstream starts
+      # rejecting large contexts; set 160 to make 1M models land back on 640KB.
+      - KIRO_MAX_PAYLOAD_KB=${KIRO_MAX_PAYLOAD_KB:-}
     restart: unless-stopped
 
   # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).
