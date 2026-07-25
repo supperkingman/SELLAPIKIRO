@@ -37,8 +37,13 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	if len(raw) > maxPayloadBytes {
-		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), maxPayloadBytes)
+	// Assert against the per-model budget, which is what truncation actually targets.
+	// The old fixed maxPayloadBytes constant no longer applies here: opus-4.8 has a
+	// 1M-token window and so gets a proportionally larger budget, and comparing
+	// against the smaller constant made this test fail while the code was correct.
+	limit := maxPayloadBytesForModel("claude-opus-4.8")
+	if len(raw) > limit {
+		t.Fatalf("payload size %d exceeds the model budget %d after truncation", len(raw), limit)
 	}
 
 	// The current message must be preserved.
