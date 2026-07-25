@@ -938,6 +938,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 	// nothing at all or sent something this parser does not understand.
 	frameCount := 0
 	seenEventTypes := map[string]int{}
+	// -1 means upstream never reported context usage, which is different from
+	// reporting 0%.
+	lastContextPct := -1.0
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -1040,6 +1043,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 			}
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
+				lastContextPct = pct
 				if callback.OnContextUsage != nil {
 					callback.OnContextUsage(pct)
 				}
@@ -1068,8 +1072,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleG
 				types = append(types, fmt.Sprintf("%s=%d", t, n))
 			}
 			sort.Strings(types)
-			logger.Warnf("[KiroAPI] stream carried %d frames but no recognised content; event types: %s",
-				frameCount, strings.Join(types, " "))
+			ctxNote := "context usage not reported"
+			if lastContextPct >= 0 {
+				ctxNote = fmt.Sprintf("context usage %.1f%%", lastContextPct)
+			}
+			logger.Warnf("[KiroAPI] stream carried %d frames but no recognised content; event types: %s; %s",
+				frameCount, strings.Join(types, " "), ctxNote)
 		}
 		return errKiroEmptyStream
 	}
