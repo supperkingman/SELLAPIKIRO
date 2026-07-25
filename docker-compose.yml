@@ -63,6 +63,11 @@ services:
       # rebuild, leaving the other stall protections in place.
       - KIRO_STREAM_IDLE_TIMEOUT_SEC=${KIRO_STREAM_IDLE_TIMEOUT_SEC:-}
       - KIRO_STREAM_HEARTBEAT_SEC=${KIRO_STREAM_HEARTBEAT_SEC:-}
+      # Budget for the wait before the FIRST frame, which is much longer than
+      # mid-stream silence: upstream sends nothing while prefilling the prompt, and
+      # a large context at high effort can stay silent for minutes before answering
+      # normally (default 600).
+      - KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC=${KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC:-}
     restart: unless-stopped
 
   # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).
