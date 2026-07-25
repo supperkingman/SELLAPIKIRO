@@ -271,14 +271,25 @@ func TestIsEffortRejectionCoversEmptyStream(t *testing.T) {
 	}
 }
 
-// TestEffortDefaultsToOff pins the safer default. Effort must not alter requests
-// until an operator has confirmed a format upstream accepts, because a wrong guess
-// fails silently rather than loudly.
-func TestEffortDefaultsToOff(t *testing.T) {
-	if got := config.GetEffortConfig().EffortFormat; got != "off" {
-		t.Errorf("default effortFormat = %q, want \"off\"", got)
+// TestEffortDefaultsToAuto pins that effort is on by default, and that switching
+// it off is still honoured.
+//
+// Being on by default is only acceptable because a wrong wire-shape guess is
+// recoverable: an empty stream counts as a possible effort rejection and is
+// retried without effort, so the cost is a retry rather than the request. That
+// property is asserted here so it cannot be removed without this test failing.
+func TestEffortDefaultsToAuto(t *testing.T) {
+	if got := config.GetEffortConfig().EffortFormat; got != "auto" {
+		t.Errorf("default effortFormat = %q, want \"auto\"", got)
 	}
-	// With the format off, nothing should be attached even at max.
+	if _, enabled := resolveEffort("claude-opus-5", effortMax, ""); !enabled {
+		t.Error("effort should apply by default for a Claude model")
+	}
+	if !isEffortRejection(errKiroEmptyStream) {
+		t.Error("the empty-stream recovery net is what makes the auto default safe")
+	}
+	// Turning it off must still suppress it entirely.
+	withEffortFormat(t, effortFormatOff)
 	if _, enabled := resolveEffort("claude-opus-5", effortMax, ""); enabled {
 		t.Error("effort must not be applied while the format is off")
 	}

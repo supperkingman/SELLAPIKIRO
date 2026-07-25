@@ -198,7 +198,7 @@ type Config struct {
 	// Reasoning-effort configuration. Effort controls how hard the model thinks
 	// (low..max); see proxy/effort.go for how a request's level is resolved.
 	DefaultEffort string `json:"defaultEffort,omitempty"` // Level for requests that do not state one (default: "max")
-	EffortFormat  string `json:"effortFormat,omitempty"`  // "auto", "reasoning", "output_config" or "off" (default: "off")
+	EffortFormat  string `json:"effortFormat,omitempty"`  // "auto", "reasoning", "output_config" or "off" (default: "auto")
 	// ExposeEffortModels is a pointer so that "unset" is distinguishable from an
 	// explicit false: the default is true, which a plain bool could not express
 	// because its zero value would silently disable the advertised variants.
@@ -851,7 +851,7 @@ type EffortConfig struct {
 }
 
 // GetEffortConfig returns the effort configuration with defaults filled in:
-// "max" effort, "off" format, and variants advertised. An empty stored value is
+// "max" effort, "auto" format, and variants advertised. An empty stored value is
 // treated as unset rather than as an error, matching GetThinkingConfig.
 func GetEffortConfig() EffortConfig {
 	cfgLock.RLock()
@@ -862,7 +862,7 @@ func GetEffortConfig() EffortConfig {
 	if cfg == nil {
 		return EffortConfig{
 			DefaultEffort:      "max",
-			EffortFormat:       "off",
+			EffortFormat:       "auto",
 			ExposeEffortModels: true,
 		}
 	}
@@ -873,12 +873,17 @@ func GetEffortConfig() EffortConfig {
 	}
 	format := cfg.EffortFormat
 	if format == "" {
-		// Default OFF, not "auto". Kiro's upstream rejects an effort shape it does not
-		// recognise by returning HTTP 200 with an empty stream rather than an error, so
-		// a wrong guess silently breaks every Claude request instead of failing loudly.
-		// Effort must therefore be switched on deliberately, once a format is known to
-		// work, rather than being inferred by default.
-		format = "off"
+		// Enabled by default again, having been ruled out as the cause of the empty
+		// streams seen in production: those continued unchanged with effort switched
+		// off, and the real cause was the endpoint loop abandoning a stream that died
+		// before any output.
+		//
+		// That does not by itself prove the wire shape is accepted, so this relies on
+		// two safety nets: isEffortRejection treats an empty stream as a possible
+		// effort rejection and retries once without it, and the endpoint loop now
+		// retries a stream that produced nothing. A wrong guess therefore costs a
+		// retry rather than the request.
+		format = "auto"
 	}
 	// Nil means the operator never chose, which defaults to advertising the
 	// variants; an explicit false is honoured.
