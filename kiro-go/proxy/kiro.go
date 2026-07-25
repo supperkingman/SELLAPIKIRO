@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -83,6 +84,45 @@ func kiroStreamResponseHeaderTimeout() time.Duration {
 	}
 	return 120 * time.Second
 }
+
+// kiroStreamIdleTimeout bounds how long a stream may go without delivering a
+// single byte before we give up on it. ResponseHeaderTimeout only covers the
+// first-byte phase, and the streaming client has no overall Timeout on purpose,
+// so without this a stream that stalls mid-body hangs until some network layer
+// happens to drop it. Override with KIRO_STREAM_IDLE_TIMEOUT_SEC (seconds).
+func kiroStreamIdleTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("KIRO_STREAM_IDLE_TIMEOUT_SEC")); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			return time.Duration(s) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
+// kiroStreamHeartbeatInterval is how often we notify the caller while a frame
+// read is blocked, so it can put a keepalive byte on the wire. Intermediate
+// reverse proxies and tunnels close idle connections well before our own idle
+// timeout, which would turn a recoverable upstream pause into a dead request.
+// Override with KIRO_STREAM_HEARTBEAT_SEC (seconds).
+func kiroStreamHeartbeatInterval() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("KIRO_STREAM_HEARTBEAT_SEC")); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			return time.Duration(s) * time.Second
+		}
+	}
+	return 15 * time.Second
+}
+
+// errKiroStreamIdle means the upstream accepted the request but then stopped
+// sending bytes entirely. Distinct from a transport error: the connection is
+// still open, it just went quiet, so the request is worth retrying elsewhere.
+var errKiroStreamIdle = errors.New("kiro stream stalled: no data for the idle timeout (transient throttle/stall)")
+
+// errKiroEmptyStream means the upstream closed the stream cleanly (HTTP 200,
+// no transport error) without ever sending a content frame. Upstream uses this
+// shape for soft throttling instead of returning an error status, so it must be
+// reported as a failure rather than an empty but successful answer.
+var errKiroEmptyStream = errors.New("upstream returned empty stream (HTTP 200): transient throttle/stall")
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -300,6 +340,12 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+
+	// OnHeartbeat fires while a frame read is blocked, so the caller can emit a
+	// keepalive to stop intermediaries closing an idle connection. It carries no
+	// model output, so a handler must NOT treat it as having committed content:
+	// failing over to another account after a heartbeat has to stay possible.
+	OnHeartbeat func()
 }
 
 // ==================== API Call ====================
@@ -641,6 +687,58 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
+// readFullWithIdleTimeout fills buf like io.ReadFull, but gives up if the stream
+// delivers nothing at all for kiroStreamIdleTimeout, and pings onHeartbeat every
+// kiroStreamHeartbeatInterval while the read is blocked.
+//
+// The read runs on its own goroutine because there is no portable way to cancel a
+// blocked Read on an arbitrary io.Reader. When the idle timeout wins the race the
+// goroutine is left parked on that Read; it unblocks and exits once the caller
+// closes the response body, which every caller does via defer. The channel is
+// buffered so the goroutine can always finish even if nobody is listening.
+//
+// The idle deadline is deliberately independent of the heartbeat: emitting
+// keepalives must not keep a genuinely stalled stream alive forever, otherwise a
+// dead upstream would never fail over.
+func readFullWithIdleTimeout(body io.Reader, buf []byte, onHeartbeat func()) (int, error) {
+	type readResult struct {
+		n   int
+		err error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		n, err := io.ReadFull(body, buf)
+		done <- readResult{n: n, err: err}
+	}()
+
+	idle := time.NewTimer(kiroStreamIdleTimeout())
+	defer idle.Stop()
+
+	// With no heartbeat consumer there is nothing to tick for, so just wait.
+	if onHeartbeat == nil {
+		select {
+		case res := <-done:
+			return res.n, res.err
+		case <-idle.C:
+			return 0, errKiroStreamIdle
+		}
+	}
+
+	beat := time.NewTicker(kiroStreamHeartbeatInterval())
+	defer beat.Stop()
+
+	for {
+		select {
+		case res := <-done:
+			return res.n, res.err
+		case <-idle.C:
+			return 0, errKiroStreamIdle
+		case <-beat.C:
+			onHeartbeat()
+		}
+	}
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback == nil {
@@ -658,11 +756,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// of failing the whole request — the client has the partial reply, and failing
 	// here just turns a truncated-but-usable answer into a hard "unexpected EOF".
 	receivedAny := false
+	// contentFrames counts frames carrying real model output (text, reasoning or
+	// tool use). Upstream soft-throttles by closing a HTTP 200 stream without ever
+	// sending one, which must be surfaced as a failure rather than an empty success.
+	contentFrames := 0
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
-		_, err := io.ReadFull(body, prelude)
+		_, err := readFullWithIdleTimeout(body, prelude, callback.OnHeartbeat)
 		if err == io.EOF {
 			break
 		}
@@ -686,7 +788,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Read the remaining message bytes.
 		remaining := totalLength - 12
 		msgBuf := make([]byte, remaining)
-		_, err = io.ReadFull(body, msgBuf)
+		_, err = readFullWithIdleTimeout(body, msgBuf, callback.OnHeartbeat)
 		if err != nil {
 			// Connection cut mid-frame: salvage prior events rather than hard-failing.
 			if (err == io.ErrUnexpectedEOF || err == io.EOF) && receivedAny {
@@ -732,17 +834,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// "1833" into "183", on both streams.
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				contentFrames++
 				if callback.OnText != nil {
 					callback.OnText(content, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				contentFrames++
 				if callback.OnText != nil {
 					callback.OnText(text, true)
 				}
 			}
 		case "toolUseEvent":
+			contentFrames++
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -755,6 +860,16 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				}
 			}
 		}
+	}
+
+	// A stream that ended cleanly without a single content frame is upstream's
+	// soft-throttle shape, not an answer. Report it as an error and deliberately
+	// skip OnComplete: firing it would both surface an empty message to the client
+	// and record a false success against the account. Safe to fail here because no
+	// content frame means nothing was written to the wire yet, so the caller is
+	// still pre-commit and can retry on another account.
+	if contentFrames == 0 {
+		return errKiroEmptyStream
 	}
 
 	if currentToolUse != nil {

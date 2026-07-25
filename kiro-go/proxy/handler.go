@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -1432,12 +1433,37 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnHeartbeat: func() {
+				// Upstream has gone quiet. Emit Anthropic's own ping event so
+				// intermediate proxies and tunnels keep the connection open instead
+				// of dropping a request that is still alive.
+				//
+				// Only safe once message_start is on the wire: a ping before it would
+				// break the protocol's event ordering. Before that point the client is
+				// still waiting on headers, which no intermediary treats as idle yet.
+				// A ping carries no model output, so messageStarted stays false and
+				// failover to another account remains possible.
+				if !messageStarted {
+					return
+				}
+				h.sendSSELocked(&writeMu, w, flusher, "ping", map[string]interface{}{
+					"type": "ping",
+				})
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// An empty stream is now detected down in parseEventStream, so it arrives
+			// here as an error rather than as a successful call with no content. Keep
+			// flagging it so that, if no account can serve the request, the caller
+			// still returns the "reduce your context" message instead of a generic
+			// "no accounts available", which would wrongly blame the account pool.
+			if errors.Is(err, errKiroEmptyStream) {
+				payload.UpstreamRejectedContext = true
+			}
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
 				continue
@@ -2553,12 +2579,35 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnHeartbeat: func() {
+				// Upstream went quiet. The keepalive started at the top of this
+				// handler is stopped as soon as the first chunk goes out, so without
+				// this a stall AFTER output began has nothing holding the connection
+				// open. An SSE comment is ignored by OpenAI clients but still counts
+				// as traffic for intermediaries.
+				//
+				// Skipped before the first chunk because startGrokKeepaliveLocked is
+				// still running then and already pings on its own. Comments carry no
+				// output, so responseStarted is untouched and failover stays possible.
+				if !responseStarted {
+					return
+				}
+				writeMu.Lock()
+				fmt.Fprintf(w, ": keepalive %d\n\n", time.Now().Unix())
+				flusher.Flush()
+				writeMu.Unlock()
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// Same as the Claude stream: an empty stream now arrives as an error from
+			// parseEventStream, so keep the flag set for the final error message.
+			if errors.Is(err, errKiroEmptyStream) {
+				payload.UpstreamRejectedContext = true
+			}
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
 				continue

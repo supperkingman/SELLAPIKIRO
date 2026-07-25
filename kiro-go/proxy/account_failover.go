@@ -60,6 +60,37 @@ func isAuthErrorMessage(msg string) bool {
 		strings.Contains(msg, "refresh token expired")
 }
 
+// isTransientThrottleMessage marks upstream's soft throttle: it accepted the
+// request and answered HTTP 200, but delivered nothing. The account itself is
+// healthy, so it earns a short cooldown to rotate the next request elsewhere and
+// must NOT be banned or have an error count held against it.
+func isTransientThrottleMessage(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "transient throttle/stall")
+}
+
+// isStreamStallOrAbortMessage reports whether an error is the stream dying rather
+// than upstream refusing the request. These are worth retrying on another account
+// because nothing is wrong with the request itself.
+//
+// Errors with their own handling are excluded first: quota, auth, overage,
+// suspension and profile-unavailable all need their specific cooldown or ban, and
+// misreading one as a stall would retry it pointlessly across the whole pool.
+func isStreamStallOrAbortMessage(msg string) bool {
+	if isQuotaErrorMessage(msg) || isAuthErrorMessage(msg) ||
+		isOverageErrorMessage(msg) || isSuspensionErrorMessage(msg) ||
+		isProfileUnavailableErrorMessage(msg) {
+		return false
+	}
+
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "transient throttle/stall") ||
+		strings.Contains(m, "stream stalled") ||
+		strings.Contains(m, "empty stream") ||
+		strings.Contains(m, "unexpected eof") ||
+		strings.Contains(m, "connection reset") ||
+		strings.Contains(m, "broken pipe")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
@@ -118,6 +149,14 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// account rotates out briefly then comes back, instead of a 1h quota ban.
 		h.pool.RecordThrottle(account.ID)
 		logger.Warnf("[AccountFailover] %s temporarily rate-throttled by AWS (short cooldown, still healthy)", account.Email)
+	case isTransientThrottleMessage(errMsg):
+		// Upstream answered HTTP 200 then delivered nothing, or went silent
+		// mid-stream. The account is fine, so take the same short cooldown as an
+		// AWS rate throttle: it rotates out of the next pick and comes back on its
+		// own. Deliberately no RecordError — a prompt that upstream dislikes would
+		// otherwise drive every account in the pool into cooldown one by one.
+		h.pool.RecordThrottle(account.ID)
+		logger.Warnf("[AccountFailover] %s hit a transient upstream stall (short cooldown, still healthy)", account.Email)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
 	case isSuspensionErrorMessage(errMsg):
