@@ -467,14 +467,31 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		InputTypes: []string{"text", "image"},
 	}}, "-thinking")
 
-	if len(models) != 2 {
-		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	// The base model and its thinking variant still come first, in that order, but
+	// the list now also carries one entry per effort level (see buildEffortVariants),
+	// so this asserts the leading pair rather than the total count.
+	if len(models) < 2 {
+		t.Fatalf("expected at least base model and thinking variant, got %d", len(models))
 	}
 	if models[0]["id"] != "claude-sonnet-4.5" {
 		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
 	}
 	if models[1]["id"] != "claude-sonnet-4.5-thinking" {
 		t.Fatalf("unexpected thinking model id: %#v", models[1]["id"])
+	}
+
+	// Effort variants are what let a client with no effort control pick a level, so
+	// their presence is part of this endpoint's contract.
+	ids := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+	for _, want := range []string{"claude-sonnet-4.5-max", "claude-sonnet-4.5-thinking-max"} {
+		if !ids[want] {
+			t.Fatalf("expected advertised effort variant %q, got %v", want, ids)
+		}
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])

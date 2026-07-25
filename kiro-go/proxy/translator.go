@@ -176,6 +176,23 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+
+	// OutputConfig carries Anthropic's native reasoning-effort hint. Second in
+	// priority after a model-name suffix; see proxy/effort.go.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+}
+
+// ClaudeOutputConfig is the Anthropic-side container for the effort hint.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// effortHint returns the request's native effort hint, or "" when absent.
+func (r *ClaudeRequest) effortHint() string {
+	if r == nil || r.OutputConfig == nil {
+		return ""
+	}
+	return r.OutputConfig.Effort
 }
 
 type ClaudeThinkingConfig struct {
@@ -1102,6 +1119,18 @@ type OpenAIRequest struct {
 	Stream               bool            `json:"stream,omitempty"`
 	Tools                []OpenAITool    `json:"tools,omitempty"`
 	ToolChoice           interface{}     `json:"tool_choice,omitempty"` // string or object
+
+	// ReasoningEffort is OpenAI's native effort hint. Second in priority after a
+	// model-name suffix; see proxy/effort.go.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+// effortHint returns the request's native effort hint, or "" when absent.
+func (r *OpenAIRequest) effortHint() string {
+	if r == nil {
+		return ""
+	}
+	return r.ReasoningEffort
 }
 
 type OpenAIMessage struct {

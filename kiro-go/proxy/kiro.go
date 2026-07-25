@@ -264,6 +264,12 @@ type KiroPayload struct {
 	// means "this context was rejected", not "no accounts were available", and
 	// the client deserves the former message. Not serialized to the Kiro API body.
 	UpstreamRejectedContext bool `json:"-"`
+
+	// EffortLevel mirrors the reasoning-effort level currently attached to this
+	// payload, so a retry can step it down without re-deriving it from the model
+	// name and body. Kept out of the request body: the level itself travels inside
+	// AdditionalModelRequestFields.
+	EffortLevel string `json:"-"`
 }
 
 type KiroUserInputMessage struct {
@@ -272,6 +278,13 @@ type KiroUserInputMessage struct {
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
+
+	// AdditionalModelRequestFields carries model-specific knobs that have no field
+	// in the OpenAI or Anthropic wire format, currently the reasoning-effort level.
+	// Kiro passes it through to the model verbatim, and its accepted shape varies
+	// by model, so applyEffortToPayload owns the contents. Omitted when empty so
+	// requests without effort keep exactly the body they had before.
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
 }
 
 type UserInputMessageContext struct {

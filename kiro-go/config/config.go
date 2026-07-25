@@ -195,6 +195,15 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
+	// Reasoning-effort configuration. Effort controls how hard the model thinks
+	// (low..max); see proxy/effort.go for how a request's level is resolved.
+	DefaultEffort string `json:"defaultEffort,omitempty"` // Level for requests that do not state one (default: "max")
+	EffortFormat  string `json:"effortFormat,omitempty"`  // "auto", "reasoning", "output_config" or "off" (default: "auto")
+	// ExposeEffortModels is a pointer so that "unset" is distinguishable from an
+	// explicit false: the default is true, which a plain bool could not express
+	// because its zero value would silently disable the advertised variants.
+	ExposeEffortModels *bool `json:"exposeEffortModels,omitempty"` // Advertise <model>-<level> variants in /v1/models (default: true)
+
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
@@ -830,6 +839,65 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	return Save()
+}
+
+// EffortConfig is the resolved reasoning-effort configuration, with defaults
+// already applied so callers never have to repeat them.
+type EffortConfig struct {
+	DefaultEffort      string `json:"defaultEffort"`
+	EffortFormat       string `json:"effortFormat"`
+	ExposeEffortModels bool   `json:"exposeEffortModels"`
+}
+
+// GetEffortConfig returns the effort configuration with defaults filled in:
+// "max" effort, "auto" format, and variants advertised. An empty stored value is
+// treated as unset rather than as an error, matching GetThinkingConfig.
+func GetEffortConfig() EffortConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	// Config may not be loaded yet (early startup, tests). Return the defaults
+	// rather than dereferencing nil, matching the other getters in this file.
+	if cfg == nil {
+		return EffortConfig{
+			DefaultEffort:      "max",
+			EffortFormat:       "auto",
+			ExposeEffortModels: true,
+		}
+	}
+
+	defaultEffort := cfg.DefaultEffort
+	if defaultEffort == "" {
+		defaultEffort = "max"
+	}
+	format := cfg.EffortFormat
+	if format == "" {
+		format = "auto"
+	}
+	// Nil means the operator never chose, which defaults to advertising the
+	// variants; an explicit false is honoured.
+	expose := true
+	if cfg.ExposeEffortModels != nil {
+		expose = *cfg.ExposeEffortModels
+	}
+
+	return EffortConfig{
+		DefaultEffort:      defaultEffort,
+		EffortFormat:       format,
+		ExposeEffortModels: expose,
+	}
+}
+
+// UpdateEffortConfig persists the effort configuration. Validation of the level
+// and format strings belongs to the caller (the admin API), which can report a
+// bad value back to the operator instead of silently storing it.
+func UpdateEffortConfig(defaultEffort, format string, exposeModels bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.DefaultEffort = defaultEffort
+	cfg.EffortFormat = format
+	cfg.ExposeEffortModels = &exposeModels
 	return Save()
 }
 

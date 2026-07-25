@@ -534,6 +534,10 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		return nil
 	}
 
+	// Effort variants are the only way a client with no effort control of its own
+	// (Claude Code, Cline) can ask for a level, so they are advertised per model.
+	exposeEffort := config.GetEffortConfig().ExposeEffortModels
+
 	models := make([]map[string]interface{}, 0, len(cached)*2)
 	if len(cached) > 0 {
 		for _, m := range cached {
@@ -541,9 +545,26 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
 			// 自动生成 thinking 变体
 			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			models = append(models, buildEffortVariants(m.ModelId, thinkingSuffix, supportsImage, exposeEffort)...)
 		}
 	}
 	return models
+}
+
+// buildEffortVariants lists "<model>-<level>" for each effort level, and the
+// thinking form alongside it so a customer does not have to give up extended
+// thinking to choose an effort. Returns nothing when the feature is switched off.
+func buildEffortVariants(modelID, thinkingSuffix string, supportsImage, expose bool) []map[string]interface{} {
+	if !expose {
+		return nil
+	}
+	levels := EffortLevels()
+	out := make([]map[string]interface{}, 0, len(levels)*2)
+	for _, level := range levels {
+		out = append(out, buildModelInfo(modelID+"-"+level, "anthropic", supportsImage))
+		out = append(out, buildModelInfo(modelID+thinkingSuffix+"-"+level, "anthropic", supportsImage))
+	}
+	return out
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
@@ -964,10 +985,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Peel the effort suffix off FIRST. Everything downstream matches on the model
+	// name — alias tables, version patterns, the pool's per-account model list, and
+	// the provider-disguise classifier — so "claude-opus-5-max" has to become
+	// "claude-opus-5" before any of them see it, or it is treated as an unknown id.
+	baseModel, suffixEffort := stripEffortSuffix(req.Model)
+	req.Model = baseModel
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	effortLevel, effortEnabled := resolveEffort(actualModel, suffixEffort, req.effortHint())
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -995,6 +1024,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
+	if effortEnabled {
+		applyEffortToPayload(kiroPayload, effortLevel)
+	}
 
 	// Stream or non-stream
 	var handled bool
@@ -1049,6 +1081,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
+	// effortRetried keeps the retry-without-effort attempt to once per request, so
+	// a persistent 400 cannot turn into a retry loop across the account pool.
+	effortRetried := false
 
 	// Keepalive: Kiro's upstream can take tens of seconds to process a large context
 	// (prefill) before emitting the first token. Without bytes on the wire, Claude CLI
@@ -1453,6 +1488,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+
+		// The effort wire shape is a guess for models whose schema we cannot read,
+		// so a 400 naming those fields means the guess was wrong rather than the
+		// request being bad. Retry once on the SAME account without effort: the cost
+		// of guessing wrong stays one request, and a request that worked before this
+		// feature existed keeps working. Only safe pre-commit.
+		if err != nil && !messageStarted && payload.EffortLevel != "" && !effortRetried &&
+			isEffortRejection400(err.Error()) {
+			effortRetried = true
+			logger.Warnf("[Effort] upstream rejected the effort fields (%v); retrying without effort", err)
+			stripEffortFromPayload(payload)
+			err = CallKiroAPI(account, payload, callback)
+		}
+
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1463,6 +1512,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			// "no accounts available", which would wrongly blame the account pool.
 			if errors.Is(err, errKiroEmptyStream) {
 				payload.UpstreamRejectedContext = true
+			}
+			// A high effort stretches time-to-first-token and lengthens generation,
+			// which is when upstream tends to cut the stream. Retrying the next
+			// account at the same level would likely be cut the same way, so ask for
+			// a little less thinking each time.
+			if !messageStarted && isStreamStallOrAbortMessage(err.Error()) {
+				if from, to, ok := reduceEffortOnPayload(payload); ok {
+					logEffortFallback("claude", model, from, to)
+				}
 			}
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
@@ -2217,13 +2275,23 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Peel the effort suffix off before any model matching, same reasoning as the
+	// Claude path: alias tables, the pool's model list and the disguise classifier
+	// all key off the bare name.
+	baseModel, suffixEffort := stripEffortSuffix(req.Model)
+	req.Model = baseModel
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	effortLevel, effortEnabled := resolveEffort(actualModel, suffixEffort, req.effortHint())
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
+	if effortEnabled {
+		applyEffortToPayload(kiroPayload, effortLevel)
+	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	var handled bool
@@ -2267,6 +2335,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
+	// effortRetried keeps the retry-without-effort attempt to once per request, so
+	// a persistent 400 cannot turn into a retry loop across the account pool.
+	effortRetried := false
 
 	// Keepalive during the upstream prefill gap (large context => long silence before
 	// the first token). Without bytes on the wire, clients idle-timeout and drop the
@@ -2600,6 +2671,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+
+		// Same as the Claude stream: a 400 naming the effort fields means our wire
+		// shape guess was wrong, not that the request is bad. Retry once without
+		// effort so a request that worked before this feature keeps working.
+		if err != nil && !responseStarted && payload.EffortLevel != "" && !effortRetried &&
+			isEffortRejection400(err.Error()) {
+			effortRetried = true
+			logger.Warnf("[Effort] upstream rejected the effort fields (%v); retrying without effort", err)
+			stripEffortFromPayload(payload)
+			err = CallKiroAPI(account, payload, callback)
+		}
+
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2607,6 +2690,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			// parseEventStream, so keep the flag set for the final error message.
 			if errors.Is(err, errKiroEmptyStream) {
 				payload.UpstreamRejectedContext = true
+			}
+			// Ask for less thinking on each retry: high effort lengthens generation,
+			// which is when upstream tends to cut the stream.
+			if !responseStarted && isStreamStallOrAbortMessage(err.Error()) {
+				if from, to, ok := reduceEffortOnPayload(payload); ok {
+					logEffortFallback("openai", model, from, to)
+				}
 			}
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
@@ -3021,6 +3111,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetThinkingConfig(w, r)
 	case path == "/thinking" && r.Method == "POST":
 		h.apiUpdateThinkingConfig(w, r)
+	case path == "/effort" && r.Method == "GET":
+		h.apiGetEffortConfig(w, r)
+	case path == "/effort" && r.Method == "POST":
+		h.apiUpdateEffortConfig(w, r)
 	case path == "/endpoint" && r.Method == "GET":
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
@@ -4555,6 +4649,94 @@ func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Pragma", "no-cache")
 	}
 	http.ServeFile(w, r, "web/"+path)
+}
+
+// apiGetEffortConfig returns the reasoning-effort configuration, along with the
+// valid levels and formats so an operator does not have to guess them.
+func (h *Handler) apiGetEffortConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.GetEffortConfig()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"defaultEffort":      cfg.DefaultEffort,
+		"effortFormat":       cfg.EffortFormat,
+		"exposeEffortModels": cfg.ExposeEffortModels,
+		"levels":             EffortLevels(),
+		"formats":            EffortFormats(),
+	})
+}
+
+// apiUpdateEffortConfig persists the reasoning-effort configuration.
+//
+// ExposeEffortModels is decoded as a pointer so that omitting it leaves the
+// current value alone, rather than a missing JSON field silently switching the
+// advertised model variants off.
+func (h *Handler) apiUpdateEffortConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DefaultEffort      string `json:"defaultEffort"`
+		EffortFormat       string `json:"effortFormat"`
+		ExposeEffortModels *bool  `json:"exposeEffortModels"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	current := config.GetEffortConfig()
+
+	level := current.DefaultEffort
+	if req.DefaultEffort != "" {
+		if normalizeEffort(req.DefaultEffort) == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":  "Invalid defaultEffort",
+				"levels": EffortLevels(),
+			})
+			return
+		}
+		level = normalizeEffort(req.DefaultEffort)
+	}
+
+	format := current.EffortFormat
+	if req.EffortFormat != "" {
+		valid := false
+		for _, f := range EffortFormats() {
+			if f == strings.ToLower(strings.TrimSpace(req.EffortFormat)) {
+				valid = true
+				format = f
+				break
+			}
+		}
+		if !valid {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":   "Invalid effortFormat",
+				"formats": EffortFormats(),
+			})
+			return
+		}
+	}
+
+	expose := current.ExposeEffortModels
+	if req.ExposeEffortModels != nil {
+		expose = *req.ExposeEffortModels
+	}
+
+	if err := config.UpdateEffortConfig(level, format, expose); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// The model list embeds the effort variants, so it has to be rebuilt when the
+	// exposure setting changes or clients keep seeing the previous list.
+	h.refreshModelsCache()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":            true,
+		"defaultEffort":      level,
+		"effortFormat":       format,
+		"exposeEffortModels": expose,
+	})
 }
 
 // apiGetThinkingConfig 获取 thinking 配置
