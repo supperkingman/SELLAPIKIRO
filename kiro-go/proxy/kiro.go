@@ -135,6 +135,25 @@ func kiroStreamFirstFrameTimeout() time.Duration {
 // stream has not cleared yet.
 const streamRetryBackoff = 2 * time.Second
 
+// retryableStreamFailure reports whether a stream that produced no output is worth
+// attempting on another endpoint.
+//
+// Not every no-output failure is. An empty stream is a deterministic refusal of
+// this particular request: upstream accepted it, reported context usage, and
+// declined to generate. Every endpoint refuses it identically, so retrying only
+// multiplies the logged failures by the endpoint count and adds the backoff to the
+// client's wait for an answer that is never coming. Field data showed exactly that,
+// roughly three logged failures per request.
+//
+// A dropped or stalled connection is a property of the connection rather than of
+// the request, so another endpoint has a genuine chance of succeeding.
+func retryableStreamFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, errKiroEmptyStream)
+}
+
 // kiroStreamHeartbeatInterval is how often we notify the caller while a frame
 // read is blocked, so it can put a keepalive byte on the wire. Intermediate
 // reverse proxies and tunnels close idle connections well before our own idle
@@ -772,6 +791,10 @@ retryEndpoints:
 		// so the error is still surfaced and the missing stop_reason keeps the
 		// truncation detectable by the client.
 		if emitted {
+			return err
+		}
+
+		if !retryableStreamFailure(err) {
 			return err
 		}
 		logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output: %v", ep.Name, err)

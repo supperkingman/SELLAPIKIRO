@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"testing"
 )
 
@@ -67,6 +69,40 @@ func TestParseEventStreamTrackedReportsEmission(t *testing.T) {
 			t.Error("a stream cut after content must still report emitted=true")
 		}
 	})
+}
+
+// TestEmptyStreamIsNotRetriedAcrossEndpoints pins the retry scope.
+//
+// An empty stream is a deterministic refusal of the request itself, so every
+// endpoint refuses it identically and retrying only multiplies the failures by the
+// endpoint count while adding backoff to the client's wait. Field data showed
+// roughly three logged failures per request before this was narrowed. A dropped or
+// stalled connection is a property of the connection instead, so those stay
+// retryable.
+func TestEmptyStreamIsNotRetriedAcrossEndpoints(t *testing.T) {
+	if !errors.Is(errKiroEmptyStream, errKiroEmptyStream) {
+		t.Fatal("sanity: sentinel must match itself")
+	}
+
+	// Deterministic refusal: must not be retried.
+	if retryableStreamFailure(errKiroEmptyStream) {
+		t.Error("an empty stream must not be retried on another endpoint")
+	}
+	if retryableStreamFailure(fmt.Errorf("account kr79: %w", errKiroEmptyStream)) {
+		t.Error("a wrapped empty stream must not be retried either")
+	}
+
+	// Connection-level failures: another endpoint has a real chance.
+	for _, err := range []error{
+		io.ErrUnexpectedEOF,
+		errKiroStreamIdle,
+		errKiroFirstFrameTimeout,
+		errors.New("connection reset by peer"),
+	} {
+		if !retryableStreamFailure(err) {
+			t.Errorf("expected %v to stay retryable", err)
+		}
+	}
 }
 
 // TestParseEventStreamWrapperUnchanged pins that the original entry point behaves
