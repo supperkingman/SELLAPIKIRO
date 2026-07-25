@@ -11,37 +11,59 @@ import (
 	"time"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
+// collectStreamText replays the given frames through parseEventStream and returns
+// the concatenated text delivered to the callback, split by stream.
+func collectStreamText(t *testing.T, eventType string, chunks []string) string {
+	t.Helper()
 
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
+	var buf bytes.Buffer
+	for _, c := range chunks {
+		field := "content"
+		if eventType == "reasoningContentEvent" {
+			field = "text"
+		}
+		buf.Write(awsEventStreamFrame(t, eventType, map[string]interface{}{field: c}))
 	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
+
+	var got string
+	err := parseEventStream(bytes.NewReader(buf.Bytes()), &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) { got += text },
+	})
+	if err != nil {
+		t.Fatalf("parseEventStream returned error: %v", err)
 	}
+	return got
 }
 
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
-
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
+// TestParseEventStreamPassesRepeatedContentVerbatim guards against reintroducing
+// content-based de-duplication. Kiro streams pure incremental deltas, so a chunk
+// that looks like a replay of the previous one is usually just text that repeats
+// itself. The old normalizeChunk heuristic silently ate that output, turning
+// "6666666666" into "666" and quietly dropping digits from years and amounts.
+func TestParseEventStreamPassesRepeatedContentVerbatim(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"identical frames", []string{"666", "666", "666", "6"}, "6666666666"},
+		{"alternating pattern", []string{"abab", "abab"}, "abababab"},
+		{"digits with repeat", []string{"183", "3"}, "1833"},
+		{"prefix of previous", []string{"abcde", "abc"}, "abcdeabc"},
+		{"suffix overlap", []string{"hello world", "world!!!"}, "hello worldworld!!!"},
+		{"incremental delta", []string{"1234567890", "234567890"}, "1234567890234567890"},
 	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
 
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
-
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := collectStreamText(t, "assistantResponseEvent", c.chunks); got != c.want {
+				t.Fatalf("assistant stream = %q, want %q", got, c.want)
+			}
+			// The reasoning stream shares the same code path and was equally affected.
+			if got := collectStreamText(t, "reasoningContentEvent", c.chunks); got != c.want {
+				t.Fatalf("reasoning stream = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
