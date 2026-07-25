@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -578,8 +579,24 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	var lastErr error
 	reresolvedProfile := false
 	shrankForLength := false
+
+	// Each attempt gets its own cancellable context, but this loop exits through
+	// continue, goto and return, so a per-iteration defer is not available. Hold the
+	// pending cancel instead: release it when the next attempt starts, and release
+	// the final one when the function returns. Cancelling an attempt we are done
+	// with is harmless, and this guarantees no context outlives the call.
+	var pendingCancel context.CancelFunc
+	releasePending := func() {
+		if pendingCancel != nil {
+			pendingCancel()
+			pendingCancel = nil
+		}
+	}
+	defer releasePending()
+
 retryEndpoints:
 	for _, ep := range endpoints {
+		releasePending()
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -587,11 +604,18 @@ retryEndpoints:
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+		// The request carries a cancellable context so the idle guard can abort a
+		// stalled stream. Cancelling is the only way to unblock a pending read on
+		// the response body; without it a silent upstream would hang until some
+		// network layer happened to drop the connection.
+		reqCtx, cancelReq := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
+			cancelReq()
 			lastErr = err
 			continue
 		}
+		pendingCancel = cancelReq
 
 		host := ""
 		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
@@ -680,7 +704,17 @@ retryEndpoints:
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		// Watch this stream for inactivity while it is parsed. The guard cancels
+		// cancelReq on a stall, which unblocks the read inside parseEventStream.
+		// callback may be nil here: parseEventStream substitutes an empty one, but
+		// this runs before that, so read the heartbeat defensively.
+		var onHeartbeat func()
+		if callback != nil {
+			onHeartbeat = callback.OnHeartbeat
+		}
+		guard := newIdleGuard(cancelReq, onHeartbeat)
+		err = parseEventStream(resp.Body, callback, guard)
+		guard.close()
 		resp.Body.Close()
 		return err
 	}
@@ -700,60 +734,132 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
-// readFullWithIdleTimeout fills buf like io.ReadFull, but gives up if the stream
-// delivers nothing at all for kiroStreamIdleTimeout, and pings onHeartbeat every
-// kiroStreamHeartbeatInterval while the read is blocked.
+// idleGuard watches a stream for inactivity while the frame loop reads it.
 //
-// The read runs on its own goroutine because there is no portable way to cancel a
-// blocked Read on an arbitrary io.Reader. When the idle timeout wins the race the
-// goroutine is left parked on that Read; it unblocks and exits once the caller
-// closes the response body, which every caller does via defer. The channel is
-// buffered so the goroutine can always finish even if nobody is listening.
+// An earlier version of this raced each individual read against a timer on a
+// throwaway goroutine. That was wrong: a blocked io.ReadFull cannot be abandoned.
+// When the timer won, the orphaned goroutine stayed parked on the same body, and
+// the next read started a SECOND reader on that body. Two readers then split the
+// bytes between them, which corrupted frame boundaries and made the timeout fire
+// on essentially every request.
 //
-// The idle deadline is deliberately independent of the heartbeat: emitting
-// keepalives must not keep a genuinely stalled stream alive forever, otherwise a
-// dead upstream would never fail over.
-func readFullWithIdleTimeout(body io.Reader, buf []byte, onHeartbeat func()) (int, error) {
-	type readResult struct {
-		n   int
-		err error
+// So the reader is never abandoned here. Exactly one goroutine owns the body, and
+// the watchdog acts on the body instead: on inactivity it cancels the request,
+// which makes the transport fail the in-flight read for real and lets that single
+// reader return. Cancellation is the only thing that safely unblocks a read on an
+// HTTP response body.
+type idleGuard struct {
+	// cancel aborts the underlying HTTP request, unblocking any pending read.
+	cancel context.CancelFunc
+	// activity is pinged after every successful read so the monitor can tell a
+	// slow-but-alive stream from a dead one.
+	activity chan struct{}
+	// stop ends the monitor when parsing finishes.
+	stop chan struct{}
+	// tripped records that the monitor, not the peer, ended the stream, so the
+	// resulting "context canceled" can be reported as the stall it really was.
+	tripped atomic.Bool
+	done    chan struct{}
+}
+
+// newIdleGuard starts the monitor. cancel must abort the request that produced the
+// body being parsed; onHeartbeat may be nil.
+func newIdleGuard(cancel context.CancelFunc, onHeartbeat func()) *idleGuard {
+	g := &idleGuard{
+		cancel:   cancel,
+		activity: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
-	done := make(chan readResult, 1)
-	go func() {
-		n, err := io.ReadFull(body, buf)
-		done <- readResult{n: n, err: err}
-	}()
+	go g.monitor(onHeartbeat)
+	return g
+}
+
+// monitor cancels the request once the stream has been silent for the idle
+// timeout, emitting a keepalive on each heartbeat tick in the meantime.
+//
+// The idle deadline is deliberately independent of the heartbeat: keepalives must
+// never keep a genuinely dead stream alive, or it would never fail over. Only real
+// progress on the wire, reported via activity, resets the deadline.
+func (g *idleGuard) monitor(onHeartbeat func()) {
+	defer close(g.done)
 
 	idle := time.NewTimer(kiroStreamIdleTimeout())
 	defer idle.Stop()
 
-	// With no heartbeat consumer there is nothing to tick for, so just wait.
-	if onHeartbeat == nil {
-		select {
-		case res := <-done:
-			return res.n, res.err
-		case <-idle.C:
-			return 0, errKiroStreamIdle
-		}
-	}
-
-	beat := time.NewTicker(kiroStreamHeartbeatInterval())
+	beatInterval := kiroStreamHeartbeatInterval()
+	beat := time.NewTicker(beatInterval)
 	defer beat.Stop()
 
 	for {
 		select {
-		case res := <-done:
-			return res.n, res.err
-		case <-idle.C:
-			return 0, errKiroStreamIdle
+		case <-g.stop:
+			return
+		case <-g.activity:
+			if !idle.Stop() {
+				// Drain a deadline that fired while we were being notified, so the
+				// reset below starts from a clean timer.
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(kiroStreamIdleTimeout())
 		case <-beat.C:
-			onHeartbeat()
+			if onHeartbeat != nil {
+				onHeartbeat()
+			}
+		case <-idle.C:
+			g.tripped.Store(true)
+			g.cancel()
+			return
 		}
 	}
 }
 
+// noteActivity records progress on the stream. Non-blocking: the monitor only
+// needs to know that something arrived, not how many times.
+func (g *idleGuard) noteActivity() {
+	if g == nil {
+		return
+	}
+	select {
+	case g.activity <- struct{}{}:
+	default:
+	}
+}
+
+// close shuts the monitor down and waits for it to exit, so no goroutine outlives
+// the parse.
+func (g *idleGuard) close() {
+	if g == nil {
+		return
+	}
+	close(g.stop)
+	<-g.done
+}
+
+// translateErr rewrites the cancellation this guard caused into the stall error,
+// so failover and logging see a stall rather than an opaque "context canceled".
+// Errors from any other cause pass through untouched.
+func (g *idleGuard) translateErr(err error) error {
+	if err == nil || g == nil || !g.tripped.Load() {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(strings.ToLower(err.Error()), "context canceled") {
+		return errKiroStreamIdle
+	}
+	return err
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+//
+// guard may be nil (non-streaming callers and tests). When present, every
+// completed read reports progress to it, and it cancels the request if the stream
+// goes silent. Reads stay plain and sequential: this goroutine is the only reader
+// of body, which is what makes the framing reliable.
+func parseEventStream(body io.Reader, callback *KiroStreamCallback, guard *idleGuard) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -777,19 +883,22 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
-		_, err := readFullWithIdleTimeout(body, prelude, callback.OnHeartbeat)
+		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			err = guard.translateErr(err)
 			// A clean stream ends with io.EOF above. An UnexpectedEOF here means the
-			// connection was cut between frames. Salvage anything already received.
+			// connection was cut between frames. Salvage anything already received,
+			// but not when the guard cut it: that is a stall worth failing over.
 			if err == io.ErrUnexpectedEOF && receivedAny {
 				logger.Warnf("[KiroAPI] stream ended early (%v) after receiving events; salvaging partial reply", err)
 				break
 			}
 			return err
 		}
+		guard.noteActivity()
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
@@ -801,8 +910,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Read the remaining message bytes.
 		remaining := totalLength - 12
 		msgBuf := make([]byte, remaining)
-		_, err = readFullWithIdleTimeout(body, msgBuf, callback.OnHeartbeat)
+		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			err = guard.translateErr(err)
 			// Connection cut mid-frame: salvage prior events rather than hard-failing.
 			if (err == io.ErrUnexpectedEOF || err == io.EOF) && receivedAny {
 				logger.Warnf("[KiroAPI] stream ended mid-frame (%v) after receiving events; salvaging partial reply", err)
@@ -810,6 +920,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 			return err
 		}
+		guard.noteActivity()
 		receivedAny = true
 
 		if headersLength > len(msgBuf)-4 {

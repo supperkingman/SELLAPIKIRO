@@ -56,6 +56,13 @@ services:
       # 1M-context models such as claude-opus-5). Lower this if upstream starts
       # rejecting large contexts; set 160 to make 1M models land back on 640KB.
       - KIRO_MAX_PAYLOAD_KB=${KIRO_MAX_PAYLOAD_KB:-}
+      # Stream watchdog. Idle: seconds of complete silence on a streaming response
+      # before it is treated as stalled and failed over (default 120). Heartbeat:
+      # how often a keepalive is emitted while waiting (default 15). Raise the idle
+      # value to a very large number to effectively disable the watchdog without a
+      # rebuild, leaving the other stall protections in place.
+      - KIRO_STREAM_IDLE_TIMEOUT_SEC=${KIRO_STREAM_IDLE_TIMEOUT_SEC:-}
+      - KIRO_STREAM_HEARTBEAT_SEC=${KIRO_STREAM_HEARTBEAT_SEC:-}
     restart: unless-stopped
 
   # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).

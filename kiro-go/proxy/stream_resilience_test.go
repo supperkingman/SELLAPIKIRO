@@ -2,30 +2,22 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// blockingReader delivers its payload, then blocks forever, simulating an
-// upstream that accepts a request and then goes silent mid-stream.
-type blockingReader struct {
-	data    []byte
-	pos     int
-	release chan struct{}
-}
-
-func (r *blockingReader) Read(p []byte) (int, error) {
-	if r.pos < len(r.data) {
-		n := copy(p, r.data[r.pos:])
-		r.pos += n
-		return n, nil
-	}
-	<-r.release
-	return 0, io.EOF
+// parseEventStreamForTest parses a stream with no idle guard, for tests that feed
+// an in-memory buffer and so have no request to cancel.
+func parseEventStreamForTest(body interface {
+	Read([]byte) (int, error)
+}, callback *KiroStreamCallback) error {
+	return parseEventStream(body, callback, nil)
 }
 
 // withStreamTimings shortens the idle/heartbeat windows so tests do not wait the
@@ -42,61 +34,192 @@ func withStreamTimings(t *testing.T, idle, beat string) {
 	})
 }
 
-// TestReadFullWithIdleTimeoutTripsOnSilence covers the case that previously hung:
-// upstream stops sending bytes but keeps the connection open. Without the
-// watchdog the read blocks until some network layer happens to drop it.
-func TestReadFullWithIdleTimeoutTripsOnSilence(t *testing.T) {
-	withStreamTimings(t, "1", "10")
+// serveStream runs an HTTP server that writes whatever the producer sends, then
+// returns a live response body plus the guard watching it. A real server is used
+// deliberately: the previous version of this watchdog passed tests against a fake
+// reader while corrupting real streams, because only a real body reproduces the
+// interaction between cancellation and a blocked read.
+func serveStream(t *testing.T, onHeartbeat func(), producer func(w http.ResponseWriter, flush func())) (*http.Response, *idleGuard) {
+	t.Helper()
 
-	release := make(chan struct{})
-	defer close(release)
-	r := &blockingReader{release: release}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		producer(w, func() {
+			if flusher != nil {
+				flusher.Flush()
+			}
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", srv.URL, nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("building request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("calling test server: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	guard := newIdleGuard(cancel, onHeartbeat)
+	t.Cleanup(guard.close)
+	return resp, guard
+}
+
+// TestIdleGuardTripsOnSilence covers the original bug: upstream answers, sends
+// nothing, and holds the connection open. The read must be cut loose and reported
+// as a stall rather than hanging.
+func TestIdleGuardTripsOnSilence(t *testing.T) {
+	withStreamTimings(t, "1", "30")
+
+	blocked := make(chan struct{})
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		flush()
+		<-blocked // never send a frame
+	})
+	defer close(blocked)
 
 	start := time.Now()
-	_, err := readFullWithIdleTimeout(r, make([]byte, 12), nil)
+	err := parseEventStream(resp.Body, &KiroStreamCallback{}, guard)
 	if !errors.Is(err, errKiroStreamIdle) {
 		t.Fatalf("err = %v, want errKiroStreamIdle", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("watchdog took %v, expected to trip near the 1s idle timeout", elapsed)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("guard took %v, expected to trip near the 1s idle timeout", elapsed)
 	}
 }
 
-// TestReadFullWithIdleTimeoutHeartbeatsWhileBlocked verifies keepalives are
-// emitted during a stall, and that they do NOT extend the idle deadline: a
-// genuinely dead stream must still fail so the request can fail over.
-func TestReadFullWithIdleTimeoutHeartbeatsWhileBlocked(t *testing.T) {
+// TestIdleGuardDoesNotCutSlowButAliveStream is the regression test for the bug
+// this rewrite fixes. The stream sends frames steadily but slower than the idle
+// timeout would allow if the deadline were not reset by real progress. The broken
+// version failed here in the worst way: it left a second reader on the body, so
+// frames were split between readers and the content came out corrupted.
+func TestIdleGuardDoesNotCutSlowButAliveStream(t *testing.T) {
+	withStreamTimings(t, "2", "30")
+
+	const frames = 8
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		flush()
+		for i := 0; i < frames; i++ {
+			w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": "x",
+			}))
+			flush()
+			time.Sleep(300 * time.Millisecond)
+		}
+	})
+
+	var got string
+	err := parseEventStream(resp.Body, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) { got += text },
+	}, guard)
+	if err != nil {
+		t.Fatalf("slow but alive stream failed: %v", err)
+	}
+	// Every frame must arrive exactly once. A second reader on the body shows up
+	// here as missing or garbled content.
+	if want := "xxxxxxxx"; got != want {
+		t.Fatalf("content = %q, want %q (frames lost or interleaved)", got, want)
+	}
+}
+
+// TestIdleGuardHeartbeatsDoNotExtendDeadline pins the rule that keepalives are for
+// intermediaries only. If a heartbeat reset the deadline, a dead upstream would be
+// kept alive forever and never fail over.
+func TestIdleGuardHeartbeatsDoNotExtendDeadline(t *testing.T) {
 	withStreamTimings(t, "2", "1")
 
-	release := make(chan struct{})
-	defer close(release)
-	r := &blockingReader{release: release}
-
 	var beats int32
-	_, err := readFullWithIdleTimeout(r, make([]byte, 12), func() {
-		atomic.AddInt32(&beats, 1)
-	})
+	blocked := make(chan struct{})
+	resp, guard := serveStream(t, func() { atomic.AddInt32(&beats, 1) },
+		func(w http.ResponseWriter, flush func()) {
+			w.WriteHeader(200)
+			flush()
+			<-blocked
+		})
+	defer close(blocked)
+
+	err := parseEventStream(resp.Body, &KiroStreamCallback{}, guard)
 	if !errors.Is(err, errKiroStreamIdle) {
 		t.Fatalf("err = %v, want errKiroStreamIdle despite heartbeats", err)
 	}
 	if got := atomic.LoadInt32(&beats); got < 1 {
-		t.Fatalf("heartbeat fired %d times, want at least 1 while blocked", got)
+		t.Fatalf("heartbeat fired %d times, want at least 1 while stalled", got)
 	}
 }
 
-// TestReadFullWithIdleTimeoutPassesThroughData confirms the watchdog is
-// transparent on a healthy read.
-func TestReadFullWithIdleTimeoutPassesThroughData(t *testing.T) {
+// TestIdleGuardPassesThroughHealthyStream confirms the guard is invisible when the
+// stream behaves, including that it does not turn a clean end into an error.
+func TestIdleGuardPassesThroughHealthyStream(t *testing.T) {
 	withStreamTimings(t, "30", "10")
 
-	want := []byte("twelve bytes")
-	buf := make([]byte, len(want))
-	n, err := readFullWithIdleTimeout(bytes.NewReader(want), buf, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "hello",
+		}))
+		flush()
+	})
+
+	var got string
+	if err := parseEventStream(resp.Body, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) { got += text },
+	}, guard); err != nil {
+		t.Fatalf("healthy stream failed: %v", err)
 	}
-	if n != len(want) || !bytes.Equal(buf, want) {
-		t.Fatalf("read %d bytes %q, want %d bytes %q", n, buf, len(want), want)
+	if got != "hello" {
+		t.Fatalf("content = %q, want \"hello\"", got)
+	}
+}
+
+// TestIdleGuardTranslateErrLeavesOtherErrorsAlone makes sure only the
+// cancellation this guard caused is relabelled as a stall. Misreporting an
+// unrelated error as a stall would send it down the wrong failover path.
+func TestIdleGuardTranslateErrLeavesOtherErrorsAlone(t *testing.T) {
+	g := &idleGuard{}
+
+	other := errors.New("HTTP 401 unauthorized")
+	if got := g.translateErr(other); got != other {
+		t.Errorf("untripped guard rewrote %v to %v", other, got)
+	}
+	if got := g.translateErr(nil); got != nil {
+		t.Errorf("nil error became %v", got)
+	}
+
+	// Once tripped, a cancellation becomes the stall error, but anything else does
+	// not: the stream may have failed for its own reasons at the same moment.
+	g.tripped.Store(true)
+	if got := g.translateErr(context.Canceled); !errors.Is(got, errKiroStreamIdle) {
+		t.Errorf("tripped guard returned %v, want errKiroStreamIdle", got)
+	}
+	if got := g.translateErr(other); got != other {
+		t.Errorf("tripped guard rewrote unrelated error %v to %v", other, got)
+	}
+
+	// A nil guard is the no-watchdog case and must be safe to call.
+	var nilGuard *idleGuard
+	if got := nilGuard.translateErr(other); got != other {
+		t.Errorf("nil guard rewrote %v to %v", other, got)
+	}
+}
+
+// TestIdleGuardNilIsSafe covers the non-streaming callers that pass no guard.
+func TestIdleGuardNilIsSafe(t *testing.T) {
+	var g *idleGuard
+	g.noteActivity()
+	g.close()
+
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "ok",
+	}))
+	if err := parseEventStream(stream, &KiroStreamCallback{}, nil); err != nil {
+		t.Fatalf("parsing without a guard failed: %v", err)
 	}
 }
 
@@ -112,7 +235,7 @@ func TestParseEventStreamRejectsContentlessStream(t *testing.T) {
 	}))
 
 	completed := false
-	err := parseEventStream(bytes.NewReader(buf.Bytes()), &KiroStreamCallback{
+	err := parseEventStreamForTest(bytes.NewReader(buf.Bytes()), &KiroStreamCallback{
 		OnComplete: func(int, int) { completed = true },
 	})
 	if !errors.Is(err, errKiroEmptyStream) {
@@ -135,7 +258,7 @@ func TestParseEventStreamAcceptsToolOnlyStream(t *testing.T) {
 		"stop":      true,
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStreamForTest(stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("tool-only stream rejected: %v", err)
 	}
 }

@@ -26,7 +26,7 @@ func collectStreamText(t *testing.T, eventType string, chunks []string) string {
 	}
 
 	var got string
-	err := parseEventStream(bytes.NewReader(buf.Bytes()), &KiroStreamCallback{
+	err := parseEventStreamForTest(bytes.NewReader(buf.Bytes()), &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) { got += text },
 	})
 	if err != nil {
@@ -76,7 +76,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStreamForTest(stream, &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		},
@@ -114,7 +114,7 @@ func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 		}),
 	}, nil))
 
-	if err := parseEventStream(stream, nil); err != nil {
+	if err := parseEventStreamForTest(stream, nil); err != nil {
 		t.Fatalf("expected nil callback to be a no-op, got %v", err)
 	}
 }
@@ -124,7 +124,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 		"content": "hello",
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStreamForTest(stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
 	}
 }
