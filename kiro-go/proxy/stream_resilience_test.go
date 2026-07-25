@@ -70,17 +70,24 @@ func serveStream(t *testing.T, onHeartbeat func(), producer func(w http.Response
 	return resp, guard
 }
 
-// TestIdleGuardTripsOnSilence covers the original bug: upstream answers, sends
-// nothing, and holds the connection open. The read must be cut loose and reported
-// as a stall rather than hanging.
+// TestIdleGuardTripsOnSilence covers the original bug: upstream starts answering,
+// then goes quiet while holding the connection open. The read must be cut loose and
+// reported as a stall rather than hanging.
+//
+// One frame is sent first so this exercises the mid-stream budget; silence before
+// any frame is the prefill phase and has its own, much larger budget.
 func TestIdleGuardTripsOnSilence(t *testing.T) {
 	withStreamTimings(t, "1", "30")
+	t.Setenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC", "60")
 
 	blocked := make(chan struct{})
 	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
 		w.WriteHeader(200)
+		w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "started",
+		}))
 		flush()
-		<-blocked // never send a frame
+		<-blocked // then stops sending
 	})
 	defer close(blocked)
 
@@ -129,17 +136,114 @@ func TestIdleGuardDoesNotCutSlowButAliveStream(t *testing.T) {
 	}
 }
 
+// TestIdleGuardAllowsLongPrefillBeforeFirstFrame is the regression test for the
+// second bug in this watchdog: a slow prefill was judged by the mid-stream idle
+// budget and healthy requests were cut. Upstream stays silent while it digests a
+// large prompt, then answers normally, so the wait before the first frame gets its
+// own much larger budget.
+func TestIdleGuardAllowsLongPrefillBeforeFirstFrame(t *testing.T) {
+	// Mid-stream budget of 1s, first-frame budget of 30s: a 2s prefill must survive.
+	withStreamTimings(t, "1", "30")
+	t.Setenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC", "30")
+
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		flush()
+		time.Sleep(2 * time.Second) // prefill: longer than the mid-stream budget
+		w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "answer",
+		}))
+		flush()
+	})
+
+	var got string
+	if err := parseEventStream(resp.Body, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) { got += text },
+	}, guard); err != nil {
+		t.Fatalf("slow prefill was cut short: %v", err)
+	}
+	if got != "answer" {
+		t.Fatalf("content = %q, want \"answer\"", got)
+	}
+}
+
+// TestIdleGuardFirstFrameTimeoutReportsItsOwnError checks that a prefill which
+// never finishes is still failed, and is reported distinctly from a mid-stream
+// stall so the logs say which phase died.
+func TestIdleGuardFirstFrameTimeoutReportsItsOwnError(t *testing.T) {
+	withStreamTimings(t, "30", "30")
+	t.Setenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC", "1")
+
+	blocked := make(chan struct{})
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		flush()
+		<-blocked // never starts answering
+	})
+	defer close(blocked)
+
+	err := parseEventStream(resp.Body, &KiroStreamCallback{}, guard)
+	if !errors.Is(err, errKiroFirstFrameTimeout) {
+		t.Fatalf("err = %v, want errKiroFirstFrameTimeout", err)
+	}
+	// It must still classify as a retryable stall, or it would not fail over.
+	if !isStreamStallOrAbortMessage(err.Error()) {
+		t.Error("first-frame timeout should classify as a stall")
+	}
+	if !isTransientThrottleMessage(err.Error()) {
+		t.Error("first-frame timeout should get the short cooldown, not a ban")
+	}
+}
+
+// TestIdleGuardTightensAfterFirstFrame confirms the switch actually happens: once
+// a frame has arrived, a silence beyond the mid-stream budget is a stall even
+// though the first-frame budget is far from exhausted.
+func TestIdleGuardTightensAfterFirstFrame(t *testing.T) {
+	withStreamTimings(t, "1", "30")
+	t.Setenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC", "120")
+
+	blocked := make(chan struct{})
+	resp, guard := serveStream(t, nil, func(w http.ResponseWriter, flush func()) {
+		w.WriteHeader(200)
+		w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "partial",
+		}))
+		flush()
+		<-blocked // goes quiet after starting
+	})
+	defer close(blocked)
+
+	start := time.Now()
+	err := parseEventStream(resp.Body, &KiroStreamCallback{}, guard)
+	if err == nil {
+		t.Fatal("expected a mid-stream stall to be reported")
+	}
+	// Must be the mid-stream error, not the first-frame one.
+	if errors.Is(err, errKiroFirstFrameTimeout) {
+		t.Errorf("reported a first-frame timeout after a frame had arrived: %v", err)
+	}
+	// And it must not have waited for the 120s first-frame budget.
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("took %v; the mid-stream budget was not applied after the first frame", elapsed)
+	}
+}
+
 // TestIdleGuardHeartbeatsDoNotExtendDeadline pins the rule that keepalives are for
 // intermediaries only. If a heartbeat reset the deadline, a dead upstream would be
 // kept alive forever and never fail over.
 func TestIdleGuardHeartbeatsDoNotExtendDeadline(t *testing.T) {
 	withStreamTimings(t, "2", "1")
+	t.Setenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC", "60")
 
 	var beats int32
 	blocked := make(chan struct{})
 	resp, guard := serveStream(t, func() { atomic.AddInt32(&beats, 1) },
 		func(w http.ResponseWriter, flush func()) {
 			w.WriteHeader(200)
+			// Enter the mid-stream phase, where the short budget applies.
+			w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": "started",
+			}))
 			flush()
 			<-blocked
 		})

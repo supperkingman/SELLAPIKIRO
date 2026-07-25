@@ -87,10 +87,13 @@ func kiroStreamResponseHeaderTimeout() time.Duration {
 }
 
 // kiroStreamIdleTimeout bounds how long a stream may go without delivering a
-// single byte before we give up on it. ResponseHeaderTimeout only covers the
-// first-byte phase, and the streaming client has no overall Timeout on purpose,
-// so without this a stream that stalls mid-body hangs until some network layer
-// happens to drop it. Override with KIRO_STREAM_IDLE_TIMEOUT_SEC (seconds).
+// single byte MID-STREAM before we give up on it. ResponseHeaderTimeout only
+// covers the first-byte phase, and the streaming client has no overall Timeout on
+// purpose, so without this a stream that stalls mid-body hangs until some network
+// layer happens to drop it. Override with KIRO_STREAM_IDLE_TIMEOUT_SEC (seconds).
+//
+// This applies only AFTER the first frame; see kiroStreamFirstFrameTimeout for the
+// wait before it, which is legitimately much longer.
 func kiroStreamIdleTimeout() time.Duration {
 	if v := strings.TrimSpace(os.Getenv("KIRO_STREAM_IDLE_TIMEOUT_SEC")); v != "" {
 		if s, err := strconv.Atoi(v); err == nil && s > 0 {
@@ -98,6 +101,26 @@ func kiroStreamIdleTimeout() time.Duration {
 		}
 	}
 	return 120 * time.Second
+}
+
+// kiroStreamFirstFrameTimeout bounds the wait for the FIRST frame, which needs a
+// far larger budget than mid-stream silence.
+//
+// Upstream sends nothing while it prefills the prompt, and that gap grows with
+// context size and reasoning effort: a large conversation at effort=max can sit
+// silent for several minutes and then stream a perfectly good reply. Judging that
+// by the mid-stream idle timeout cut healthy requests, which is what the first
+// deployment of this watchdog did.
+//
+// Once a frame has arrived the model is actively generating, so a long silence
+// after that really is a stall. Override with KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC.
+func kiroStreamFirstFrameTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC")); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			return time.Duration(s) * time.Second
+		}
+	}
+	return 600 * time.Second
 }
 
 // kiroStreamHeartbeatInterval is how often we notify the caller while a frame
@@ -124,6 +147,14 @@ var errKiroStreamIdle = errors.New("kiro stream stalled: no data for the idle ti
 // shape for soft throttling instead of returning an error status, so it must be
 // reported as a failure rather than an empty but successful answer.
 var errKiroEmptyStream = errors.New("upstream returned empty stream (HTTP 200): transient throttle/stall")
+
+// errKiroFirstFrameTimeout means upstream accepted the request but never began
+// answering within the (generous) first-frame budget. Distinct from a mid-stream
+// stall: this one usually means the request was too heavy to prefill, so the retry
+// benefits from a lower effort rather than just a different account. Carries the
+// same "transient throttle/stall" marker so the existing classifiers treat it as a
+// retryable stall without needing to know about the phase.
+var errKiroFirstFrameTimeout = errors.New("kiro upstream never started answering within the first-frame budget (transient throttle/stall)")
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -759,7 +790,12 @@ type idleGuard struct {
 	// tripped records that the monitor, not the peer, ended the stream, so the
 	// resulting "context canceled" can be reported as the stall it really was.
 	tripped atomic.Bool
-	done    chan struct{}
+	// firstFrameTimeout distinguishes "upstream never started answering" from
+	// "upstream went quiet part-way through". Both are stalls worth failing over,
+	// but only the former points at the request being too heavy to prefill, so the
+	// distinction is worth keeping in the logs.
+	firstFrameTimeout atomic.Bool
+	done              chan struct{}
 }
 
 // newIdleGuard starts the monitor. cancel must abort the request that produced the
@@ -784,11 +820,17 @@ func newIdleGuard(cancel context.CancelFunc, onHeartbeat func()) *idleGuard {
 func (g *idleGuard) monitor(onHeartbeat func()) {
 	defer close(g.done)
 
-	idle := time.NewTimer(kiroStreamIdleTimeout())
+	// Two phases with very different budgets. Before the first frame upstream is
+	// prefilling the prompt and sends nothing, which on a large context at high
+	// effort can legitimately take minutes. After the first frame the model is
+	// actively generating, so a long silence really is a stall. Using the short
+	// mid-stream budget for the prefill wait is what made the first version of this
+	// watchdog kill healthy requests.
+	idle := time.NewTimer(kiroStreamFirstFrameTimeout())
 	defer idle.Stop()
+	sawFirstFrame := false
 
-	beatInterval := kiroStreamHeartbeatInterval()
-	beat := time.NewTicker(beatInterval)
+	beat := time.NewTicker(kiroStreamHeartbeatInterval())
 	defer beat.Stop()
 
 	for {
@@ -804,6 +846,8 @@ func (g *idleGuard) monitor(onHeartbeat func()) {
 				default:
 				}
 			}
+			// The first frame switches us to the stricter mid-stream budget.
+			sawFirstFrame = true
 			idle.Reset(kiroStreamIdleTimeout())
 		case <-beat.C:
 			if onHeartbeat != nil {
@@ -811,6 +855,7 @@ func (g *idleGuard) monitor(onHeartbeat func()) {
 			}
 		case <-idle.C:
 			g.tripped.Store(true)
+			g.firstFrameTimeout.Store(!sawFirstFrame)
 			g.cancel()
 			return
 		}
@@ -848,6 +893,9 @@ func (g *idleGuard) translateErr(err error) error {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		strings.Contains(strings.ToLower(err.Error()), "context canceled") {
+		if g.firstFrameTimeout.Load() {
+			return errKiroFirstFrameTimeout
+		}
 		return errKiroStreamIdle
 	}
 	return err
