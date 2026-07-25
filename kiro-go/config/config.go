@@ -264,8 +264,12 @@ type AccountInfo struct {
 	TrialExpiresAt    int64
 }
 
-// Version current version
-const Version = "1.1.2"
+// Version current version. Bumped to 1.1.5 now that every upstream change in
+// that release which applies to this fork has been ported: major-only Claude
+// context classification, verbatim response streams, and native web_search via
+// the Kiro MCP endpoint. The two Microsoft Enterprise SSO commits are not
+// included because this fork does not carry that feature.
+const Version = "1.1.5"
 
 var (
 	cfg     *Config
