@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -71,39 +72,53 @@ func TestParseEventStreamTrackedReportsEmission(t *testing.T) {
 	})
 }
 
-// TestEmptyStreamIsNotRetriedAcrossEndpoints pins the retry scope.
+// TestIsRetryableStreamError pins which no-output failures earn another attempt.
 //
-// An empty stream is a deterministic refusal of the request itself, so every
-// endpoint refuses it identically and retrying only multiplies the failures by the
-// endpoint count while adding backoff to the client's wait. Field data showed
-// roughly three logged failures per request before this was narrowed. A dropped or
-// stalled connection is a property of the connection instead, so those stay
-// retryable.
-func TestEmptyStreamIsNotRetriedAcrossEndpoints(t *testing.T) {
-	if !errors.Is(errKiroEmptyStream, errKiroEmptyStream) {
-		t.Fatal("sanity: sentinel must match itself")
-	}
-
-	// Deterministic refusal: must not be retried.
-	if retryableStreamFailure(errKiroEmptyStream) {
-		t.Error("an empty stream must not be retried on another endpoint")
-	}
-	if retryableStreamFailure(fmt.Errorf("account kr79: %w", errKiroEmptyStream)) {
-		t.Error("a wrapped empty stream must not be retried either")
-	}
-
-	// Connection-level failures: another endpoint has a real chance.
-	for _, err := range []error{
+// A second attempt is refused where it cannot plausibly do better: a cancelled
+// context was aborted deliberately, and a timeout has already spent its full
+// waiting budget, so retrying would only double the client's wait for the same
+// outcome. Our own stall sentinels are timeouts in that sense too.
+//
+// An empty stream is retryable. It was briefly excluded after field data showed it
+// repeating, but that data came from retrying a DIFFERENT endpoint two seconds
+// later; the retry now goes to the same endpoint after a short pause, which is a
+// materially different attempt.
+func TestIsRetryableStreamError(t *testing.T) {
+	retryable := []error{
+		errKiroEmptyStream,
+		fmt.Errorf("account kr79: %w", errKiroEmptyStream),
 		io.ErrUnexpectedEOF,
+		errors.New("connection reset by peer"),
+	}
+	for _, err := range retryable {
+		if !isRetryableStreamError(err) {
+			t.Errorf("expected %v to be retryable", err)
+		}
+	}
+
+	notRetryable := []error{
+		nil,
+		context.Canceled,
+		context.DeadlineExceeded,
+		fmt.Errorf("wrapped: %w", context.Canceled),
 		errKiroStreamIdle,
 		errKiroFirstFrameTimeout,
-		errors.New("connection reset by peer"),
-	} {
-		if !retryableStreamFailure(err) {
-			t.Errorf("expected %v to stay retryable", err)
+		timeoutError{},
+	}
+	for _, err := range notRetryable {
+		if isRetryableStreamError(err) {
+			t.Errorf("expected %v to not be retryable", err)
 		}
 	}
 }
+
+// timeoutError stands in for a transport timeout, which reports itself through
+// net.Error rather than through a sentinel value.
+type timeoutError struct{}
+
+func (timeoutError) Error() string { return "i/o timeout" }
+func (timeoutError) Timeout() bool { return true }
+func (timeoutError) Temporary() bool { return true }
 
 // TestParseEventStreamWrapperUnchanged pins that the original entry point behaves
 // as before, since non-streaming callers and existing tests still use it.

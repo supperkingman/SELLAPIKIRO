@@ -12,6 +12,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -129,29 +130,54 @@ func kiroStreamFirstFrameTimeout() time.Duration {
 	return 240 * time.Second
 }
 
-// streamRetryBackoff spaces out retries of a stream that died before emitting
-// anything. Without a pause the next endpoint is tried within the same second and
-// tends to fail the same way, because whatever upstream condition dropped the
-// stream has not cleared yet.
-const streamRetryBackoff = 2 * time.Second
+const (
+	// streamRetryBackoff spaces out a retry of a stream that died before delivering
+	// any output. Upstream drops cluster in time, so an immediate retry tends to hit
+	// the same blip. Kept short (sub-second) because the retry now happens on the
+	// SAME endpoint: the wait is added to the client's time-to-first-token, so a
+	// multi-second pause costs more than it buys.
+	streamRetryBackoff = 700 * time.Millisecond
 
-// retryableStreamFailure reports whether a stream that produced no output is worth
-// attempting on another endpoint.
+	// maxStreamAttemptsPerEndpoint includes the initial request. One retry covers
+	// the observed transient drops without multiplying the endpoint and account
+	// fallback budgets that already sit outside this loop.
+	maxStreamAttemptsPerEndpoint = 2
+)
+
+// isRetryableStreamError reports whether a stream failure that produced no output
+// is worth another attempt.
 //
-// Not every no-output failure is. An empty stream is a deterministic refusal of
-// this particular request: upstream accepted it, reported context usage, and
-// declined to generate. Every endpoint refuses it identically, so retrying only
-// multiplies the logged failures by the endpoint count and adds the backoff to the
-// client's wait for an answer that is never coming. Field data showed exactly that,
-// roughly three logged failures per request.
+// Retrying is refused for three shapes, each because a second attempt cannot
+// plausibly do better:
 //
-// A dropped or stalled connection is a property of the connection rather than of
-// the request, so another endpoint has a genuine chance of succeeding.
-func retryableStreamFailure(err error) bool {
+//   - A cancelled context means the caller (or the idle guard) deliberately aborted
+//     this request; honouring that beats quietly starting another one.
+//   - A timeout, whether ours or the transport's, has already spent its full budget
+//     waiting. Retrying doubles the client's wait for the same outcome.
+//   - Our own stall sentinels are timeouts in that sense too: the guard waited out
+//     kiroStreamFirstFrameTimeout or kiroStreamIdleTimeout before tripping.
+//
+// Everything else, including an empty stream, is treated as a transient drop worth
+// one more attempt. Empty streams were briefly excluded here after field data
+// showed them repeating across endpoints, but that measurement was taken while the
+// retry went to a DIFFERENT endpoint after two seconds; retrying the same endpoint
+// after a short pause is a materially different attempt, so the exclusion no longer
+// follows from that evidence.
+func isRetryableStreamError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return !errors.Is(err, errKiroEmptyStream)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, errKiroStreamIdle) || errors.Is(err, errKiroFirstFrameTimeout) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return true
 }
 
 // kiroStreamHeartbeatInterval is how often we notify the caller while a frame
@@ -656,8 +682,34 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 	defer releasePending()
 
-retryEndpoints:
+	// Each endpoint appears maxStreamAttemptsPerEndpoint times in a row, so a stream
+	// that died before any output gets another go at the SAME endpoint before we
+	// fall back to a different one. Expanding the slice keeps the existing control
+	// flow intact: the many `continue` statements in the loop body below still mean
+	// "give up on this attempt", and `goto retryEndpoints` still restarts the whole
+	// sequence, which an inner attempt loop would have quietly changed.
+	attempts := make([]kiroEndpoint, 0, len(endpoints)*maxStreamAttemptsPerEndpoint)
 	for _, ep := range endpoints {
+		for i := 0; i < maxStreamAttemptsPerEndpoint; i++ {
+			attempts = append(attempts, ep)
+		}
+	}
+	// Only a retryable stream failure earns the duplicate attempt. Any other outcome
+	// (429, non-200, transport error) already means "move on", so the repeat is
+	// skipped rather than doubling those calls.
+	retrySameEndpoint := false
+
+retryEndpoints:
+	for attemptIdx, ep := range attempts {
+		isRepeat := attemptIdx > 0 && attempts[attemptIdx-1].Name == ep.Name
+		if isRepeat && !retrySameEndpoint {
+			continue
+		}
+		if isRepeat {
+			// Upstream drops cluster in time, so pause before trying the same place.
+			time.Sleep(streamRetryBackoff)
+		}
+		retrySameEndpoint = false
 		releasePending()
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
@@ -784,24 +836,25 @@ retryEndpoints:
 		lastErr = err
 
 		// Stream parsing was the only failure branch here that returned instead of
-		// trying the next endpoint, so an upstream that dropped the connection was
-		// never retried however early it happened. Retry only while nothing has been
-		// emitted: the client has seen no bytes, so a fresh attempt cannot duplicate
-		// output. Once content is out, retrying would concatenate two partial answers,
-		// so the error is still surfaced and the missing stop_reason keeps the
-		// truncation detectable by the client.
+		// trying again, so an upstream that dropped the connection was never retried
+		// however early it happened. Retry only while nothing has been emitted: the
+		// client has seen no bytes, so a fresh attempt cannot duplicate output. Once
+		// content is out, retrying would concatenate two partial answers, so the error
+		// is still surfaced and the missing stop_reason keeps the truncation
+		// detectable by the client.
 		if emitted {
 			return err
 		}
 
-		if !retryableStreamFailure(err) {
+		if !isRetryableStreamError(err) {
 			return err
 		}
+		// Arm the duplicate entry for this endpoint. Retrying the same place after a
+		// short pause is tried first because a drop is usually a momentary blip there,
+		// rather than something a different endpoint would avoid; if the repeat fails
+		// too, the loop carries on to the remaining endpoints as before.
+		retrySameEndpoint = true
 		logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output: %v", ep.Name, err)
-		// The pause is what makes the retry worth attempting. Cross-endpoint attempts
-		// otherwise fire within the same second and tend to fail together, since the
-		// upstream condition causing the drop has not cleared yet.
-		time.Sleep(streamRetryBackoff)
 		continue
 	}
 
