@@ -144,6 +144,31 @@ const (
 	maxStreamAttemptsPerEndpoint = 2
 )
 
+// kiroRequestBudget caps the wall-clock time one client request may spend across
+// every retry layer.
+//
+// The layers multiply: up to maxAccountRetryAttempts accounts, each trying several
+// endpoints, each now allowed maxStreamAttemptsPerEndpoint attempts, each of which
+// may wait kiroStreamFirstFrameTimeout for a first frame. That is over an hour in
+// the worst case, and nothing bounded the total before this. Meanwhile the keepalive
+// pings every 12s forever, so the client sees traffic and keeps waiting instead of
+// failing fast. A customer reported exactly that: 36m41s of "thinking" before their
+// client gave up with no chunk ever delivered.
+//
+// Ten minutes is longer than any legitimate prefill observed while still failing
+// inside the patience of a typical client, so the caller gets an error it can act on
+// rather than an open connection that leads nowhere.
+const kiroRequestBudget = 10 * time.Minute
+
+// kiroBudgetExhausted reports whether a request that began at start has used up its
+// overall budget, so the caller should stop retrying and surface the last error.
+func kiroBudgetExhausted(start time.Time) bool {
+	if start.IsZero() {
+		return false
+	}
+	return time.Since(start) >= kiroRequestBudget
+}
+
 // isRetryableStreamError reports whether a stream failure that produced no output
 // is worth another attempt.
 //
@@ -699,11 +724,22 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	// skipped rather than doubling those calls.
 	retrySameEndpoint := false
 
+	// Every attempt below may wait out a first-frame timeout, so the loop needs a
+	// wall-clock ceiling as well as an attempt count.
+	callStart := time.Now()
+
 retryEndpoints:
 	for attemptIdx, ep := range attempts {
 		isRepeat := attemptIdx > 0 && attempts[attemptIdx-1].Name == ep.Name
 		if isRepeat && !retrySameEndpoint {
 			continue
+		}
+		// Stop once the budget is gone rather than starting an attempt that cannot
+		// finish in time. Checked before the first attempt too: a caller that already
+		// burned the budget on an earlier account should not open another stream.
+		if kiroBudgetExhausted(callStart) {
+			logger.Warnf("[KiroAPI] request budget of %s exhausted after %d attempts; giving up", kiroRequestBudget, attemptIdx)
+			break
 		}
 		if isRepeat {
 			// Upstream drops cluster in time, so pause before trying the same place.

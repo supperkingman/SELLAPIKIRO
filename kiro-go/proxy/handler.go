@@ -1127,6 +1127,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		// CallKiroAPI budgets its own endpoint attempts, but that budget restarts for
+		// each account, so without this check the total is still the budget times the
+		// account count. Stop here instead: after this long the client is very likely
+		// gone, and holding the connection open only delays the error it needs.
+		if attempt > 0 && kiroBudgetExhausted(reqStart) {
+			logger.Warnf("[Claude] request budget of %s exhausted after %d accounts; giving up", kiroRequestBudget, attempt)
+			break
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2059,6 +2067,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		// See the Claude path: the per-call budget inside CallKiroAPI restarts for
+		// every account, so the total needs capping here as well.
+		if attempt > 0 && kiroBudgetExhausted(reqStart) {
+			logger.Warnf("[Claude] request budget of %s exhausted after %d accounts; giving up", kiroRequestBudget, attempt)
+			break
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2362,6 +2376,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
+			break
+		}
+		// See the Claude path: the per-call budget inside CallKiroAPI restarts for
+		// every account, so the total needs capping here as well. This is the path
+		// where an unbounded total was most visible, because its keepalive keeps
+		// pinging so the client waits instead of failing.
+		if attempt > 0 && kiroBudgetExhausted(reqStart) {
+			logger.Warnf("[OpenAI] request budget of %s exhausted after %d accounts; giving up", kiroRequestBudget, attempt)
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
@@ -2870,6 +2892,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
+			break
+		}
+		// See the Claude path: the per-call budget inside CallKiroAPI restarts for
+		// every account, so the total needs capping here as well.
+		if attempt > 0 && kiroBudgetExhausted(reqStart) {
+			logger.Warnf("[OpenAI] request budget of %s exhausted after %d accounts; giving up", kiroRequestBudget, attempt)
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
