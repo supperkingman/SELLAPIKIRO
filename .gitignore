@@ -50,3 +50,17 @@ scripts/9router_*.txt
 scripts/export-grok*.json
 scripts/export-*-accounts.json
 
+# Account dumps at the repo root: kiro-kr79-80-import.txt, codex-30-bulk.txt and
+# the like. These hold LIVE OAuth refresh tokens, so one stray `git add .` would
+# publish working credentials for every account in them.
+#
+# The leading slash anchors each pattern to the repo root on purpose: without it
+# "kiro-*.json" would also swallow kiro-go/version.json and the web locale files,
+# which are legitimate tracked source.
+/kiro-*.txt
+/kiro-*.json
+/codex-*.txt
+/codex-*.json
+/grok-*.txt
+/grok-*.json
+
