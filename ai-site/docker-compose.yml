@@ -1,0 +1,65 @@
+# Site ai.mmodiary.com — nhan kiro-go GIU NGUYEN BAN GOC (Quorinex/Kiro-Go).
+#
+# Nguyen tac: khong patch vao kiro-go. Cac sidecar noi chuyen voi no qua HTTP
+# (admin API), nen `git pull` tu upstream luc nao cung duoc ma khong xung dot.
+#
+# Cong 8090-8092, tach hoan toan khoi api.mmodiary.com (8080-8083).
+services:
+  # Nhan goc. Build tu thu muc kiro-go-upstream/ do setup.sh clone ve.
+  kiro-go:
+    build: ./kiro-go-upstream
+    image: aikiro-upstream:local
+    container_name: ${SITE_NAME:-aikiro}-go
+    ports:
+      # Chi bind localhost; OpenLiteSpeed lam reverse proxy ra ngoai.
+      - "127.0.0.1:${KIRO_PORT:-8090}:8080"
+    volumes:
+      # config.json RIENG cho site nay: tai khoan + API key khong dung chung
+      # voi api.mmodiary.com. Dung chung se khien 2 site tranh cung quota va
+      # throttle mot ben lam ben kia cung loi.
+      - ./data:/app/data
+    environment:
+      - CONFIG_PATH=/app/data/config.json
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong .env}
+    restart: unless-stopped
+
+  # Sidecar co QUYEN: bot goi vao day de tao key / cong gio / tam dung.
+  # Giu ADMIN_PASSWORD, xac thuc voi bot bang bearer KEYADMIN_TOKEN.
+  #
+  # Chinh sidecar nay lam viec ma ban goc khong biet: ma hoa han dung vao TEN key
+  # (#exp=<unix>, #pause=<giay>). Ban goc coi ten key la chuoi thuong, nen han
+  # dung la khai niem chi ton tai o tang nay tro len.
+  keyadmin:
+    build: ./keyadmin
+    image: aikiro-keyadmin:local
+    container_name: ${SITE_NAME:-aikiro}-keyadmin
+    ports:
+      - "127.0.0.1:${KEYADMIN_PORT:-8092}:8082"
+    environment:
+      - KEYADMIN_LISTEN=:8082
+      - KEYADMIN_KIRO_BASE=http://kiro-go:8080
+      - KEYADMIN_TOKEN=${KEYADMIN_TOKEN:?Phai dat KEYADMIN_TOKEN trong .env}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Phai dat ADMIN_PASSWORD trong .env}
+    depends_on:
+      - kiro-go
+    restart: unless-stopped
+
+  # Bot Telegram. Long-poll ra Telegram nen KHONG mo cong vao, khong can
+  # webhook/SSL rieng. Goi keyadmin trong mang compose, khong ra Internet.
+  #
+  # Chi chat ID trong TELEGRAM_ADMIN_IDS dung duoc; thieu bien nay bot TU CHOI
+  # khoi dong (kiem tra nam trong telegram-bot/config.go, khong phai o day).
+  telegram-bot:
+    build: ./telegram-bot
+    image: aikiro-telegram-bot:local
+    container_name: ${SITE_NAME:-aikiro}-telegram-bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:?Phai dat TELEGRAM_BOT_TOKEN trong .env}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS:?Phai dat TELEGRAM_ADMIN_IDS trong .env}
+      - KEYADMIN_URL=http://keyadmin:8082
+      - KEYADMIN_TOKEN=${KEYADMIN_TOKEN:?Phai dat KEYADMIN_TOKEN trong .env}
+      - SITE_LABEL=${SITE_LABEL:-ai.mmodiary.com}
+      - SITE_NAME=${SITE_NAME:-aikiro}
+    depends_on:
+      - keyadmin
+    restart: unless-stopped
