@@ -117,6 +117,39 @@ services:
       - kiro-go
     restart: unless-stopped
 
+  # Bot Telegram dieu khien key: tao key, cong gio, tam dung, tiep tuc.
+  # Goi keyadmin trong mang compose (khong ra Internet). Long-poll ra Telegram nen
+  # KHONG mo cong vao, khong can reverse proxy, khong can webhook/SSL rieng.
+  #
+  # Chi chat ID trong TELEGRAM_ADMIN_IDS dung duoc. Thieu bien nay bot TU CHOI khoi
+  # dong: username bot ai cung tim duoc, allowlist trong = phat key cho nguoi la.
+  #
+  # Dung profile "bot" nen site khong dung Telegram khong bi anh huong:
+  #   docker compose --profile bot up -d
+  telegram-bot:
+    build: ./telegram-bot
+    image: kiro-telegram-bot:local
+    container_name: ${SITE_NAME:-kiro}-telegram-bot
+    profiles: ["bot"]
+    environment:
+      # Dung ${VAR:-} chu KHONG dung ${VAR:?...}: compose noi suy bien cho MOI service
+      # khi doc file, ke ca service bi profile loai ra. Dung :? se lam `docker compose
+      # up` cua site KHONG dung bot bi loi ngay tu buoc parse.
+      #
+      # Khong mat an toan: bot TU CHOI khoi dong neu thieu token hoac allowlist
+      # (xem loadConfig trong telegram-bot/config.go). Kiem tra nam o do, dung o day.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS:-}
+      # Ten service keyadmin trong mang compose, khong qua Internet.
+      - KEYADMIN_URL=http://keyadmin:8082
+      - KEYADMIN_TOKEN=${KEYADMIN_TOKEN:-}
+      # Hien trong tin nhan tra loi, de biet key thuoc site nao.
+      - SITE_LABEL=${SITE_LABEL:-}
+      - SITE_NAME=${SITE_NAME:-kiro}
+    depends_on:
+      - keyadmin
+    restart: unless-stopped
+
   # Web ban API cho khach: landing page + tai khoan khach + admin (Shopify-style).
   # Khi don duoc admin duyet -> goi keyadmin tao API key (creditLimit = credit goi)
   # -> luu & tra khach. Du lieu (users/orders/keys) trong SQLite rieng o ./storefront-data.
