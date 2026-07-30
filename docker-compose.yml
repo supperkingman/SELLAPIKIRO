@@ -68,6 +68,13 @@ services:
       # a large context at high effort can stay silent for minutes before answering
       # normally (default 600).
       - KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC=${KIRO_STREAM_FIRST_FRAME_TIMEOUT_SEC:-}
+      # Credit markup on Kiro usage. Kiro's meteringEvent reports raw upstream
+      # consumption; this scales it before a customer's balance is charged.
+      # Empty = built-in default of 1.3. Set 1.5 to bill 1.5x raw usage.
+      #
+      # Affects only requests served AFTER a restart: credits are charged once, at
+      # the end of each request, so work already billed is never recalculated.
+      - KIRO_CREDIT_MULTIPLIER=${KIRO_CREDIT_MULTIPLIER:-}
     restart: unless-stopped
 
   # Sidecar cho khach kiem tra key + xem usage (token/credit da dung & con lai).
